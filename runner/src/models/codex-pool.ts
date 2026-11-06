@@ -9,16 +9,19 @@ import { executeCli, type CliRequest, type CliResponse } from './claude-pool.ts'
 export type CodexRequest = Omit<CliRequest, 'claudePath'> & { codexPath: string };
 
 export async function askCodex(req: CodexRequest): Promise<CliResponse> {
-  let schemaDir: string | undefined;
+  let callDir: string | undefined;
   try {
     fs.mkdirSync(req.cwd, { recursive: true });
+    callDir = fs.mkdtempSync(path.join(req.cwd, 'call-'));
+    const instructionsFile = path.join(callDir, 'instructions.txt');
+    fs.writeFileSync(instructionsFile, req.system?.trim() || 'Answer the message. Plain text, no preamble.', { mode: 0o600 });
     const binary = resolveCodexBinary(req.codexPath);
-    const args = [...binary.args, 'exec', '--ephemeral', '--ignore-user-config', '--ignore-rules',
+    const args = [...binary.args, 'exec', '--ephemeral', '--strict-config', '--ignore-user-config', '--ignore-rules',
       '--skip-git-repo-check', '--json', '--sandbox', 'read-only', '--model', req.model];
     const config: Record<string, string | number | boolean> = {
       model_reasoning_effort: req.effort ?? 'low',
       project_doc_max_bytes: 0,
-      base_instructions: req.system?.trim() || 'Answer the message. Plain text, no preamble.',
+      model_instructions_file: instructionsFile,
       developer_instructions: 'Return only the requested answer. Do not use tools.',
       web_search: 'disabled',
       'features.shell_tool': false,
@@ -37,8 +40,7 @@ export async function askCodex(req: CodexRequest): Promise<CliResponse> {
     };
     for (const [key, value] of Object.entries(config)) args.push('-c', `${key}=${JSON.stringify(value)}`);
     if (req.jsonSchema) {
-      schemaDir = fs.mkdtempSync(path.join(req.cwd, 'schema-'));
-      const schemaFile = path.join(schemaDir, 'output.json');
+      const schemaFile = path.join(callDir, 'output.json');
       fs.writeFileSync(schemaFile, JSON.stringify(req.jsonSchema), { mode: 0o600 });
       args.push('--output-schema', schemaFile);
     }
@@ -48,8 +50,8 @@ export async function askCodex(req: CodexRequest): Promise<CliResponse> {
   } catch (error) {
     return { ok: false, timedOut: false, limit: false, message: `Couldn't start Codex: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
-    if (schemaDir) {
-      try { fs.rmSync(schemaDir, { recursive: true, force: true }); } catch { /* Cleanup must not fail the caller. */ }
+    if (callDir) {
+      try { fs.rmSync(callDir, { recursive: true, force: true }); } catch { /* Cleanup must not fail the caller. */ }
     }
   }
 }

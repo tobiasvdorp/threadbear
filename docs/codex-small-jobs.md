@@ -18,7 +18,9 @@ including strong requests. A call snapshots its settings before awaiting.
 `askCodex(CodexRequest): Promise<CliResponse>` and `askCli(CliRequest)`
 share process lifetime handling through `executeCli`. Codex resolves the
 managed binary for each invocation and uses an ephemeral, read-only exec.
-Its JSONL parser requires both a completed turn and a final agent message.
+Job instructions use a private `model_instructions_file` removed after the
+call. `--strict-config` rejects unsupported settings before inference.
+The JSONL parser requires both a completed turn and a final agent message.
 Provider failures stay in the existing ModelResult failure contract.
 
 The codexSmallJobs experiment is off by default. Settings expose the

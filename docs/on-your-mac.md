@@ -145,7 +145,10 @@ File references are where to look.
   use the official managed Codex binary in ephemeral exec mode instead.
   It ignores user configuration and rules, disables shell, browser, apps
   and agent tools, and runs in a read-only sandbox. Structured jobs write a
-  temporary JSON schema under `models/cli` and remove it when done.
+  temporary JSON schema under `models/cli`. Every call also writes its job
+  instructions there, using the supported `model_instructions_file` setting.
+  Both files are private and removed when done. Strict config checking rejects
+  unknown fields instead of silently losing instructions.
   Calls use the selected login's subscription; no credentials are copied.
   When a project's notes pass 12,000 characters, the librarian sends them
   the same way to be rewritten shorter, and keeps the old notes in the

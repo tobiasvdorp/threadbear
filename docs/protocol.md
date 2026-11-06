@@ -1427,10 +1427,12 @@ efforts are rejected before saving. For Luna at Max:
 {"models":{"pool":"codex","provider":"codex","model":"gpt-6-luna","effort":"max"}}
 ```
 
-Codex calls use the official managed binary, `exec --ephemeral`, the login's
+Codex calls use the official managed binary, `exec --ephemeral --strict-config`, the login's
 CODEX_HOME, an empty working folder, no user config or rules, read-only
 sandboxing and disabled shell, browsing, apps and agent tools. Prompts go
-through stdin; JSON schemas use a temporary file removed after the call.
+through stdin. The job instructions use `model_instructions_file`, not an
+inline config override. Instructions and JSON schemas use a private per-call
+directory removed after the call; unknown config fields fail before inference.
 Codex JSONL replies supply the final agent message and token usage. Privacy,
 concurrency, login failover and ledger records follow the same shared path.
 Codex calls allow 180 seconds for reasoning; Claude keeps 60 seconds.
