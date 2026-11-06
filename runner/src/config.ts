@@ -368,7 +368,7 @@ export function modelSettingsFrom(json: RunnerJson): Config['models'] {
   const folders = json.models?.privateFolders;
   const pool = json.models?.pool;
   return {
-    provider: json.models?.provider === 'codex' ? 'codex' : 'claude',
+    ...(isProvider(json.models?.provider) ? { provider: json.models.provider } : {}),
     ...(nonEmpty(json.models?.model) ? { model: nonEmpty(json.models?.model) } : {}),
     ...(isEffortLevel(json.models?.effort) ? { effort: json.models.effort } : {}),
     // Absent or not a string: the Claude pool. null is Mike saying none.

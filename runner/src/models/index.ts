@@ -139,7 +139,7 @@ export class Models {
   // a pool with a Claude login. Room isn't checked; a call finds that out.
   unavailable(): string | undefined {
     if (this.opts.settings().provider === 'codex' && !this.opts.codexBinary?.()) return 'Codex small jobs are disabled in this runner';
-    return this.poolLogins() ? undefined : `Needs a ${this.opts.settings().provider ?? 'claude'} pool to run on`;
+    return this.poolLogins() ? undefined : `Needs a ${this.opts.settings().provider === 'codex' ? 'Codex' : 'Claude'} pool to run on`;
   }
 
   private poolLogins(settings: ModelSettings = this.opts.settings()): { pool: Pool; accounts: Account[] } | undefined {
@@ -229,9 +229,10 @@ export class Models {
   // login, and on the next one if that says it's out of room.
   private async viaPool<T>(job: ModelJob, p: Common, model: string, a: Attempt<T>, settings: ModelSettings): Promise<ModelResult<T> | { ok: false; skipped: Failure }> {
     const provider = settings.provider ?? 'claude';
+    const providerName = provider === 'codex' ? 'Codex' : 'Claude';
     if (!this.poolLogins(settings)) {
       const id = this.poolId();
-      return skip('no-pool', id === null ? 'Small jobs are on no pool.' : `No pool called ${id} has a matching login.`);
+      return skip('no-pool', id === null ? 'Small jobs are on no pool.' : `No pool called ${id} has a ${providerName} login.`);
     }
     const cliPath = provider === 'codex' ? this.opts.codexBinary?.() : this.opts.claudePath;
     if (!cliPath) return skip('off', `${provider} pool calls are off in this runner.`);
@@ -242,7 +243,7 @@ export class Models {
       for (;;) {
         // Read again each time round: the last call may have used up a login.
         const found = this.poolLogins(settings);
-        if (!found) return skip('no-pool', 'The pool has no matching login.');
+        if (!found) return skip('no-pool', `The pool has no ${providerName} login.`);
         title = found.pool.title;
         const id = pickInPool(found.pool, found.accounts, { provider, current: this.lastLogin, exclude: tried });
         const account = id ? found.accounts.find((x) => x.id === id) : undefined;
