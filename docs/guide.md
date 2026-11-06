@@ -650,14 +650,12 @@ It looks after a thread's first message and when a turn ends, then catches
 up at most every 20 minutes while the thread keeps going. A catch-up after
 only a quick reply is skipped without asking anything.
 
-Each look is one short call to Haiku, Claude's small, cheap model, rather
-than the model your threads run on. It runs on one of your own Claude
-logins: the one the pool would pick next in the pool chosen under Runs on (the
-same pool that writes thread titles, also in Settings › Models), and it
-counts towards that login's usage like any other call. When every login in
-the pool is out of room it waits, and with only Codex logins it doesn't
-run at all. Threads in a private folder (Settings › Models) are never sent
-to it.
+Each look uses the small-jobs model in Settings › Models, on one of the
+matching logins in its Runs on pool, and counts towards that login's usage.
+The default is Claude Haiku. With the Codex small jobs experiment enabled,
+an agent can set the provider, model and effort in runner.json, including
+GPT-6 Luna at Max. When every matching login is out of room it waits.
+Threads in a private folder (Settings › Models) are never sent to it.
 
 The Librarian view lists what it did and what it will look at next. Turn
 off Look at threads there to pause it; what's queued waits until you turn
@@ -785,9 +783,9 @@ to continue, with the conversation carried across. It pins the thread to
 that Codex login. Anything you've typed in the message field stays there.
 The switch happens only when you click.
 
-Titles, the librarian and Wake when… run on a Claude login, so with only
-Codex they don't happen: threads keep the first line of their first message
-as their title.
+Titles, the librarian and Wake when… use Claude by default. The Codex small
+jobs experiment lets them use your Codex login instead. Without a matching
+login, threads keep the first line of their first message as their title.
 
 Logins are grouped into pools, one for Claude and one for Codex to begin
 with (Settings > Pools). A new thread in a pool starts on the login with room whose
@@ -915,6 +913,11 @@ restart:
 Once an experiment has proved itself it becomes a standard part of
 Threadbear, and its switch goes.
 
+- **Codex small jobs** (`codexSmallJobs`, since 6 Nov 2026). Titles,
+  the librarian and other small jobs can use a Codex login. Ask your agent
+  to set `models.provider` to `codex`, `models.pool` to your Codex pool,
+  `models.model` to `gpt-6-luna` and `models.effort` to `max` in runner.json.
+  This uses your Codex subscription and can take longer than low effort.
 - **Review by another lab** (`labReview`, since 6 Nov 2026). When a turn
   that changed code (five lines or more, not counting docs) finishes with
   nothing for you to do, Threadbear starts a review thread in the same

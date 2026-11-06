@@ -1,6 +1,6 @@
 // The runner's own small-model calls (docs/protocol.md, "Settings and
 // models"): classify, extract, summarize and generate, on one of the Claude
-// logins in a pool, through the official CLI. Features ask for a job, not
+// or Codex logins in a pool, through the official CLI. Features ask for a job, not
 // a model; ROUTES says which model answers it. A call never throws: a
 // failed one says why, and the feature falls back to what it did before
 // there was a model to ask.
@@ -12,11 +12,12 @@
 import path from 'node:path';
 import type { Clock } from '../clock.ts';
 import type { Logger } from '../log.ts';
-import type { Account, Pool } from '../protocol.ts';
+import type { Account, Pool, Provider, EffortLevel } from '../protocol.ts';
 import { expandHome } from '../config.ts';
 import { pickInPool } from '../pools.ts';
 import { askCli, cliDir } from './claude-pool.ts';
 import type { AskCli, CliResponse } from './claude-pool.ts';
+import { askCodex } from './codex-pool.ts';
 import { Ledger } from './ledger.ts';
 import { outermostBraces } from '../linear-text.ts';
 import type { UsageLine } from './ledger.ts';
@@ -59,8 +60,8 @@ export type SummarizeParams = Common & { text: string; maxWords?: number };
 // strong: Opus (ROUTES.decide) rather than Haiku.
 export type GenerateParams = Common & { prompt: string; system?: string; maxTokens?: number; strong?: boolean };
 
-// pool: the pool whose Claude logins answer; null for none (no small jobs).
-export type ModelSettings = { privateFolders: string[]; pool?: string | null };
+// pool: the pool whose matching logins answer; null for none (no small jobs).
+export type ModelSettings = { privateFolders: string[]; pool?: string | null; provider?: Provider; model?: string; effort?: EffortLevel };
 
 // What the Models layer needs of the runner.
 export type PoolHost = {
@@ -80,6 +81,7 @@ export type ModelsOptions = {
   // no-pool or off.
   poolHost?: PoolHost;
   claudePath?: string;
+  codexBinary?: () => string | undefined;
   registry?: { add(pid: number, command: string): void; remove(pid: number): void };
   // Stands in for the CLI in tests.
   askCli?: AskCli;
@@ -136,15 +138,16 @@ export class Models {
   // Why no call could go out at all, or undefined when one might: there's
   // a pool with a Claude login. Room isn't checked; a call finds that out.
   unavailable(): string | undefined {
-    return this.poolLogins() ? undefined : 'Needs a Claude pool to run on';
+    if (this.opts.settings().provider === 'codex' && !this.opts.codexBinary?.()) return 'Codex small jobs are disabled in this runner';
+    return this.poolLogins() ? undefined : `Needs a ${this.opts.settings().provider ?? 'claude'} pool to run on`;
   }
 
-  private poolLogins(): { pool: Pool; accounts: Account[] } | undefined {
-    const id = this.poolId();
+  private poolLogins(settings: ModelSettings = this.opts.settings()): { pool: Pool; accounts: Account[] } | undefined {
+    const id = settings.pool === undefined ? DEFAULT_POOL : settings.pool;
     if (id === null || !this.opts.poolHost) return undefined;
     const found = this.opts.poolHost.pool(id);
     if (!found) return undefined;
-    const accounts = found.accounts.filter((a) => a.provider === 'claude' && found.pool.accountIds.includes(a.id));
+    const accounts = found.accounts.filter((a) => a.provider === (settings.provider ?? 'claude') && found.pool.accountIds.includes(a.id));
     return accounts.length ? { pool: found.pool, accounts } : undefined;
   }
 
@@ -216,51 +219,53 @@ export class Models {
   }
 
   private async run<T>(job: ModelJob, p: Common, a: Attempt<T>): Promise<ModelResult<T>> {
-    const s = this.opts.settings();
+    const s = { ...this.opts.settings() };
     if (p.cwd && isPrivate(p.cwd, s.privateFolders)) return { ok: false, reason: 'private', message: `${p.cwd} is a private folder.` };
-    const res = await this.viaPool(job, p, ROUTES[job], a);
+    const res = await this.viaPool(job, p, s.model ?? (s.provider === 'codex' ? ASK_CODEX_MODEL : ROUTES[job]), a, s);
     return 'skipped' in res ? res.skipped : res;
   }
 
   // One route: skipped with no pool or no login with room; else run on a
   // login, and on the next one if that says it's out of room.
-  private async viaPool<T>(job: ModelJob, p: Common, model: string, a: Attempt<T>): Promise<ModelResult<T> | { ok: false; skipped: Failure }> {
-    if (!this.poolLogins()) {
+  private async viaPool<T>(job: ModelJob, p: Common, model: string, a: Attempt<T>, settings: ModelSettings): Promise<ModelResult<T> | { ok: false; skipped: Failure }> {
+    const provider = settings.provider ?? 'claude';
+    if (!this.poolLogins(settings)) {
       const id = this.poolId();
-      return skip('no-pool', id === null ? 'Small jobs are on no pool.' : `No pool called ${id} has a Claude login.`);
+      return skip('no-pool', id === null ? 'Small jobs are on no pool.' : `No pool called ${id} has a matching login.`);
     }
-    if (!this.opts.claudePath) return skip('off', 'Pool calls are off in this runner.');
+    const cliPath = provider === 'codex' ? this.opts.codexBinary?.() : this.opts.claudePath;
+    if (!cliPath) return skip('off', `${provider} pool calls are off in this runner.`);
     await this.acquirePool();
     try {
       const tried: string[] = [];
       let title = '';
       for (;;) {
         // Read again each time round: the last call may have used up a login.
-        const found = this.poolLogins();
-        if (!found) return skip('no-pool', 'The pool has no Claude login.');
+        const found = this.poolLogins(settings);
+        if (!found) return skip('no-pool', 'The pool has no matching login.');
         title = found.pool.title;
-        const id = pickInPool(found.pool, found.accounts, { provider: 'claude', current: this.lastLogin, exclude: tried });
+        const id = pickInPool(found.pool, found.accounts, { provider, current: this.lastLogin, exclude: tried });
         const account = id ? found.accounts.find((x) => x.id === id) : undefined;
         if (!account) break;
         tried.push(account.id);
         const started = this.opts.clock.now();
-        const res: CliResponse = await (this.opts.askCli ?? askCli)({
-          claudePath: this.opts.claudePath,
-          account,
-          model,
-          system: a.system,
-          user: a.user,
-          jsonSchema: a.jsonSchema?.schema,
+        const request = {
+          account, model, effort: settings.effort,
+          system: a.system, user: a.user, jsonSchema: a.jsonSchema?.schema,
           cwd: cliDir(this.opts.home),
-          timeoutMs: this.opts.poolTimeoutMs ?? POOL_TIMEOUT_MS,
+          timeoutMs: this.opts.poolTimeoutMs ?? (provider === 'codex' ? 180_000 : POOL_TIMEOUT_MS),
           registry: this.opts.registry,
-        });
+        };
+        const res: CliResponse = provider === 'codex'
+          ? await askCodex({ ...request, codexPath: cliPath })
+          : await (this.opts.askCli ?? askCli)({ ...request, claudePath: cliPath });
         const value = res.ok ? a.read(res.text) : undefined;
         const unreadable = res.ok && value === undefined ? 'unreadable answer' : undefined;
         this.record({
           job,
           feature: p.feature,
           model,
+          effort: settings.effort ?? 'low',
           started,
           ok: res.ok && !unreadable,
           accountId: account.id,

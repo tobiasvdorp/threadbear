@@ -5,7 +5,7 @@ import path from 'node:path';
 import type { Config } from './config.ts';
 import { expandHome, readRunnerJson, writeRunnerJson } from './config.ts';
 import type { Clock } from './clock.ts';
-import { ErrorCode, RpcError } from './protocol.ts';
+import { ErrorCode, RpcError, isProvider, isEffortLevel } from './protocol.ts';
 import type { Notification } from './runner.ts';
 import type { Models } from './models/index.ts';
 import type { BringInSetting } from './bring-in.ts';
@@ -24,6 +24,9 @@ export type Settings = {
   models: {
     pool: string | null;
     privateFolders: string[];
+    provider?: Config['models']['provider'];
+    model?: string;
+    effort?: Config['models']['effort'];
   };
 };
 
@@ -35,7 +38,7 @@ export type SettingsUpdate = {
   bulletReplies?: boolean;
   oneReply?: boolean;
   bringIn?: BringInSetting;
-  models?: { pool?: string | null; privateFolders?: string[] };
+  models?: { pool?: string | null; privateFolders?: string[]; provider?: Config['models']['provider']; model?: string | null; effort?: Config['models']['effort'] | null };
 };
 
 export class SettingsService {
@@ -61,6 +64,7 @@ export class SettingsService {
       oneReply: this.cfg.oneReply,
       bringIn: bringInSetting(this.cfg.home),
       models: {
+        ...this.cfg.models,
         pool: this.cfg.models.pool,
         privateFolders: [...this.cfg.models.privateFolders],
       },
@@ -79,6 +83,9 @@ export class SettingsService {
     if (u.maxLiveCLIs !== undefined && !(Number.isInteger(u.maxLiveCLIs) && u.maxLiveCLIs >= 1 && u.maxLiveCLIs <= 20)) {
       throw bad('maxLiveCLIs must be a whole number from 1 to 20');
     }
+    if (u.models?.provider !== undefined && !isProvider(u.models.provider)) throw bad('models.provider must be claude or codex');
+    if (u.models?.model !== undefined && u.models.model !== null && !u.models.model.trim()) throw bad('models.model must be non-empty or null');
+    if (u.models?.effort !== undefined && u.models.effort !== null && !isEffortLevel(u.models.effort)) throw bad('Unknown models.effort');
     const folders = u.models?.privateFolders?.map((f) => f.trim()).filter(Boolean);
     const pool = u.models?.pool === undefined ? undefined : u.models.pool === null ? null : u.models.pool.trim();
     if (pool === '') throw bad('pool must be a pool id or null');
@@ -104,8 +111,17 @@ export class SettingsService {
     if (u.oneReply !== undefined) json.oneReply = this.cfg.oneReply = u.oneReply;
     // Read each time it's needed (bring-in.ts), so this takes effect at once.
     if (u.bringIn !== undefined) json.releases = { ...json.releases, bringIn: u.bringIn };
-    if (folders !== undefined || pool !== undefined) {
+    if (u.models !== undefined) {
       json.models = { ...json.models };
+      if (u.models.provider !== undefined) json.models.provider = this.cfg.models.provider = u.models.provider;
+      if (u.models.model !== undefined) {
+        if (u.models.model === null) { delete json.models.model; delete this.cfg.models.model; }
+        else json.models.model = this.cfg.models.model = u.models.model.trim();
+      }
+      if (u.models.effort !== undefined) {
+        if (u.models.effort === null) { delete json.models.effort; delete this.cfg.models.effort; }
+        else json.models.effort = this.cfg.models.effort = u.models.effort;
+      }
       if (pool !== undefined) json.models.pool = this.cfg.models.pool = pool;
       if (folders !== undefined) json.models.privateFolders = this.cfg.models.privateFolders = [...new Set(folders)];
     }
@@ -150,6 +166,18 @@ export function settingsMethods(s: SettingsService): Record<string, (p: Record<s
         if (!m || typeof m !== 'object' || Array.isArray(m)) throw bad('models must be an object');
         const mm = m as Record<string, unknown>;
         u.models = {};
+        if (mm.provider !== undefined) {
+          if (!isProvider(mm.provider)) throw bad('models.provider must be claude or codex');
+          u.models.provider = mm.provider;
+        }
+        if (mm.model !== undefined) {
+          if (mm.model !== null && typeof mm.model !== 'string') throw bad('models.model must be a string or null');
+          u.models.model = mm.model;
+        }
+        if (mm.effort !== undefined) {
+          if (mm.effort !== null && !isEffortLevel(mm.effort)) throw bad('Unknown models.effort');
+          u.models.effort = mm.effort;
+        }
         if (mm.pool !== undefined) {
           if (mm.pool !== null && typeof mm.pool !== 'string') throw bad('models.pool must be a pool id or null');
           u.models.pool = mm.pool;

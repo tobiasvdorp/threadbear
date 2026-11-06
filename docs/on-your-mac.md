@@ -141,6 +141,12 @@ File references are where to look.
 - **Small model calls** (`runner/src/models/`): thread titles, filing
   threads into projects (the librarian, every 5 minutes) and similar jobs
   send short excerpts of your threads to `claude -p` on your own logins.
+  With `codexSmallJobs` enabled and `models.provider` set to `codex`, they
+  use the official managed Codex binary in ephemeral exec mode instead.
+  It ignores user configuration and rules, disables shell, browser, apps
+  and agent tools, and runs in a read-only sandbox. Structured jobs write a
+  temporary JSON schema under `models/cli` and remove it when done.
+  Calls use the selected login's subscription; no credentials are copied.
   When a project's notes pass 12,000 characters, the librarian sends them
   the same way to be rewritten shorter, and keeps the old notes in the
   data folder's `project-notes/` (the last 5 for each project).

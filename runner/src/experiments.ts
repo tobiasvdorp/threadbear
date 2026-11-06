@@ -27,6 +27,13 @@ export type Experiment = {
 
 export const EXPERIMENTS: readonly Experiment[] = [
   {
+    id: 'codexSmallJobs',
+    title: 'Codex small jobs: titles and librarian can use a Codex model and effort',
+    added: '2026-11-06',
+    on: false,
+    reminder: '6a7ca905',
+  },
+  {
     id: 'labReview',
     title: 'Review by another lab: a code change is checked by the other provider before the thread finishes',
     added: '2026-11-06',
@@ -56,7 +63,7 @@ export const EXPERIMENTS: readonly Experiment[] = [
   },
 ];
 
-export type ExperimentId = 'labReview' | 'keepAwake' | 'scheduleChecks' | 'richBlocks';
+export type ExperimentId = 'labReview' | 'keepAwake' | 'scheduleChecks' | 'richBlocks' | 'codexSmallJobs';
 
 // Read from runner.json each time, so turning one on or off takes effect
 // at the next turn, with no restart.

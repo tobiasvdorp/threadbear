@@ -171,21 +171,23 @@ private struct ModelSettings: View {
             Form {
                 if settings.models.poolSupported {
                     SettingsSection("Small jobs",
-                                    about: "Titles and the librarian use Haiku on one of this pool's Claude logins, the one with the most room, and count towards its usage. When every login is out of room they wait. None turns them off.",
-                                    ask: "change this, or which model and effort new threads start on. Your agent edits them in runner.json.") {
+                                    about: "Titles and the librarian use the configured model on this pool and count towards the login's usage. When every matching login is out of room they wait. None turns them off.",
+                                    ask: "change the provider, model and effort for small jobs, or the defaults for new threads. Your agent edits runner.json.") {
                         Picker("Run on", selection: poolBinding(settings)) {
-                            ForEach(claudePools) { pool in
+                            ForEach(app.smallJobPools(settings)) { pool in
                                 Label(pool.title, systemImage: Pools.symbol(pool, accounts: app.accounts)).labelStyle(.titleAndIcon).tag(Optional(pool.id))
                             }
                             // A pool deleted since it was picked, so the
                             // picker still says what's set.
-                            if let id = settings.models.pool, !claudePools.contains(where: { $0.id == id }) {
-                                Label("\(id), which has no Claude login", systemImage: "exclamationmark.triangle").labelStyle(.titleAndIcon).tag(Optional(id))
+                            if let id = settings.models.pool, !app.smallJobPools(settings).contains(where: { $0.id == id }) {
+                                Label("\(id), which has no matching login", systemImage: "exclamationmark.triangle").labelStyle(.titleAndIcon).tag(Optional(id))
                             }
                             Divider()
                             Label("None", systemImage: "nosign").labelStyle(.titleAndIcon).tag(String?.none)
                         }
-                        .tip("Which pool's Claude logins write titles and do the librarian's work")
+                        .tip("Which pool's matching logins write titles and do the librarian's work")
+                        Text("\(settings.models.model ?? (settings.models.provider == "codex" ? "gpt-6-luna" : "Haiku")) · \(settings.models.effort ?? "low") effort")
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -228,7 +230,7 @@ private struct ModelSettings: View {
         }
     }
 
-    private var claudePools: [Pool] { app.claudePools }
+
 
     private func poolBinding(_ settings: RunnerSettings) -> Binding<String?> {
         Binding(get: { settings.models.pool }, set: { app.updateSettings(SettingsUpdate(pool: .some($0))) })

@@ -105,10 +105,10 @@ export type Config = {
   // Mike's runner tags a signed release of main once a day for everyone
   // else's copy (src/upstream.ts): runner.json `releases`.
   releases?: { publish: boolean; signingKey?: string };
-  // The runner's own model calls (src/models/): the pool whose Claude
+  // The runner's own model calls (src/models/): the pool whose matching
   // logins answer them (null: none, so no small jobs) and folders whose
   // threads are never sent.
-  models: { pool: string | null; privateFolders: string[] };
+  models: { pool: string | null; privateFolders: string[]; provider?: Provider; model?: string; effort?: EffortLevel };
   // The Convex mirror (src/sync.ts): the project's URL, whether it's on,
   // the name the phone shows for this runner and its id (made once).
   // THREADBEAR_SYNC=off turns it off for tests and dev runners.
@@ -162,7 +162,7 @@ export type RunnerJson = {
   // bringIn: how often a fork's runner starts a thread to bring in Mike's
   // releases (bring-in.ts): every so many days, 'important' or 'off'.
   releases?: { publish?: boolean; signingKey?: string; bringIn?: number | 'important' | 'off' };
-  models?: { pool?: string | null; privateFolders?: string[] };
+  models?: { pool?: string | null; privateFolders?: string[]; provider?: Provider; model?: string | null; effort?: EffortLevel | null };
   // icon: an SF Symbol for this runner in lists (machine.ts works one out).
   // rpcUrl: how a Mac app reaches this runner over the tailnet (step 6 part 2).
   // full: true sends tool output to your Convex deployment as well, scrubbed first
@@ -368,6 +368,9 @@ export function modelSettingsFrom(json: RunnerJson): Config['models'] {
   const folders = json.models?.privateFolders;
   const pool = json.models?.pool;
   return {
+    provider: json.models?.provider === 'codex' ? 'codex' : 'claude',
+    ...(nonEmpty(json.models?.model) ? { model: nonEmpty(json.models?.model) } : {}),
+    ...(isEffortLevel(json.models?.effort) ? { effort: json.models.effort } : {}),
     // Absent or not a string: the Claude pool. null is Mike saying none.
     pool: pool === null ? null : typeof pool === 'string' && pool.trim() ? pool.trim() : DEFAULT_SMALL_MODEL_POOL,
     privateFolders: Array.isArray(folders) ? folders.filter((f): f is string => typeof f === 'string' && f.trim() !== '') : [],

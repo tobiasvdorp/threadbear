@@ -42,6 +42,9 @@ public struct RunnerSettings: Sendable, Hashable, Decodable {
         public var poolSupported: Bool
         /// Folders whose thread text is never sent, as written ("~/" kept).
         public var privateFolders: [String]
+        public var provider: String = "claude"
+        public var model: String?
+        public var effort: String?
 
         public init(pool: String? = nil, poolSupported: Bool = false, privateFolders: [String] = []) {
             self.pool = pool
@@ -51,12 +54,15 @@ public struct RunnerSettings: Sendable, Hashable, Decodable {
 
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
+            provider = (try? c.decode(String.self, forKey: .provider)) ?? "claude"
+            model = try? c.decode(String.self, forKey: .model)
+            effort = try? c.decode(String.self, forKey: .effort)
             poolSupported = c.contains(.pool)
             pool = ((try? c.decodeIfPresent(String.self, forKey: .pool)) ?? nil).flatMap { $0.isEmpty ? nil : $0 }
             privateFolders = c.lossyArray(String.self, forKey: .privateFolders)
         }
 
-        enum CodingKeys: String, CodingKey { case pool, privateFolders }
+        enum CodingKeys: String, CodingKey { case pool, privateFolders, provider, model, effort }
     }
 
     public var defaultCwd: String

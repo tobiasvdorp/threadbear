@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import type { Account } from '../protocol.ts';
+import type { Account, EffortLevel } from '../protocol.ts';
 import { cliEnv } from '../adapters/claude/adapter.ts';
 import { USAGE_LIMIT_TEXT } from '../adapters/claude/normalize.ts';
 import { groupAlive, killGroup } from '../proc.ts';
@@ -17,6 +17,7 @@ export type CliRequest = {
   claudePath: string;
   account: Account;
   model: string;
+  effort?: EffortLevel;
   system?: string;
   user: string;
   // Structured output through --json-schema (classify and extract).
@@ -39,7 +40,7 @@ export type AskCli = (req: CliRequest) => Promise<CliResponse>;
 // is long and all about being a coding agent.
 const DEFAULT_SYSTEM = 'Answer the message. Plain text, no preamble.';
 
-export function cliArgs(req: Pick<CliRequest, 'model' | 'system' | 'jsonSchema'>): string[] {
+export function cliArgs(req: Pick<CliRequest, 'model' | 'system' | 'jsonSchema' | 'effort'>): string[] {
   const args = [
     '-p',
     '--model',
@@ -57,7 +58,7 @@ export function cliArgs(req: Pick<CliRequest, 'model' | 'system' | 'jsonSchema'>
     '--disable-slash-commands',
     // Haiku thinks less at low effort: a title is 15 output tokens, not 135.
     '--effort',
-    'low',
+    req.effort ?? 'low',
     '--output-format',
     'json',
     '--system-prompt',
@@ -67,8 +68,15 @@ export function cliArgs(req: Pick<CliRequest, 'model' | 'system' | 'jsonSchema'>
   return args;
 }
 
-export const askCli: AskCli = (req) =>
-  new Promise((resolve) => {
+export const askCli: AskCli = (req) => executeCli(req, {
+  command: req.claudePath, args: cliArgs(req), env: cliEnv(req.account), prompt: req.user, read: readReply,
+});
+
+export function executeCli(req: Pick<CliRequest, 'cwd' | 'timeoutMs' | 'registry'>, run: {
+  command: string; args: string[]; env: NodeJS.ProcessEnv; prompt: string;
+  read: (out: string, err: string, code: number | null) => CliResponse;
+}): Promise<CliResponse> {
+  return new Promise((resolve) => {
     try {
       fs.mkdirSync(req.cwd, { recursive: true });
     } catch {
@@ -76,26 +84,26 @@ export const askCli: AskCli = (req) =>
     }
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(req.claudePath, cliArgs(req), {
+      child = spawn(run.command, run.args, {
         cwd: req.cwd,
-        env: cliEnv(req.account) as NodeJS.ProcessEnv,
+        env: run.env,
         stdio: ['pipe', 'pipe', 'pipe'],
         // Its own process group, like a thread's CLI, so a timeout stops
         // anything it started too.
         detached: true,
       });
     } catch (e) {
-      resolve({ ok: false, timedOut: false, limit: false, message: `Couldn't start claude: ${(e as Error).message}` });
+      resolve({ ok: false, timedOut: false, limit: false, message: `Couldn't start model CLI: ${(e as Error).message}` });
       return;
     }
     const pid = child.pid;
-    if (pid) req.registry?.add(pid, req.claudePath);
+    if (pid) req.registry?.add(pid, run.command);
     let out = '';
     let err = '';
     let timedOut = false;
     let done = false;
     child.stdout?.setEncoding('utf8');
-    child.stdout?.on('data', (d: string) => (out += d));
+    child.stdout?.on('data', (d: string) => (out = (out + d).slice(-2_000_000)));
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (d: string) => (err = (err + d).slice(-2000)));
     const timer = setTimeout(() => {
@@ -114,16 +122,17 @@ export const askCli: AskCli = (req) =>
       if (pid) req.registry?.remove(pid);
       resolve(r);
     };
-    child.on('error', (e) => finish({ ok: false, timedOut: false, limit: false, message: `Couldn't start claude: ${e.message}` }));
+    child.on('error', (e) => finish({ ok: false, timedOut: false, limit: false, message: `Couldn't start model CLI: ${e.message}` }));
     child.on('close', (code) => {
       if (timedOut) return finish({ ok: false, timedOut: true, limit: false, message: `Timed out after ${Math.round(req.timeoutMs / 1000)} s` });
-      finish(readReply(out, err, code));
+      finish(run.read(out, err, code));
     });
     // The prompt goes in on stdin rather than as an argument: thread text
     // can be long, and it keeps it out of `ps`.
     child.stdin?.on('error', () => {});
-    child.stdin?.end(req.user);
+    child.stdin?.end(run.prompt);
   });
+}
 
 // The CLI's --output-format json answer: one JSON object, the last line of
 // stdout.

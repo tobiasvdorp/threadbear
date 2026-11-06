@@ -1411,9 +1411,30 @@ The runner makes small model calls of its own (classify, extract,
 summarise, generate) for features like titles, the librarian and "wake
 when" (`src/models/`). Features ask for a job, not a model: `ROUTES` says
 which model answers it, Haiku for everything but `decide`, which is Opus.
-Every call runs on the official `claude` CLI on one of the Claude logins
+By default calls run on the official `claude` CLI on one of the Claude logins
 in the pool `models.pool` names: the same CLI and logins as threads, so
 it needs no key and costs nothing beyond the login's usage.
+
+With experiment `codexSmallJobs` enabled, small jobs can also run on Codex. `models.provider` selects `"claude"`
+(the default) or `"codex"`; only matching logins in `models.pool` are used.
+`models.model` overrides the job route; absent on Codex it uses `gpt-6-luna`.
+`models.effort` overrides the default low effort. These optional fields are
+returned by settings.get and accepted by settings.update under models;
+null resets model or effort. Invalid providers, empty models and unknown
+efforts are rejected before saving. For Luna at Max:
+
+```json
+{"models":{"pool":"codex","provider":"codex","model":"gpt-6-luna","effort":"max"}}
+```
+
+Codex calls use the official managed binary, `exec --ephemeral`, the login's
+CODEX_HOME, an empty working folder, no user config or rules, read-only
+sandboxing and disabled shell, browsing, apps and agent tools. Prompts go
+through stdin; JSON schemas use a temporary file removed after the call.
+Codex JSONL replies supply the final agent message and token usage. Privacy,
+concurrency, login failover and ledger records follow the same shared path.
+Codex calls allow 180 seconds for reasoning; Claude keeps 60 seconds.
+Calls send text to the selected provider on the user's subscription.
 
 There used to be OpenRouter as well, with a key, a daily budget and a
 spend to show. It went on 29 Oct 2026: every feature is Haiku or Opus,
@@ -1422,11 +1443,11 @@ older runner's `openRouterKey`, `dailyBudgetUsd`, `spentTodayUsd` and
 `spentMonthUsd` in `Settings.models` are ignored by clients, and
 `secrets/openrouter-key`, if there is one, is no longer read.
 
-- **Consent.** A call sends thread text to Anthropic on Mike's own login,
+- **Consent.** A call sends thread text to the configured provider on Mike's own login,
   as the thread itself does.
 - **The pool.** `models.pool` in `runner.json` is a pool id, `"claude"`
   when it isn't set, or `null` for none, which turns titles and the
-  librarian off. Only its Claude logins are used. A call runs on the one
+  librarian off. Only logins matching models.provider are used. A call runs on the one
   it ran on last while that's OK to run on (see Pools), else the one with
   the most room. The CLI runs as `claude -p` at low effort in an empty
   folder (`models/cli` in the data dir), with no tools, MCP servers,
@@ -1443,7 +1464,7 @@ older runner's `openRouterKey`, `dailyBudgetUsd`, `spentTodayUsd` and
   doesn't go out.
 - **Usage.** Each call that goes out adds a line to `models/usage.ndjson`
   in the data dir: `{ ts, feature, job, model, ok, ms, inputTokens?,
-  outputTokens?, accountId?, notionalUsd?, error? }`. `notionalUsd` is
+  outputTokens?, accountId?, effort?, notionalUsd?, error? }`. `notionalUsd` is
   what the CLI says it would have cost on the API, which isn't spent. No
   text from the call is kept.
 - **Titles.** A new thread's title is the first line of its first
@@ -1453,7 +1474,7 @@ older runner's `openRouterKey`, `dailyBudgetUsd`, `spentTodayUsd` and
   names them too. Later, the librarian renames a thread whose title no
   longer says what it's about (see Projects).
 - **Failures.** A call never throws: it says why it didn't answer
-  (`no-pool`: no pool, or none of its logins is a Claude one; `no-room`:
+  (`no-pool`: no pool, or none of its logins matches the provider; `no-room`:
   every login is out of room; `off`: this runner makes no model calls;
   private folder, timed out, error), and the feature falls back to what
   it did before there was a model to ask.
@@ -1466,7 +1487,7 @@ the transcript, with a box under it for a follow-up question. It's a mini
 fork of the thread for that one thing: `threads.explain` sends the
 selection, the message it came from, the thread's first message and
 its last 8 messages to the small model (job `generate`, feature `explain`,
-so Haiku on the pool first), and the answer goes back to the app alone.
+using the configured small-jobs model), and the answer goes back to the app alone.
 Nothing goes into the thread's events, so the agent never sees it and its
 context doesn't grow. The side conversation lives in the app (one per
 thread, gone on quit); each follow-up sends the earlier answers again as
@@ -3705,8 +3726,8 @@ and also when a move or an ask leaves it out. That isn't remembered as a
 no the way Mike's is: a later look can put it back. Looks are listed in
 `LibrarianStatus.recent`.
 
-Looks (and icon picks) run on the Claude pool, like every small job.
-Without a pool with a Claude login (`models.pool` null, or a pool with
+Looks (and icon picks) use the configured small-jobs provider and pool.
+Without a pool with a matching login (`models.pool` null, or a pool with
 none), or while every login in it is out of room, the queue waits
 (`state: "off"`) and tries again later.
 

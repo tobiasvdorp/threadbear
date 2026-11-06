@@ -213,13 +213,14 @@ async function main(): Promise<void> {
     onNotice: (text) => runner.notice('warning', text),
     extraGuidance: () => (experimentOn(cfg.home, 'richBlocks') ? RICH_BLOCKS_LINE : ''),
   });
-  // The runner's own small-model calls, on the settings' Claude pool.
+  // The runner's own model calls, on the configured provider and pool.
   const models = new Models({
     home: cfg.home,
     clock: realClock,
     log,
     settings: () => cfg.models,
     claudePath: cfg.claudePath,
+    codexBinary: () => experimentOn(cfg.home, 'codexSmallJobs') ? updates.codexBinary() : undefined,
     registry,
     poolHost: { pool: (id) => runner.smallModelPool(id), ranDry: (id) => runner.noteRanDry(id) },
   });
