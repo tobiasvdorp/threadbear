@@ -58,6 +58,23 @@ test('step: a plain failure says the exit code', () => {
   assert.throws(() => steps.step('Typecheck', c.npm, ['run', 'typecheck'], {}, io), /Typecheck failed \(npm exited with 1\); the whole output is in /);
 });
 
+test('step: long names keep distinct readable failure logs', () => {
+  const { io } = fakeIo([{ status: 1, output: 'first failure\n' }, { status: 1, output: 'second failure\n' }]);
+  const prefix = `Rerunning ${'test/unit/a-long-failed-test.test.ts, '.repeat(12)}`;
+  const files: string[] = [];
+  for (const name of [`${prefix}first`, `${prefix}second`]) {
+    assert.throws(() => steps.step(name, c.node, [], {}, io), (e: Error & { logFile: string }) => {
+      assert.ok(e instanceof steps.StepFailed);
+      assert.ok(e.message.startsWith(`${name} failed`));
+      files.push(e.logFile);
+      return true;
+    });
+  }
+  assert.notEqual(files[0], files[1]);
+  assert.match(fs.readFileSync(files[0], 'utf8'), /first failure/);
+  assert.match(fs.readFileSync(files[1], 'utf8'), /second failure/);
+});
+
 test('unitTests: a run that failed without naming a test file gets the whole suite once more', () => {
   // As on 4 Nov (THREADBEAR-M): npm test died in 0.1s with an empty log.
   const { io, said, calls } = fakeIo([{ status: null, signal: 'SIGKILL' }, { status: 0 }]);
@@ -86,6 +103,15 @@ test('unitTests: a test that fails twice stops the build', () => {
   const output = 'test at test/unit/broken.test.ts:1:1\n';
   const { io } = fakeIo([{ status: 1, output }, { status: 1, output }]);
   assert.throws(() => steps.unitTests(c, {}, io), /Rerunning test\/unit\/broken\.test\.ts failed \(node exited with 1\)/);
+});
+
+test('unitTests: many failed files still reach the test process', () => {
+  const files = Array.from({ length: 12 }, (_, i) => `test/unit/a-long-failed-test-${i}.test.ts`);
+  const output = files.map((file) => `test at ${file}:1:1`).join('\n');
+  const { io, calls } = fakeIo([{ status: 1, output }, { status: 0 }]);
+  steps.unitTests(c, {}, io);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].args.filter((arg) => arg.endsWith('.test.ts')), files);
 });
 
 // 90 s was too short with the Mac at a load of 94 on 18 cores (6 Nov): the

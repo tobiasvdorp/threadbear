@@ -3,6 +3,7 @@
 // drive them with fake processes. deploy.mjs runs on import, so it can't be
 // imported by a test itself.
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -45,7 +46,9 @@ export function step(name, cmd, args, opts, io = {}) {
   const { say = console.log, write = (s) => process.stdout.write(s), error = console.error, spawn = spawnSync, tmpdir = os.tmpdir() } = io;
   write(`${name}... `);
   const started = Date.now();
-  const logFile = path.join(tmpdir, `threadbear-deploy-${process.pid}-${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.log`);
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  const logName = slug.length > 120 ? `${slug.slice(0, 120)}-${createHash('sha256').update(name).digest('hex').slice(0, 16)}` : slug;
+  const logFile = path.join(tmpdir, `threadbear-deploy-${process.pid}-${logName}.log`);
   const fd = fs.openSync(logFile, 'w');
   const r = spawn(cmd, args, { ...opts, stdio: ['ignore', fd, fd] });
   fs.closeSync(fd);
