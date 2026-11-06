@@ -26,18 +26,14 @@ import { cleanTitle } from '../../src/runner.ts';
 const LS = String.fromCharCode(0x2028);
 const IDEO_SPACE = String.fromCharCode(0x3000);
 
-// Well under 100 ms: the old versions took a second or more on each of
-// these. The best of up to five, so a busy machine's pause isn't taken for
-// backtracking, which would be slow every time.
+// Backtracking spends CPU; waiting for another process or the disk does not.
+// The old versions took a second or more of CPU on each of these.
 function fast<T>(what: string, fn: () => T): T {
-  let best = Infinity;
-  let out!: T;
-  for (let i = 0; i < 5 && best >= 100; i++) {
-    const t0 = performance.now();
-    out = fn();
-    best = Math.min(best, performance.now() - t0);
-  }
-  assert.ok(best < 100, `${what} took ${Math.round(best)} ms`);
+  const cpu = process.cpuUsage();
+  const out = fn();
+  const { user, system } = process.cpuUsage(cpu);
+  const ms = (user + system) / 1000;
+  assert.ok(ms < 100, `${what} took ${Math.round(ms)} ms of CPU`);
   return out;
 }
 
@@ -162,7 +158,7 @@ test('F25: long runs in .env files parse in linear time', () => {
   assert.equal(fast('unclosed', () => parseEnvFile('A="x\n'.repeat(8000))).length, 8000);
 });
 
-test('F25: a folder with hundreds of .env files is read in full, as before', async () => {
+test('F25: a folder with hundreds of .env files is read in full, as before', async (t) => {
   // No count limit: one that stopped at 500 let a repo's junk push your own
   // .env.qa.local out of the mask (Codex's review of this fix).
   const home = tmpDir();
@@ -171,6 +167,8 @@ test('F25: a folder with hundreds of .env files is read in full, as before', asy
   for (let i = 0; i < 600; i++) fs.writeFileSync(path.join(repo, `.env.aaa${String(i).padStart(3, '0')}`), 'PLAIN=1\n');
   const own = `${crypto.randomBytes(24).toString('base64url')}7`;
   fs.writeFileSync(path.join(repo, '.env.qa.local'), `QA_PASSWORD=${own}\n`);
+  // Check the file count independently of the scan's real-time deadline.
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   const known = new KnownValues({ env: {}, home });
   known.noteFolder(repo);
   assert.equal(await known.settled(), true);
@@ -178,7 +176,7 @@ test('F25: a folder with hundreds of .env files is read in full, as before', asy
   assert.ok(!known.mask(`it is ${own}`).includes(own));
 });
 
-test("F25: a repo's many .env files of long runs are read in linear time", async () => {
+test("F25: a repo's many .env files of long runs are read in linear time", async (t) => {
   // The scan's case: many .env.<x> files, each a line of a long run, in the
   // thread's folder and the ones inside it. CPU time rather than the clock,
   // so a busy machine doesn't count: each file took a second of it before.
@@ -188,6 +186,7 @@ test("F25: a repo's many .env files of long runs are read in linear time", async
   for (const [i, dir] of [repo, path.join(repo, 'web')].entries()) {
     for (let j = 0; j < 5; j++) fs.writeFileSync(path.join(dir, `.env.x${i}${j}`), `FOO=a${' '.repeat(35_000)}b\nX_URL=a://${':'.repeat(35_000)}\n`);
   }
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   const known = new KnownValues({ env: {}, home });
   const cpu = process.cpuUsage();
   known.noteFolder(repo);

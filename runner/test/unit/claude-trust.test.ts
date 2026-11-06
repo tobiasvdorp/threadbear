@@ -631,11 +631,11 @@ test('F23: reading frontmatter and following commands stays quick on a hostile f
   fs.mkdirSync(path.join(dir, '.claude', 'agents'), { recursive: true });
   const spaces = ' '.repeat(200_000);
   fs.writeFileSync(path.join(dir, '.claude', 'agents', 'a.md'), `\n${'\n'.repeat(50_000)}${spaces}\n---\nname: a${spaces}x\nhooks:\n  Stop:\n    - hooks:\n        - type: command\n          command: x${spaces}y${spaces}\n${':'.repeat(50_000)}${spaces}\n---\n`);
-  const t = performance.now();
+  const cpu = process.cpuUsage();
   claudeCommands(dir, home);
-  // About 40 ms here; a regex that backtracks over those runs takes minutes.
-  // Loose, for a busy Mac running tests at background priority.
-  assert.ok(performance.now() - t < 3000, `took ${performance.now() - t} ms`);
+  // Backtracking spends CPU; time waiting for a busy Mac or disk does not.
+  const { user, system } = process.cpuUsage(cpu);
+  assert.ok((user + system) / 1000 < 3000, `took ${(user + system) / 1000} ms of CPU`);
 });
 
 test("F23: a thread in home starts without the project source, which would pick up any cloned repo's nested skills under home", () => {
