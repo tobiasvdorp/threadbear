@@ -700,8 +700,10 @@ test("F22: a command a live function queues to start after it returns isn't run"
 test('pre-trust hashing: a long first word with many words after it is linear, and a file over the read limit fails closed', () => {
   const folder = realTmp();
   const text = 'x'.repeat(20_000) + ' x'.repeat(20_000) + '\n';
-  write(folder, { 'a.sh': text });
-  assertLinear('long first word', () => Array.from(text, (c) => ({ k: 'lit', s: c })), () => reachOf(path.join(folder, 'a.sh'), follow(folder)), 200);
+  write(folder, { 'a.sh': text, 'small.sh': 'x'.repeat(5000) + ' x'.repeat(5000) + '\n' });
+  // Four times the input does four times the linear work. Rebuilding the
+  // first word for every later word does sixteen times the work.
+  assertLinear('long first word', () => reachOf(path.join(folder, 'small.sh'), follow(folder)), () => reachOf(path.join(folder, 'a.sh'), follow(folder)), 8);
   const big = realTmp();
   fs.mkdirSync(path.join(big, '.threadbear/patches'), { recursive: true });
   fs.writeFileSync(path.join(big, '.threadbear/patches/tools.ts'), "export default { actions: [{ title: 'S', run: 'node ./big.js' }], worktree: { setup: './s.sh' } };\n");

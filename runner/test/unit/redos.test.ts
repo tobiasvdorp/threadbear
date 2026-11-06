@@ -443,13 +443,11 @@ test('a Notion page names its task database as before', async () => {
 
 test('a Notion page of unclosed database tags is read in linear time', async () => {
   const text = '<database url="x" data-source-url="collection://a"'.repeat(6000);
-  let best = Infinity;
-  for (let i = 0; i < 5 && best >= 100; i++) {
-    const t0 = performance.now();
-    await assert.rejects(findSource(notionPage(text) as never, 'page-1'), /No database/);
-    best = Math.min(best, performance.now() - t0);
-  }
-  assert.ok(best < 100, `findSource took ${Math.round(best)} ms`);
+  const cpu = process.cpuUsage();
+  await assert.rejects(findSource(notionPage(text) as never, 'page-1'), /No database/);
+  const { user, system } = process.cpuUsage(cpu);
+  const ms = (user + system) / 1000;
+  assert.ok(ms < 100, `findSource took ${Math.round(ms)} ms of CPU`);
 });
 
 test('a Notion database with long runs reads in linear time', () => {
