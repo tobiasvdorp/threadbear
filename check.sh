@@ -160,8 +160,11 @@ step() {
 }
 
 # The runner's unit tests, as `npm test` runs them (runner/package.json),
-# plus a reporter that writes the files with a failure. Plenty of them
-# start real processes with real timeouts, and on a loaded machine those
+# plus a reporter that writes the files with a failure. Two files at once
+# bounds the CPU, memory and disk used by the real runners they boot,
+# including when this Mac has no remote check host configured.
+#
+# Real processes have real timeouts, and on a loaded machine those
 # fail with nothing wrong: six did at once, taking 13 to 145 s, while other
 # threads built the app on the M5 (6 Nov). So when a few files failed, just
 # those run again, one file at a time; passing then counts, but the step
@@ -172,7 +175,7 @@ runner_unit_tests() {
   local name="runner unit tests" dir="$ROOT/runner"
   local log="$LOGS/runner-unit-tests.log" list="$LOGS/runner-unit-tests.failed"
   local start=$SECONDS
-  local run=(node --test --test-timeout=300000 --test-force-exit --test-reporter=spec)
+  local run=(node --test --test-concurrency=2 --test-timeout=300000 --test-force-exit --test-reporter=spec)
   if (cd "$dir" && "${run[@]}" --test-reporter-destination=stdout \
       --test-reporter=./test/helpers/failed-files-reporter.mjs --test-reporter-destination="$list" \
       "test/unit/**/*.test.ts") >"$log" 2>&1; then
