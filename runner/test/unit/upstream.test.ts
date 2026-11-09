@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { tmpDir } from '../helpers/fakes.ts';
 import { FakeClock } from '../../src/clock.ts';
 import { nullLogger } from '../../src/log.ts';
-import { type CiRun, ciVerdict, FETCH_INTERVAL_MS, FIRST_LOOK_MS, SETTLE_MS, Upstream, cleanNotes, parseImportant, parseNotes, repoKey, signersPath, splitSignedTag, tagFor } from '../../src/upstream.ts';
+import { type CiRun, ciVerdict, gitAsync, FETCH_INTERVAL_MS, FIRST_LOOK_MS, SETTLE_MS, Upstream, cleanNotes, parseImportant, parseNotes, repoKey, signersPath, splitSignedTag, tagFor } from '../../src/upstream.ts';
 import { PATIENCE_MS } from '../helpers/patience.ts';
 
 // Commits and tags in the throwaway repos need a name, and must not pick
@@ -70,6 +71,13 @@ function world() {
 // The clock after every release date the tests use: a release dated after
 // today (and a couple of days' slack) isn't looked at.
 const LATER = Date.parse('2026-12-31T00:00:00Z');
+
+// origin as GitHub, still fetching from and pushing to the bare repo: the
+// runner reads the configured URL, git goes through the insteadOf.
+function asGitHub(repo: string, root: string): void {
+  git(repo, 'config', 'remote.origin.url', 'https://github.com/mikecann/threadbear.git');
+  git(repo, 'config', `url.${path.join(root, 'mike.git')}.insteadOf`, 'https://github.com/mikecann/threadbear.git');
+}
 
 function upstreamFor(checkout: string, home: string, clock = new FakeClock(LATER), extra = {}) {
   return new Upstream({ home, checkout, clock, log: nullLogger, ...extra });
@@ -295,10 +303,7 @@ test("ciVerdict: every workflow's latest attempt has to pass", () => {
 
 test("Mike's runner holds a release until GitHub's checks pass on that commit", async () => {
   const w = world();
-  // origin as GitHub, still pushing to the bare repo (the runner reads the
-  // configured URL, git fetches through the insteadOf).
-  git(w.mike, 'config', 'remote.origin.url', 'https://github.com/mikecann/threadbear.git');
-  git(w.mike, 'config', `url.${path.join(w.root, 'mike.git')}.insteadOf`, 'https://github.com/mikecann/threadbear.git');
+  asGitHub(w.mike, w.root);
   fs.mkdirSync(path.join(w.mike, '.github', 'workflows'), { recursive: true });
   const tip = commit(w.mike, '.github/workflows/build.yml', 'Build on GitHub');
   git(w.mike, 'push', '-q', 'origin', 'main');
@@ -340,6 +345,36 @@ test("Mike's runner holds a release until GitHub's checks pass on that commit", 
   assert.equal(up.status().published?.tag, tag);
   assert.equal(notesCalls, 1);
   assert.match(git(w.mike, "cat-file", "tag", tag!), /What's new:\n- Checks keep releases buildable/);
+});
+
+test("Mike's runner pushes a settled main GitHub doesn't have, then waits for its checks", async () => {
+  const w = world();
+  asGitHub(w.mike, w.root);
+  fs.mkdirSync(path.join(w.mike, '.github', 'workflows'), { recursive: true });
+  const tip = commit(w.mike, '.github/workflows/build.yml', 'Build on GitHub');
+  // Landed here, never pushed.
+  assert.notEqual(git(w.mike, 'ls-remote', 'origin', 'refs/heads/main').split('\t')[0], tip);
+  const committed = Number(git(w.mike, 'log', '-1', '--format=%ct')) * 1000;
+  const up = upstreamFor(w.mike, w.home, new FakeClock(committed + 2 * SETTLE_MS), { publish: { publish: true, signingKey: w.mikeKey.priv }, runningMainSettled: () => true, ciRuns: async () => assert.fail('not asked yet') });
+  assert.equal(await up.publishOnce(), undefined);
+  assert.equal(git(w.mike, 'ls-remote', 'origin', 'refs/heads/main').split('\t')[0], tip, 'pushed');
+  assert.match(up.status().held!.why, /just pushed main/);
+
+  // A main that's gone a different way from GitHub's isn't pushed over it.
+  const w2 = world();
+  asGitHub(w2.mike, w2.root);
+  commit(w2.mike, 'x.txt', 'Mine');
+  const other = path.join(w2.root, 'other');
+  git(w2.root, 'clone', '-q', path.join(w2.root, 'mike.git'), other);
+  commit(other, 'y.txt', 'Theirs');
+  git(other, 'push', '-q', 'origin', 'HEAD:main');
+  fs.mkdirSync(path.join(w2.mike, '.github', 'workflows'), { recursive: true });
+  commit(w2.mike, '.github/workflows/build.yml', 'Build on GitHub');
+  const at = Number(git(w2.mike, 'log', '-1', '--format=%ct')) * 1000;
+  const up2 = upstreamFor(w2.mike, w2.home, new FakeClock(at + 2 * SETTLE_MS), { publish: { publish: true, signingKey: w2.mikeKey.priv }, runningMainSettled: () => true });
+  assert.equal(await up2.publishOnce(), undefined);
+  assert.match(up2.status().held!.why, /different ways/);
+  assert.match(git(other, 'log', '-1', '--format=%s', 'origin/main'), /Theirs/);
 });
 
 test("a main whose origin isn't GitHub can't show its checks, so it waits", async () => {
@@ -473,8 +508,10 @@ test('a release swapped upstream after it verified never moves the ref a bring-i
   assert.equal(kept(w.theirs, '2026-10-30'), good, 'the verified ref keeps the commit that verified');
   assert.equal(s.release?.tag, 'release/2026-10-30');
   assert.equal(s.release?.commit, good);
-  // What upstream serves now is only in the staging namespace.
-  assert.equal(git(w.theirs, 'rev-parse', 'refs/threadbear/upstream-incoming/2026-10-30^{commit}'), evil);
+  // What upstream serves now never reached the checkout: it was staged
+  // outside it, didn't verify, and went (Daybreak, 7 Nov 2026).
+  assert.equal(git(w.theirs, 'for-each-ref', 'refs/threadbear/upstream-incoming/'), '');
+  assert.notEqual(spawnSync('git', ['-C', w.theirs, 'cat-file', '-e', evil]).status, 0, 'the unsigned tag\'s commit is not in the checkout');
 });
 
 test('a release name that verified keeps its first tag even if a signed one replaces it upstream', async () => {
@@ -672,4 +709,211 @@ test('tb updates: what to bring in, or that there is nothing', async () => {
   assert.match(text, /bringing-in-updates\.md/);
   assert.match(formatUpstream({ state: 'idle', checkedAt, release: { tag: 'release/2026-10-30', commit: 'abc', changes: 0, subjects: [] } }, now), /^Mike's releases: up to date with release\/2026-10-30, checked/);
   assert.equal(formatUpstream({ state: 'off', reason: 'upstream is this repo', published: { tag: 'release/2026-10-30', at: checkedAt } }, now), "Mike's releases: off (upstream is this repo)\nLast release tagged here: release/2026-10-30");
+});
+
+// ------------------------------------------- Daybreak, 7 Nov 2026: bounds
+// Upstream's tags are listed first, only a bounded few date-named ones are
+// fetched, into a folder of their own outside the checkout, every git
+// command has a deadline, and what doesn't verify leaves nothing behind.
+
+// Objects in the checkout, loose and packed.
+function objectsIn(repo: string): Set<string> {
+  const r = spawnSync('git', ['-C', repo, 'cat-file', '--batch-all-objects', '--batch-check=%(objectname)'], { encoding: 'utf8' });
+  return new Set(r.stdout.trim().split('\n').filter(Boolean));
+}
+
+test('upstream with thousands of tags: only a bounded few are fetched, and none that fail to verify stay', async () => {
+  const w = world();
+  assert.equal((await upstreamFor(w.theirs, w.home).check()).release?.tag, 'release/2026-10-01');
+  const base = git(w.mike, 'rev-parse', 'HEAD');
+  const tree = git(w.mike, 'rev-parse', `${base}^{tree}`);
+  // Fakes with commits of their own, so any that came over would show.
+  const fakes: string[] = [];
+  const fake = (msg: string) => {
+    const c = spawnSync('git', ['-C', w.mike, 'commit-tree', tree, '-p', base, '-m', msg], { encoding: 'utf8', env: GIT_ENV }).stdout.trim();
+    fakes.push(c);
+    return c;
+  };
+  const lines: string[] = [];
+  // Thousands of names, most not dates, and dates years ahead.
+  for (let i = 0; i < 3000; i++) lines.push(`create refs/tags/release/junk-${i} ${base}`);
+  for (let d = Date.parse('2027-01-10'); d < Date.parse('2030-01-01'); d += 86_400_000) lines.push(`create refs/tags/release/${new Date(d).toISOString().slice(0, 10)} ${base}`);
+  // Every date after the last release that isn't the real one: a name
+  // straight at a commit of its own (never fetched)...
+  for (let d = Date.parse('2026-10-02'); d <= Date.parse('2026-12-06'); d += 86_400_000) {
+    const name = new Date(d).toISOString().slice(0, 10);
+    if (name !== '2026-11-06') lines.push(`create refs/tags/release/${name} ${fake(name)}`);
+  }
+  assert.equal(spawnSync('git', ['-C', w.mike, 'update-ref', '--stdin'], { input: lines.join('\n') + '\n' }).status, 0);
+  // ...or an unsigned tag, newer than the real one, on a commit of its own.
+  for (let i = 7; i <= 31; i++) git(w.mike, 'tag', '-a', '-m', 'unsigned', `release/2026-12-${String(i).padStart(2, '0')}`, fake(`tag ${i}`));
+  const real = commit(w.mike, 'b.txt', 'Real');
+  signedTag(w.mike, 'release/2026-11-06', w.mikeKey.priv);
+  git(w.mike, 'push', '-q', 'origin', 'main', '--tags');
+  const before = objectsIn(w.theirs);
+  const up = upstreamFor(w.theirs, w.home);
+  // 25 unsigned tags newer than it: 20 a check, then the real one.
+  let s = await up.check();
+  assert.equal(s.release?.tag, 'release/2026-10-01');
+  s = await up.check();
+  assert.equal(s.release?.commit, real, s.reason ?? '');
+  const after = objectsIn(w.theirs);
+  assert.deepEqual(fakes.filter((f) => after.has(f)), [], "no unsigned tag's or name's commit is in the checkout");
+  // What came in is the release and its history: a commit, a tree, a blob and the tag.
+  assert.ok(after.size - before.size <= 4, `${after.size - before.size} objects came in`);
+  assert.equal(git(w.theirs, 'for-each-ref', 'refs/threadbear/upstream-incoming/'), '');
+  assert.deepEqual(fs.readdirSync(path.join(w.home, 'runner', 'upstream-fetch')), [], 'the staging folder is gone');
+});
+
+// A remote that never answers, standing in for one that's hijacked or down:
+// git's upload-pack swapped for a script that hangs, with a child of its own.
+function hangingUpstream(w: ReturnType<typeof world>, when: 'list' | 'fetch') {
+  const script = path.join(w.root, 'hang.sh');
+  const count = path.join(w.root, 'calls');
+  fs.writeFileSync(script, `#!/bin/bash
+n=$(( $(cat "${count}" 2>/dev/null || echo 0) + 1 )); echo $n >"${count}"
+if [ ${when === 'list' ? 1 : 2} -le $n ]; then sleep 600 & echo $! >>"${w.root}/pids"; echo $$ >>"${w.root}/pids"; wait; fi
+exec git-upload-pack "$@"
+`, { mode: 0o755 });
+  git(w.theirs, 'config', 'remote.upstream.uploadpack', script);
+  git(w.theirs, 'config', 'protocol.version', '2');
+  return () => fs.readFileSync(path.join(w.root, 'pids'), 'utf8').trim().split('\n').map(Number);
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+for (const when of ['list', 'fetch'] as const) {
+  test(`an upstream that hangs ${when === 'list' ? 'listing its tags' : 'sending them'} fails the check by its deadline, and leaves nothing running or behind`, async () => {
+    const w = world();
+    const up = upstreamFor(w.theirs, w.home, new FakeClock(LATER), { fetchTimeoutMs: 1500 });
+    assert.equal((await up.check()).release?.tag, 'release/2026-10-01');
+    fs.rmSync(path.join(w.root, 'calls'), { force: true });
+    commit(w.mike, 'b.txt', 'Newer');
+    signedTag(w.mike, 'release/2026-11-06', w.mikeKey.priv);
+    git(w.mike, 'push', '-q', 'origin', 'main', '--tags');
+    const pids = hangingUpstream(w, when);
+    const before = objectsIn(w.theirs);
+    const t0 = Date.now();
+    const s = await up.check();
+    assert.ok(Date.now() - t0 < 15_000, `took ${Date.now() - t0} ms`);
+    assert.equal(s.state, 'failed');
+    assert.match(s.reason ?? '', /timed out/);
+    assert.equal(s.release?.tag, 'release/2026-10-01', 'keeps the release it knew of');
+    await new Promise((r) => setTimeout(r, 200));
+    for (const pid of pids()) assert.ok(!alive(pid), `pid ${pid} still running`);
+    assert.deepEqual([...objectsIn(w.theirs)].filter((o) => !before.has(o)), []);
+    assert.deepEqual(fs.readdirSync(path.join(w.home, 'runner', 'upstream-fetch')), []);
+  });
+}
+
+test('gitAsync stops a git command at its deadline, and what it started', async () => {
+  const dir = tmpDir('tb-git-deadline-');
+  const pidFile = path.join(dir, 'pid');
+  const t0 = Date.now();
+  await assert.rejects(gitAsync(dir, ['-c', `alias.hang=!sleep 600 & echo $! >${pidFile}; wait`, 'hang'], { timeoutMs: 500 }), /timed out/);
+  assert.ok(Date.now() - t0 < 5000);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.ok(!alive(Number(fs.readFileSync(pidFile, 'utf8'))), 'the sleep it started is gone');
+  assert.equal(await gitAsync(dir, ['--version']).then((v) => v.startsWith('git version')), true);
+});
+
+// Codex's review of the bounds.
+test("fetch.prune and fetch.pruneTags in the fork's config change none of its refs", async () => {
+  const w = world();
+  git(w.theirs, 'tag', 'mine');
+  git(w.theirs, 'config', 'fetch.prune', 'true');
+  git(w.theirs, 'config', 'fetch.pruneTags', 'true');
+  git(w.theirs, 'config', 'remote.upstream.prune', 'true');
+  const real = commit(w.mike, 'b.txt', 'Real');
+  signedTag(w.mike, 'release/2026-11-06', w.mikeKey.priv);
+  git(w.mike, 'tag', '-a', '-m', 'unsigned', 'release/2026-11-07');
+  git(w.mike, 'push', '-q', 'origin', 'main', '--tags');
+  const refsBefore = git(w.theirs, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/tags', 'refs/heads', 'refs/remotes');
+  const s = await upstreamFor(w.theirs, w.home).check();
+  assert.equal(s.release?.commit, real, s.reason ?? '');
+  assert.equal(git(w.theirs, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/tags', 'refs/heads', 'refs/remotes'), refsBefore);
+  assert.equal(git(w.theirs, 'fsck', '--connectivity-only', '--no-dangling'), '');
+});
+
+test('two checks at once, as when a runner hands over to the next, each stage on their own', async () => {
+  const w = world();
+  const real = commit(w.mike, 'b.txt', 'Real');
+  signedTag(w.mike, 'release/2026-11-06', w.mikeKey.priv);
+  git(w.mike, 'push', '-q', 'origin', 'main', '--tags');
+  const [a, b] = await Promise.all([upstreamFor(w.theirs, w.home).check(), upstreamFor(w.theirs, w.home).check()]);
+  assert.equal(a.release?.commit, real, a.reason ?? '');
+  assert.equal(b.release?.commit, real, b.reason ?? '');
+  assert.deepEqual(fs.readdirSync(path.join(w.home, 'runner', 'upstream-fetch')), []);
+});
+
+test('a fetch bigger than the limit is stopped, and brings nothing into the checkout', async () => {
+  const w = world();
+  assert.equal((await upstreamFor(w.theirs, w.home).check()).release?.tag, 'release/2026-10-01');
+  git(w.mike, 'checkout', '-q', '-b', 'big');
+  fs.writeFileSync(path.join(w.mike, 'big.bin'), crypto.randomBytes(3 * 1024 * 1024));
+  git(w.mike, 'add', 'big.bin');
+  git(w.mike, 'commit', '-q', '-m', 'big');
+  git(w.mike, 'tag', '-a', '-m', 'unsigned', 'release/2026-11-07');
+  git(w.mike, 'push', '-q', 'origin', 'refs/tags/release/2026-11-07');
+  const before = objectsIn(w.theirs);
+  const s = await upstreamFor(w.theirs, w.home, new FakeClock(LATER), { stageMaxBytes: 1024 * 1024 }).check();
+  assert.equal(s.state, 'failed');
+  assert.match(s.reason ?? '', /more than 1 MB/);
+  assert.equal(s.release, undefined);
+  assert.deepEqual([...objectsIn(w.theirs)].filter((o) => !before.has(o)), []);
+  assert.deepEqual(fs.readdirSync(path.join(w.home, 'runner', 'upstream-fetch')), []);
+});
+
+test("tags too big to read are remembered, so they can't hold a real release out", async () => {
+  const w = world();
+  const big = path.join(w.root, 'big.txt');
+  fs.writeFileSync(big, 'x'.repeat(1024 * 1024 + 10));
+  for (let i = 7; i <= 27; i++) git(w.mike, 'tag', '-a', '-F', big, `release/2026-12-${String(i).padStart(2, '0')}`);
+  const real = commit(w.mike, 'b.txt', 'Real');
+  signedTag(w.mike, 'release/2026-11-06', w.mikeKey.priv);
+  git(w.mike, 'push', '-q', 'origin', 'main', '--tags');
+  const up = upstreamFor(w.theirs, w.home);
+  let s = await up.check();
+  for (let i = 0; i < 2 && s.release?.commit !== real; i++) s = await up.check();
+  assert.equal(s.release?.commit, real, s.reason ?? '');
+});
+
+test('a server that lists commits as tags (forged peeled lines) still lets a real release through', async () => {
+  const w = world();
+  const base = git(w.mike, 'rev-parse', 'HEAD');
+  const lines: string[] = [];
+  for (let i = 7; i <= 31; i++) lines.push(`create refs/tags/release/2026-12-${String(i).padStart(2, '0')} ${base}`);
+  assert.equal(spawnSync('git', ['-C', w.mike, 'update-ref', '--stdin'], { input: lines.join('\n') + '\n' }).status, 0);
+  const real = commit(w.mike, 'b.txt', 'Real');
+  signedTag(w.mike, 'release/2026-11-06', w.mikeKey.priv);
+  git(w.mike, 'push', '-q', 'origin', 'main', '--tags');
+  // ls-remote as such a server would answer: a peeled line for every name.
+  const forge = async (cwd: string, args: string[], opts?: Parameters<typeof gitAsync>[2]) => {
+    const out = await gitAsync(cwd, args, opts);
+    if (args[0] !== 'ls-remote') return out;
+    return out.split('\n').flatMap((l) => (l.endsWith('^{}') || !l ? [l] : [l, `${l.split('\t')[0]}\t${l.split('\t')[1]}^{}`])).join('\n');
+  };
+  const up = upstreamFor(w.theirs, w.home, new FakeClock(LATER), { git: forge });
+  let s = await up.check();
+  for (let i = 0; i < 2 && s.release?.commit !== real; i++) s = await up.check();
+  assert.equal(s.release?.commit, real, s.reason ?? '');
+});
+
+test("gitAsync's watcher stops a command it says is over its limit, and what it started", async () => {
+  const dir = tmpDir('tb-git-watch-');
+  const pidFile = path.join(dir, 'pid');
+  let asked = 0;
+  await assert.rejects(
+    gitAsync(dir, ['-c', `alias.hang=!sleep 600 & echo $! >${pidFile}; wait`, 'hang'], { timeoutMs: 60_000, over: () => (++asked >= 2 ? 'fetched more than 1 MB' : undefined) }),
+    /fetched more than 1 MB/,
+  );
+  await new Promise((r) => setTimeout(r, 200));
+  assert.ok(!alive(Number(fs.readFileSync(pidFile, 'utf8'))));
 });

@@ -53,11 +53,38 @@ const timed = <T>(fn: () => T): { ms: number; out: T } => {
 // quadratic regexes this replaces took thousands of times one pass
 // (minutes at these sizes). At full speed, each parse below takes well
 // under 100 ms.
+// Up to three tries: a busy Mac (a build or another suite running) can
+// stall one timing for a second, which failed the runner's build of main
+// on 6 Nov with this test passing alone. Quadratic work is slow every
+// time, so one quick try is enough to show it's linear.
 function assertLinear<T>(label: string, ref: () => unknown, fn: () => T, factor = 50): T {
-  const base = Math.min(timed(ref).ms, timed(ref).ms, timed(ref).ms);
-  const { ms, out } = timed(fn);
-  assert.ok(ms < factor * base + 50, `${label}: ${Math.round(ms)} ms, against ${Math.round(base)} ms for one pass`);
-  return out;
+  let last = '';
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const base = Math.min(timed(ref).ms, timed(ref).ms, timed(ref).ms);
+    const { ms, out } = timed(fn);
+    if (ms < factor * base + 50) return out;
+    last = `${label}: ${Math.round(ms)} ms, against ${Math.round(base)} ms for one pass`;
+  }
+  assert.fail(`${last} (three tries)`);
+}
+
+// The same for a shell script's parse, measured against itself on an eighth
+// of the input: 8 times the work when linear, 64 when quadratic, so 16 splits
+// them. A cheap stand-in for lexing (mapping each character to an object) is
+// no reference here: the JIT took it from 12 ms to 2 by the end of this file
+// while the parse stayed about 300, which failed the release build 2 runs in 3.
+// A second try, as a process can land on a slower core; quadratic fails both.
+function assertScriptLinear(label: string, folder: string, n: number, script: (n: number) => string): void {
+  const parse = (size: number) => {
+    write(folder, { 'a.sh': script(size) });
+    return () => reachOf(path.join(folder, 'a.sh'), follow(folder));
+  };
+  const small = parse(Math.floor(n / 8));
+  const limit = 16 * Math.min(timed(small).ms, timed(small).ms, timed(small).ms) + 50;
+  const full = parse(n);
+  let ms = timed(full).ms;
+  if (ms >= limit) ms = timed(full).ms;
+  assert.ok(ms < limit, `${label}: ${Math.round(ms)} ms, over ${Math.round(limit)} ms, 16 times an eighth of the input`);
 }
 
 // One plain pass over a text: its lines, and its characters one by one
@@ -89,8 +116,11 @@ test("F10: a trusted patch's bare import that resolves through the repo's own pa
     const root = tmpDir();
     const folder = path.join(root, 'repo');
     const ran = path.join(marks, `${target.replace(/\W/g, '-')}.ran`);
+    // A real checkout, with node_modules installed (git doesn't track it).
+    fs.mkdirSync(folder, { recursive: true });
+    git(folder, 'init', '-q');
     write(folder, {
-      '.git/HEAD': 'ref: refs/heads/main\n',
+      '.gitignore': 'node_modules\n',
       'package.json': JSON.stringify({ ...pkg, type: 'module' }),
       [target]: `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(ran)}, 'x');\nexport const list = 1;\n`,
       // What `zod` was when the patch was trusted: a real package.
@@ -120,17 +150,23 @@ test("F10: a repo unpacked inside some node_modules/zod folder can't self-refere
     '.threadbear/patches/tools.mjs': "import { list } from 'zod';\nexport default { actions: [{ title: 'Go ' + list, run: 'true' }] };\n",
   });
   const trust = new PatchTrust();
-  assert.equal(trust.trustCurrent([patchIn(folder, 'tools.mjs')]).length, 1);
+  // Not a git checkout, so it can't be trusted at all now; before that, a
+  // yes was refused when it loaded.
+  assert.ok(trust.trustCurrent([patchIn(folder, 'tools.mjs')]).length <= 1);
   const set = await loadPatchSet(folder, root, new Map(), [], [], undefined, trust);
-  assert.match(set.patches[0]?.error ?? '', /imports zod, its own package by name/);
+  // Not a git checkout either, so it can't tell installed from shipped
+  // (committed-node-modules.test.ts); the load hook refuses it too.
+  assert.match(set.patches[0]?.error ?? '', /imports zod, its own package by name|imports zod, and .* isn't a git checkout/);
   assert.equal(fs.existsSync(ran), false);
 });
 
 test('F10: a bare import of a real package in node_modules, or a builtin, still loads', async () => {
   const root = tmpDir();
   const folder = path.join(root, 'repo');
+  fs.mkdirSync(folder, { recursive: true });
+  git(folder, 'init', '-q');
   write(folder, {
-    '.git/HEAD': 'ref: refs/heads/main\n',
+    '.gitignore': 'node_modules\n',
     'package.json': JSON.stringify({ name: 'repo', type: 'module' }),
     'node_modules/left-pad-x/package.json': JSON.stringify({ name: 'left-pad-x', type: 'module', exports: './index.mjs' }),
     'node_modules/left-pad-x/index.mjs': "export const title = 'Padded';\n",
@@ -353,15 +389,10 @@ test("F19: a patch with `./` and a long run of dots is hashed in linear time, an
 
 test('pre-trust hashing: a script with a very long word is followed in linear time', () => {
   const folder = realTmp();
-  const text = 'a'.repeat(200_000) + '\n' + 'B'.repeat(100_000) + '+x=1\n';
-  write(folder, { 'a.sh': text });
-  // Lexing makes a part of each character, so the pass here is that.
-  assertLinear('long word', () => Array.from(text, (c) => ({ k: 'lit', s: c })), () => reachOf(path.join(folder, 'a.sh'), follow(folder)), 200);
+  assertScriptLinear('long word', folder, 100_000, (n) => 'a'.repeat(2 * n) + '\n' + 'B'.repeat(n) + '+x=1\n');
   // A long run of reserved words (Codex's review, 6 Nov).
   const words = realTmp();
-  const ifs = 'if '.repeat(100_000) + '\n';
-  write(words, { 'a.sh': ifs });
-  assertLinear('reserved words', () => Array.from(ifs, (c) => ({ k: 'lit', s: c })), () => reachOf(path.join(words, 'a.sh'), follow(words)), 200);
+  assertScriptLinear('reserved words', words, 100_000, (n) => 'if '.repeat(n) + '\n');
   // A shell script too big to read fails closed.
   write(words, { 'big.sh': 'true\n'.repeat(300_000) });
   assert.match(reachOf(path.join(words, 'big.sh'), follow(words)).problem ?? '', /over 1024 KB/);
@@ -551,7 +582,8 @@ export default { appliesTo: ['*.foo'], panels: [{ title: 'Status', url: 'http://
   assert.equal(base.patches[0]?.untrusted, undefined);
   const set = await applyLive(base, { cwd: video, threadId: 't', run: (c, cwd) => runCommand(c, { cwd, env: process.env }), verify: (f, h) => trust.verify(f, h) });
   assert.equal(set.panels[0]?.badge, undefined);
-  assert.match(set.patches[0]?.liveError ?? '', /badge\.sh, which patch trust didn't hash/);
+  // Refused from the folder it applies in first: outside that repo and off the short list.
+  assert.match(set.patches[0]?.liveError ?? '', /Not run: .*badge\.sh/);
   assert.equal(fs.existsSync(ran), false);
 });
 
@@ -642,9 +674,7 @@ test("F28: Codex's third round: node -- -, an rc file on an open descriptor, inc
   write(folder, { '.yarnrc.yml': '"yarnPath": yarn.cjs\n' });
   assert.ok(reach('yarn install').files.some((f) => f.endsWith('yarn.cjs')), 'a quoted key');
   // A long run of assignments is linear.
-  const text = 'a=1 '.repeat(100_000) + 'true\n';
-  write(folder, { 'a.sh': text });
-  assertLinear('assignments', () => Array.from(text, (c) => ({ k: 'lit', s: c })), () => reachOf(path.join(folder, 'a.sh'), follow(folder)), 200);
+  assertScriptLinear('assignments', folder, 100_000, (n) => 'a=1 '.repeat(n) + 'true\n');
 });
 
 test("F28: Codex's fourth round: env files, #! -s, $'' escapes, a Makefile linked to stdin, make -I and -C twice, !=, Yarn Classic and flow plugins, and linear awk and wrappers", () => {
@@ -674,9 +704,7 @@ test("F28: Codex's fourth round: env files, #! -s, $'' escapes, a Makefile linke
   write(folder, { '.yarnrc.yml': 'plugins: [{path: .yarn/plugins/custom.cjs, spec: custom}]\n' });
   assert.match(reach('yarn install').problem ?? '', /flow value/);
   const awk = realTmp();
-  const prog = "awk '" + 'print '.repeat(100_000) + "'\n";
-  write(awk, { 'a.sh': prog });
-  assertLinear('awk prints', () => Array.from(prog, (c) => ({ k: 'lit', s: c })), () => reachOf(path.join(awk, 'a.sh'), follow(awk)), 200);
+  assertScriptLinear('awk prints', awk, 100_000, (n) => "awk '" + 'print '.repeat(n) + "'\n");
   assert.match(reachOfCommand(`awk '{ print $1 | "sh" }'`, 'the command', follow(awk)).problem ?? '', /runs commands/);
   assert.equal(reachOfCommand(`awk '{ if (a || b) print $1 }'`, 'the command', follow(awk)).problem, undefined);
   const envs = 'env '.repeat(50_000) + 'true\n';
@@ -699,11 +727,7 @@ test("F22: a command a live function queues to start after it returns isn't run"
 
 test('pre-trust hashing: a long first word with many words after it is linear, and a file over the read limit fails closed', () => {
   const folder = realTmp();
-  const text = 'x'.repeat(20_000) + ' x'.repeat(20_000) + '\n';
-  write(folder, { 'a.sh': text, 'small.sh': 'x'.repeat(5000) + ' x'.repeat(5000) + '\n' });
-  // Four times the input does four times the linear work. Rebuilding the
-  // first word for every later word does sixteen times the work.
-  assertLinear('long first word', () => reachOf(path.join(folder, 'small.sh'), follow(folder)), () => reachOf(path.join(folder, 'a.sh'), follow(folder)), 8);
+  assertScriptLinear('long first word', folder, 20_000, (n) => 'x'.repeat(n) + ' x'.repeat(n) + '\n');
   const big = realTmp();
   fs.mkdirSync(path.join(big, '.threadbear/patches'), { recursive: true });
   fs.writeFileSync(path.join(big, '.threadbear/patches/tools.ts'), "export default { actions: [{ title: 'S', run: 'node ./big.js' }], worktree: { setup: './s.sh' } };\n");

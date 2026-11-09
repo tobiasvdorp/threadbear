@@ -54,6 +54,15 @@ public final class LocalPreviewSite: @unchecked Sendable {
     static let scannedExtensions: Set<String> = ["html", "htm", "css"]
     /// Bigger than any page or picture a preview needs.
     public static let maxBytes = 64 * 1024 * 1024
+    /// How much of a page or stylesheet is read for what it names, and how
+    /// many names are kept from one file and in all: a 64 MB page of short
+    /// `src=` attributes made millions of strings and a set of them before
+    /// the page was shown (Daybreak, 7 Nov 2026). A real page names its
+    /// files near the top and far fewer than this; an asset named past the
+    /// limits just isn't served.
+    public static let scanBytes = 4 * 1024 * 1024
+    public static let maxReferencesPerFile = 2_000
+    public static let maxAllowed = 10_000
 
     /// The folder is the file's own (its symlinks followed); the page itself
     /// is held to the same rules as everything else when it's served.
@@ -78,6 +87,12 @@ public final class LocalPreviewSite: @unchecked Sendable {
     private let rootFD: Int32
     public let pageDigest: String?
 
+    /// How many paths the page may read now (for tests).
+    var allowedCount: Int { lock.withLock { allowed.count } }
+
+    /// Whether `relative` is one the page may read now (for tests).
+    func allows(_ relative: String) -> Bool { lock.withLock { allowed.contains(relative) } }
+
     deinit { close(rootFD) }
 
     /// The bytes and MIME type for `path` (from the folder, as in the URL
@@ -91,12 +106,24 @@ public final class LocalPreviewSite: @unchecked Sendable {
         guard relative == page || Self.assetExtensions.contains(ext) && lock.withLock({ allowed.contains(relative) }) else { return nil }
         guard let data = Self.read(parts, under: rootFD, maxBytes: Self.maxBytes) else { return nil }
         if relative == page, let pageDigest, Self.digest(data) != pageDigest { return nil }
-        if Self.scannedExtensions.contains(ext), let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) {
+        let utf8 = Self.scannedExtensions.contains(ext) && String(data: data, encoding: .utf8) != nil
+        if Self.scannedExtensions.contains(ext) {
+            // Only the start is read for names (scanBytes); a character cut
+            // in two at the end reads as U+FFFD, which names nothing.
+            let head = data.prefix(Self.scanBytes)
+            let text = utf8 ? String(decoding: head, as: UTF8.self) : String(data: Data(head), encoding: .isoLatin1) ?? ""
             let dir = (relative as NSString).deletingLastPathComponent
-            let found = (ext == "css" ? Self.cssReferences(in: text) : Self.htmlReferences(in: text)).compactMap { Self.resolve($0, from: dir) }
-            lock.withLock { allowed.formUnion(found) }
+            let limit = Self.maxReferencesPerFile
+            let found = (ext == "css" ? Self.cssReferences(in: text, limit: limit) : Self.htmlReferences(in: text, limit: limit)).compactMap { Self.resolve($0, from: dir) }
+            lock.withLock {
+                for ref in found where allowed.count < Self.maxAllowed { allowed.insert(ref) }
+            }
         }
-        let mime = UTType(filenameExtension: ext)?.preferredMIMEType ?? "application/octet-stream"
+        var mime = UTType(filenameExtension: ext)?.preferredMIMEType ?? "application/octet-stream"
+        // With no charset in the response or the page, WebKit reads it as
+        // Latin-1 and a UTF-8 page's ✓ shows as "âœ“" (Mike, 7 Nov). A page
+        // or stylesheet that is valid UTF-8 is served as that.
+        if utf8 { mime += "; charset=utf-8" }
         return (data, mime)
     }
 
@@ -154,25 +181,28 @@ public final class LocalPreviewSite: @unchecked Sendable {
     /// attributes, each part of a `srcset`, and `url()` and `@import` in its
     /// style attributes and `<style>` blocks. Scripts' contents are taken
     /// out first, so nothing a script says counts.
-    static func htmlReferences(in text: String) -> [String] {
+    /// At most `limit` of them, stopping each read once it has them all.
+    static func htmlReferences(in text: String, limit: Int = .max) -> [String] {
         let markup = withoutScriptContents(text)
-        var out = matches(#"\b(?:src|href|poster|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#, in: markup)
-        for srcset in matches(#"\bsrcset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#, in: markup) {
+        var out = matches(#"\b(?:src|href|poster|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#, in: markup, limit: limit)
+        srcsets: for srcset in matches(#"\bsrcset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#, in: markup, limit: limit - out.count) {
             for piece in srcset.split(separator: ",") {
+                guard out.count < limit else { break srcsets }
                 if let first = piece.split(separator: " ").first { out.append(String(first)) }
             }
         }
-        return out + cssReferences(in: markup)
+        return out + cssReferences(in: markup, limit: limit - out.count)
     }
 
-    /// What a stylesheet names: `url()` and `@import`.
-    static func cssReferences(in text: String) -> [String] {
-        cssURLs(in: text) + matches(#"@import\s+(?:"([^"]*)"|'([^']*)')"#, in: text)
+    /// What a stylesheet names: `url()` and `@import`, at most `limit`.
+    static func cssReferences(in text: String, limit: Int = .max) -> [String] {
+        let urls = cssURLs(in: text, limit: limit)
+        return urls + matches(#"@import\s+(?:"([^"]*)"|'([^']*)')"#, in: text, limit: limit - urls.count)
     }
 
-    // These run on the main thread, as the preview's web view asks for each
-    // file (LocalPreviewSchemeHandler), on whatever a page or stylesheet
-    // says. Two of the regexes they used backtracked: `url(` and 16 KB of
+    // These ran on the main thread, as the preview's web view asks for each
+    // file (LocalPreviewSchemeHandler, which now serves off it), on whatever
+    // a page or stylesheet says. Two of the regexes they used backtracked: `url(` and 16 KB of
     // spaces took 15 seconds, and `<script>` over and over with no
     // `</script>` was quadratic (6 Nov 2026). Both are read in one pass
     // now, giving what the regexes gave: ICU finds where each starts (its
@@ -217,7 +247,8 @@ public final class LocalPreviewSite: @unchecked Sendable {
     /// `url\(\s*(?:"([^"]*)"|'([^']*)'|([^)"'\s]*))\s*\)`, trimmed, as
     /// `matches` gave it: a quoted value, or a bare one up to a space,
     /// quote or `)`, then `)` after any spaces.
-    static func cssURLs(in text: String) -> [String] {
+    static func cssURLs(in text: String, limit: Int = .max) -> [String] {
+        guard limit > 0 else { return [] }
         let units = Array(text.utf16)
         let n = units.count
         let dq = UInt16(UInt8(ascii: "\"")), sq = UInt16(UInt8(ascii: "'")), paren = UInt16(UInt8(ascii: ")"))
@@ -231,7 +262,7 @@ public final class LocalPreviewSite: @unchecked Sendable {
         var resume = 0
         // Enumerated, not listed: a 64 MB stylesheet of `url(` would make
         // millions of matches at once (Codex's review).
-        urlOpenRegex.enumerateMatches(in: text, range: NSRange(location: 0, length: n)) { open, _, _ in
+        urlOpenRegex.enumerateMatches(in: text, range: NSRange(location: 0, length: n)) { open, _, stop in
             guard let open, open.range.location >= resume else { return }
             let p = afterOpen.first(in: units, from: NSMaxRange(open.range))
             var value: Range<Int>?, close = 0
@@ -251,6 +282,7 @@ public final class LocalPreviewSite: @unchecked Sendable {
             guard let value else { return }
             out.append(String(decoding: units[value], as: UTF16.self).trimmingCharacters(in: .whitespaces))
             resume = close + 1
+            if out.count >= limit { stop.pointee = true }
         }
         return out
     }
@@ -285,15 +317,16 @@ public final class LocalPreviewSite: @unchecked Sendable {
     }
 
     /// The first group that matched in each match of `pattern`.
-    private static func matches(_ pattern: String, in text: String) -> [String] {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+    private static func matches(_ pattern: String, in text: String, limit: Int = .max) -> [String] {
+        guard limit > 0, let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
         // Enumerated, so a page of millions of `src=x` holds the strings, not
         // a match object for each as well (Codex's review).
         var out: [String] = []
-        regex.enumerateMatches(in: text, range: NSRange(text.startIndex..., in: text)) { match, _, _ in
+        regex.enumerateMatches(in: text, range: NSRange(text.startIndex..., in: text)) { match, _, stop in
             guard let match else { return }
             if let first = (1..<match.numberOfRanges).lazy.compactMap({ Range(match.range(at: $0), in: text) }).first {
                 out.append(String(text[first]).trimmingCharacters(in: .whitespaces))
+                if out.count >= limit { stop.pointee = true }
             }
         }
         return out

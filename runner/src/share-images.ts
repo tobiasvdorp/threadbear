@@ -287,8 +287,7 @@ export function replyImagesInEvent(e: PersistedEvent, cwd: string | undefined, h
 // The pictures Mike pasted into a message, for his own website (`sync.pastedPictures`
 // in runner.json, on by default; docs/on-your-mac.md). `src` is picture:N, for
 // the [Picture N] that stands for it (docs/protocol.md, "Pictures in a message"):
-// the phone only swaps a src it finds in Markdown, so it goes on showing its
-// chip. Only as they're sent, never by looking back through the logs: nobody
+// the phone draws them over Mike's bubble and keeps the chips in his words. Only as they're sent, never by looking back through the logs: nobody
 // asked for what they'd already pasted to go up, and backfills are what cost.
 export function pastedImagesInEvent(e: PersistedEvent): ReplyImage[] {
   if (e.type !== 'user.message') return [];

@@ -9,6 +9,14 @@ extension AppModel {
     /// 30 Oct): beside the thread as a dock tab the images were too small
     /// to compare.
     func openReview(threadId: String, review: DesignReview) {
+        // Another Mac's review: its pictures and pages are files on that
+        // Mac, and read here they'd be whatever this Mac has at those paths
+        // (Codex review, 7 Nov). Its answers went to this Mac's runner too,
+        // which doesn't have it, so it never worked from here.
+        if let thread = threads[threadId], thread.isRemote {
+            errorMessage = "This review is on \(runnerName(of: thread) ?? "another Mac"). Open it there for now."
+            return
+        }
         let key = threadId + "/" + review.id
         if let existing = reviewWindows[key] {
             existing.session.receive(review)
@@ -132,8 +140,13 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         window.delegate = self
         // The app, for a page's Open in Browser (LocalPagePreview).
+        // A window of its own doesn't inherit the main window's openURL, and
+        // the agent's notes in it are Markdown with links: they go through
+        // OpenGate as links from the thread (Codex's review, 8 Nov).
         window.contentView = NSHostingView(rootView: ReviewWindow(session: session, back: back, close: { [weak self] in self?.close() })
-            .environment(app).allowsWindowActivationEvents())
+            .environment(app)
+            .environment(\.openURL, OpenGate.urlAction(files: .thread(session.threadId)))
+            .allowsWindowActivationEvents())
         // Up in the title bar rather than a row of their own, so the images
         // and the choices get that height. Wide enough for all of them, as an
         // accessory doesn't resize when some come and go.
@@ -217,12 +230,23 @@ final class ReviewNativeWindow: NSWindow {
                 if session.mode == .single { session.showAll() } else { session.browse(0) }
                 return
             case 53 where session.mode == .single: // Esc: out of a zoom, then out to all of them
-                if session.zoomed { session.zoom(.fit) } else { session.showAll() }
+                if stageIsZoomed { session.zoom(.fit) } else { session.showAll() }
                 return
             default: break
             }
         }
         super.keyDown(with: event)
+    }
+
+    /// Whether the stage is zoomed in right now. `session.zoomed` hears a
+    /// moment later (the stage tells it on the next turn of the main
+    /// queue), so Esc straight after a zoom, with the app busy, went out
+    /// to all of them rather than out of the zoom.
+    private var stageIsZoomed: Bool {
+        func zoomed(_ view: NSView) -> Bool {
+            (view as? ReviewImageScroll)?.isZoomedNow == true || view.subviews.contains(where: zoomed)
+        }
+        return contentView.map(zoomed) ?? false
     }
 }
 
@@ -304,9 +328,11 @@ struct ReviewWindow: View {
                     Spacer()
                     if session.conflict && session.review.isPending {
                         Button("Save my draft") { Task { await session.keepMyDraft() } }
+                            .busy(session.saving)
                             .tip("Keep what you have here, over the copy that changed elsewhere")
                     } else if session.review.isPending {
                         Button("Try saving again") { Task { await session.saveNow() } }
+                            .busy(session.saving)
                             .tip("Save the draft to the runner again")
                     }
                 }.padding(12).background(Color.orange.opacity(0.1))
@@ -368,14 +394,17 @@ struct ReviewWindow: View {
                 }.buttonStyle(.plain)
                     .tip(session.peeking ? "Back to \(session.focusedOption?.id ?? "it") (or let go of Space)" : "Flick to \(baseline.title): click, or hold Space")
             }
-            if let link = option.url, let url = URL(string: link) {
-                Button { NSWorkspace.shared.open(url) } label: {
+            // Only a web page, which is all an option's url is for: a runner
+            // (maybe another Mac's) sends it, and a file: or another app's
+            // link would open whatever it named here (Daybreak, 7 Nov).
+            if let url = LinkPolicy.web(option.url) {
+                Button { OpenGate.openWeb(url) } label: {
                     Label("Open live", systemImage: "arrow.up.right")
                         .font(.system(size: TypeScale.detail, weight: .medium))
                         .padding(.horizontal, 11).frame(height: 26)
                         .background(Color.primary.opacity(0.08), in: Capsule())
                         .contentShape(Capsule())
-                }.buttonStyle(.plain).tip("Try \(option.id) running live: \(link)")
+                }.buttonStyle(.plain).tip("Try \(option.id) running live: \(url.absoluteString)")
             }
         }
         .padding(.horizontal, 22).padding(.top, 14)
@@ -536,6 +565,9 @@ struct ReviewWindow: View {
                 Text(option.id).font(.system(size: TypeScale.detail, weight: .semibold))
                     .foregroundStyle(picked ? Color.accentColor : Color.secondary)
                 if count > 1 { Text("\(count) shots").font(.system(size: TypeScale.detail)).foregroundStyle(.tertiary) }
+                if session.review.recommended == option.id {
+                    Text("my pick").font(.system(size: TypeScale.detail)).foregroundStyle(Color.accentColor)
+                }
             }
             .lineLimit(1).frame(height: Self.captionHeight, alignment: .topLeading)
             Group {
@@ -569,8 +601,11 @@ struct ReviewWindow: View {
         VStack(spacing: 0) {
             ScrollViewReader { scroller in ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
+                    // The agent's lead, as markdown in the text colour: drawn
+                    // raw in grey it was one long wall where backticks showed
+                    // and nothing stood out (Mike, 7 Nov).
                     if let note = session.review.note, !note.isEmpty {
-                        Text(note).font(.system(size: TypeScale.work)).foregroundStyle(.secondary)
+                        Text(AttributedString.inlineMarkdown(note)).font(.system(size: TypeScale.work)).lineSpacing(2)
                             .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                             .padding(14)
                         Divider()
@@ -652,10 +687,14 @@ struct ReviewWindow: View {
     private func choiceText(_ option: ReviewOption) -> some View {
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(option.label).font(.system(size: TypeScale.work, weight: .semibold))
+                // The agent's pick, worded and coloured as on an asks card.
+                (Text(option.label).font(.system(size: TypeScale.work, weight: .semibold))
+                    + (session.review.recommended == option.id
+                        ? Text("  my pick").font(.system(size: TypeScale.detail)).foregroundStyle(Color.accentColor)
+                        : Text("")))
                     .fixedSize(horizontal: false, vertical: true)
                 if let reason = option.note, !reason.isEmpty {
-                    Text(reason).font(.system(size: TypeScale.detail)).foregroundStyle(.secondary)
+                    Text(AttributedString.inlineMarkdown(reason)).font(.system(size: TypeScale.detail)).foregroundStyle(.secondary).lineSpacing(1.5)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -973,6 +1012,8 @@ final class ReviewImageScroll: NSScrollView {
     private var dragOrigin = NSPoint.zero
     var onClick: (() -> Void)?
     var onZoom: ((Bool) -> Void)?
+    /// What `onZoom` will say, before it's said.
+    var isZoomedNow: Bool { zoomable && magnification > fitScale * 1.001 }
 
     // The most zoomed in: 4 pixels on screen to one in the image.
     private static let furthest: CGFloat = 4

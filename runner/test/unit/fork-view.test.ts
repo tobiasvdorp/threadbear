@@ -53,3 +53,44 @@ test("a fork's own patches show nothing of Mike's", async () => {
     SHOWN,
   );
 });
+
+// Text the app and runner show people or send to agents runs in every fork,
+// where the person at the Mac isn't Mike. The investigate prompt told a
+// fork's agent "Mike was pressing Trust..." and a closed question said
+// "before Mike saw it" (fork-leak review, 8 Nov). Strings may still name
+// Mike where he's meant: his releases that a fork follows from upstream, the
+// About credit, and the push key only he can fix. Anything else says "the
+// user" or "you". Comments are fine; debug-only Automation is skipped.
+const MIKE_MEANT = [
+  /Mike'?s (new |newer |latest )?releases?\b/,
+  /releases? (from|Mike)|from Mike|Mike marked|Mike has a newer release|Mike hasn't made a release/i,
+  /only Mike can fix/,
+  /Made in Busselton by Mike/,
+  /upstream remote \(Mike's repo\)/,
+];
+
+function sourceFiles(dir: string, ext: string[]): string[] {
+  const out: string[] = [];
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (e.name === '.build' || e.name === 'node_modules') continue;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...sourceFiles(p, ext));
+    else if (ext.some((x) => e.name.endsWith(x))) out.push(p);
+  }
+  return out;
+}
+
+test('strings shown or sent in a fork only name Mike where he is meant', () => {
+  const files = [...sourceFiles(path.join(REPO, 'runner/src'), ['.ts']), ...sourceFiles(path.join(REPO, 'app/Sources'), ['.swift'])].filter((f) => !/\/Automation[^/]*\.swift$/.test(f));
+  const found: string[] = [];
+  for (const file of files) {
+    fs.readFileSync(file, 'utf8').split('\n').forEach((line, i) => {
+      // Drop a comment: a whole-line one, or one after code (" // ").
+      const code = /^\s*(\/\/|\*|\/\*)/.test(line) ? '' : line.replace(/\s\/\/\s.*$/, '');
+      // Only text inside quotes or backticks.
+      const strings = code.match(/(['"`])(?:\\.|(?!\1).)*\1/g) ?? [];
+      for (const s of strings) if (/\bMike\b/.test(s) && !MIKE_MEANT.some((m) => m.test(s))) found.push(`${path.relative(REPO, file)}:${i + 1}: ${s.slice(0, 120)}`);
+    });
+  }
+  assert.deepEqual(found, []);
+});

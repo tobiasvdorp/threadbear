@@ -62,3 +62,13 @@ test("the relay and the backend keep the same lists of Apple's reasons and socke
   assert.deepEqual([...relay.APPLE].sort(), [...backend.APPLE_REASONS].sort());
   assert.deepEqual([...relay.SOCKET].sort(), [...backend.SOCKET_CODES].sort());
 });
+
+test('pushOff: only with the relay off and no Apple key of its own', async () => {
+  const { pushOff } = await import('../../../convex/pushHealth.ts');
+  assert.equal(pushOff({}), false);
+  assert.equal(pushOff({ PUSH_RELAY: 'off' }), true);
+  assert.equal(pushOff({ PUSH_RELAY: 'off', APNS_KEY_P8: 'k', APNS_KEY_ID: 'i', APNS_TEAM_ID: 't', APNS_TOPIC: 'b' }), false);
+  // Half an Apple key is no key: push.ts sends nothing with it.
+  assert.equal(pushOff({ PUSH_RELAY: 'off', APNS_KEY_P8: 'k' }), true);
+  assert.equal(pushOff({ PUSH_RELAY: 'on' }), false);
+});

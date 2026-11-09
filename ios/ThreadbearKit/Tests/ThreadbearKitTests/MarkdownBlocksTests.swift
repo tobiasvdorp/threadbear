@@ -59,11 +59,11 @@ import Testing
     }
 
     @Test func aDraftNeedsItsOwnClosingFence() {
-        // Only a fence on its own closes it, indented less than four spaces
-        // past the opening one; anything else is part of the draft.
+        // Only a fence on its own closes it, at any indent.
         #expect(MarkdownBlock.parse("```slack\nhello\n> ```") == [.code("hello\n> ```")])
-        #expect(MarkdownBlock.parse("```slack\nhello\n    ```") == [.code("hello\n    ```")])
         #expect(MarkdownBlock.parse("```slack\nhello\n   ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("```slack\nhello\n    ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("```slack\nhello\n``` x") == [.code("hello\n``` x")])
         // A fence opening on a list item's own line: the block, in the item.
         #expect(MarkdownBlock.parse("- ```slack\n  hello\n  ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
         #expect(MarkdownBlock.parse("- Run:\n1. ```sh\n   tb land\n   ```") == [
@@ -78,6 +78,67 @@ import Testing
         // Too big to be a message: code.
         let big = String(repeating: "a", count: DraftBlock.maxSource + 1)
         #expect(MarkdownBlock.parse("```slack\n\(big)\n```") == [.code(big)])
+    }
+
+    // Cross-lab review, round three (6 Nov).
+    @Test func backticksAfterABacktickFenceMakeItWords() {
+        #expect(MarkdownBlock.parse("- ```literal```\n- next") == [
+            .listItem(text: "```literal```", marker: "•", depth: 0, task: nil),
+            .listItem(text: "next", marker: "•", depth: 0, task: nil),
+        ])
+        #expect(MarkdownBlock.parse("```a``` b\nnext") == [.paragraph("```a``` b next")])
+        // A tilde fence's info string may have backticks.
+        #expect(MarkdownBlock.parse("~~~slack `x`\nhi\n~~~") == [.draft(DraftBlock(kind: .slack, source: "hi"))])
+    }
+
+    @Test func aClosingFenceClosesAtAnyIndent() {
+        #expect(MarkdownBlock.parse("   ```slack\n   hello\n    ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("  ```slack\n  hello\n```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("- ```slack\n  hello\n```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("- ```slack\n  hello\n     ```") == [.draft(DraftBlock(kind: .slack, source: "hello"))])
+        #expect(MarkdownBlock.parse("- Steps:\n\n  ```slack\n  hello\n  ```") == [
+            .listItem(text: "Steps:", marker: "•", depth: 0, task: nil),
+            .draft(DraftBlock(kind: .slack, source: "hello")),
+        ])
+        #expect(MarkdownBlock.parse("- a\n  - b\n\n    ```\n    code\n    ```") == [
+            .listItem(text: "a", marker: "•", depth: 0, task: nil),
+            .listItem(text: "b", marker: "•", depth: 1, task: nil),
+            .code("code"),
+        ])
+        // Round four: a reply's words after the block stay words, under a
+        // nested list or after a heading that ended one.
+        #expect(MarkdownBlock.parse("- root\n  - middle\n    - child\n\n    ```swift\n    let x = 1\n    ```\n\nAfter.") == [
+            .listItem(text: "root", marker: "•", depth: 0, task: nil),
+            .listItem(text: "middle", marker: "•", depth: 1, task: nil),
+            .listItem(text: "child", marker: "•", depth: 2, task: nil),
+            .code("let x = 1"),
+            .paragraph("After."),
+        ])
+        #expect(MarkdownBlock.parse("- item\n\n# Heading\n\n  ```swift\n  let x = 1\n```\n\nAfter.") == [
+            .listItem(text: "item", marker: "•", depth: 0, task: nil),
+            .heading(level: 1, text: "Heading"),
+            .code("let x = 1"),
+            .paragraph("After."),
+        ])
+    }
+
+    @Test func aFencedItemKeepsTheListsDepths() {
+        #expect(MarkdownBlock.parse("- ```sh\n  echo hi\n  ```\n  - child\n- sibling") == [
+            .code("echo hi"),
+            .listItem(text: "child", marker: "•", depth: 1, task: nil),
+            .listItem(text: "sibling", marker: "•", depth: 0, task: nil),
+        ])
+    }
+
+    @Test func ordinaryListsAndCodeAreAsBefore() {
+        #expect(MarkdownBlock.parse("- one\n  - two\n- three") == [
+            .listItem(text: "one", marker: "•", depth: 0, task: nil),
+            .listItem(text: "two", marker: "•", depth: 1, task: nil),
+            .listItem(text: "three", marker: "•", depth: 0, task: nil),
+        ])
+        #expect(MarkdownBlock.parse("```swift\nlet a = 1\n```\nafter") == [.code("let a = 1"), .paragraph("after")])
+        #expect(MarkdownBlock.parse("````\n```\ninner\n```\n````") == [.code("```\ninner\n```")])
+        #expect(MarkdownBlock.parse("Use `a` and ``b``") == [.paragraph("Use `a` and ``b``")])
     }
 
     @Test func aFenceStillStreamingInOrTooBigStaysCode() {

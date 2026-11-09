@@ -144,6 +144,7 @@ export const ACCESS: Record<string, Access> = {
   addShareImage: 'own',
   dropShareImages: 'own',
   prune: 'own',
+  sharedThreads: 'own',
   heartbeat: 'own',
   bye: 'own',
   threadsOf: 'own',
@@ -202,6 +203,10 @@ export const ACCESS: Record<string, Access> = {
   finishCommand: 'own',
   setThreadIndex: 'own',
   otherRunnersList: 'owner',
+  // Mike's runner order (API 58): a runner key that could move it could put
+  // itself first for his new threads from the phone.
+  runnerOrder: 'owner',
+  setRunnerOrder: 'owner',
   threadIndexSince: 'owner',
   otherRunnersThreads: 'owner',
   addRunnerKey: 'owner',
@@ -219,6 +224,10 @@ export const ACCESS: Record<string, Access> = {
   remoteThread: 'owner',
   queueCommand: 'owner',
   commandState: 'owner',
+  // Pictures for another runner's thread (API 63): an upload URL, and
+  // deleting ones uploaded for a command that wasn't queued.
+  pictureUploadUrl: 'owner',
+  discardPictures: 'owner',
   remoteAccounts: 'owner',
   // Full sync (API 52): a runner writes its own threads' tool output, and only
   // the main Mac's runner reads another runner's.
@@ -282,6 +291,37 @@ export function cutBytes(s: string, max: number): string {
   }
   return out;
 }
+// What another runner writes that the Mac and iPhone apps read as a time or
+// a number has to be one: their Swift stops on a date offset of "+////"
+// (a byte below "0" taken from 48) or Int(1e20), and nothing can catch
+// that (Daybreak, 7 Nov 2026). The apps check too, for rows from before.
+
+// An ISO time as toISOString writes it, or with an offset: what the Mac
+// app's ISO8601.parse reads.
+const ISO_TIME = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:([0-5]\d|60)(\.\d{1,9})?(Z|[+-]([01]\d|2[0-3]):?[0-5]\d)?$/;
+export function isIsoTime(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 64 && ISO_TIME.test(value);
+}
+// A whole number from 0 to `most`.
+export function wholeIn(value: unknown, most: number): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= most;
+}
+// The most each machine figure can be (sync:setRunnerStats), as the Mac
+// app's RunnerMachineStats.Limits has them.
+export const STATS_MOST = { cpuPercent: 100, cores: 1_000_000, memUsed: 1e18, memTotal: 1e18, diskFree: 1e18, diskTotal: 1e18, load1: 1_000_000, uptimeSec: 3.2e10 } as const;
+// What's wrong with a machine's figures, or undefined: sync:setRunnerStats
+// refuses them from any key, as a real machine never reports one.
+export function badRunnerStats(stats: Record<string, unknown>): string | undefined {
+  for (const [field, most] of Object.entries(STATS_MOST)) {
+    const value = stats[field];
+    if (value === undefined && field === 'load1') continue;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > most || (field === 'cores' && !Number.isInteger(value))) {
+      return `stats.${field} must be a ${field === 'cores' ? 'whole ' : ''}number from 0 to ${most}`;
+    }
+  }
+  return undefined;
+}
+
 // A runner key's schedule ids are what the runner makes (crypto.randomUUID),
 // so none can carry text a terminal would run when an audit lists it.
 export const SCHEDULE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;

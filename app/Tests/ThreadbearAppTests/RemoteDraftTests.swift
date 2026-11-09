@@ -306,3 +306,99 @@ private final class RecordingTransport: RPCTransport, @unchecked Sendable {
         }
     }
 }
+
+/// Pictures for another runner's thread. On 8 Nov Mike pasted one into a new
+/// thread on Hetzner Cloud and the banner said "Pictures can't go to Hetzner
+/// Cloud from this Mac yet." Through Convex (the default) they go now: this
+/// Mac's runner uploads them with the message (docs/protocol.md, "Other
+/// runners' threads through the backend", Pictures). The direct link still
+/// can't carry them, and says how to send them instead.
+@MainActor
+final class RemotePicturesTests: XCTestCase {
+    private let keys = [AppModel.lastAccountKey, "lastAccountId.byProvider", "lastAccountId.codex.byProvider", AppModel.defaultRunnerKey,
+                        AppModel.directRemoteLinkKey]
+
+    override func setUp() {
+        super.setUp()
+        _ = NSApplication.shared
+        keys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+    }
+
+    override func tearDown() {
+        keys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+        super.tearDown()
+    }
+
+    private let cloud = RemoteRunner(id: "r-cloud", name: "Hetzner Cloud", icon: "cloud", online: true)
+    private let picture = ImageRef(path: "/runner/inbox/a.png", mediaType: "image/png")
+
+    private func app(direct: Bool = false) async throws -> (AppModel, RecordingTransport) {
+        let app = AppModel()
+        let local = RecordingTransport()
+        local.answers["threads.create"] = { _ in ["thread": ["id": "th_cloud", "title": "On the cloud", "cwd": "/root"]] }
+        local.answers["threads.send"] = { _ in ["turnId": ""] }
+        let client = RPCClient(transport: local)
+        try await client.start()
+        app.useClientForTesting(client)
+        app.accounts = [Account(id: "claude-here", provider: "claude", title: "me@example.com")]
+        app.defaults = RunnerDefaults(cwd: "/Users/me/misc", accountId: "claude-here")
+        app.directRemoteLink = direct
+        app.remoteRunners = [cloud]
+        return (app, local)
+    }
+
+    private func until(_ condition: () -> Bool) async throws {
+        for _ in 0..<400 where !condition() {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    func testANewThreadOnAnotherRunnerTakesItsPicturesThroughConvex() async throws {
+        let (app, local) = try await app()
+        app.chooseNewThreadRunner(cloud.id)
+        XCTAssertNil(app.picturesRefusal(for: nil), "pasting one is fine")
+        app.drafts["new"] = Draft(text: "Why does it look like this?", images: [picture])
+        app.send(threadId: nil)
+        try await until { app.selection == "th_cloud" }
+        XCTAssertNil(app.errorMessage)
+        let create = try XCTUnwrap(local.params("threads.create").first)
+        XCTAssertEqual(create["runnerId"] as? String, cloud.id, "this Mac's runner sends it on")
+        let images = try XCTUnwrap(create["images"] as? [[String: Any]])
+        XCTAssertEqual(images.map { $0["path"] as? String }, [picture.path])
+        XCTAssertNil(app.drafts["new"])
+    }
+
+    func testAMessageToAnotherRunnersThreadTakesItsPictures() async throws {
+        let (app, local) = try await app()
+        var thread = ThreadSummary(id: "t_cloud", title: "On the cloud", cwd: "/root", status: .idle)
+        thread.runnerId = cloud.id
+        app.threads[thread.id] = thread
+        XCTAssertNil(app.picturesRefusal(for: thread))
+        app.drafts[thread.id] = Draft(text: "This one", images: [picture])
+        app.send(threadId: thread.id)
+        try await until { !local.params("threads.send").isEmpty }
+        let send = try XCTUnwrap(local.params("threads.send").first)
+        XCTAssertEqual((send["images"] as? [[String: Any]])?.count, 1)
+        XCTAssertNil(app.errorMessage)
+    }
+
+    func testTheDirectLinkSaysHowToSendThemAndKeepsTheDraft() async throws {
+        let (app, local) = try await app(direct: true)
+        app.remoteRunners = [RemoteRunner(id: cloud.id, name: cloud.name, online: true, rpcUrl: URL(string: "ws://127.0.0.1:1/rpc"), tokenFile: "/tmp/not-read")]
+        app.chooseNewThreadRunner(cloud.id)
+        let why = try XCTUnwrap(app.picturesRefusal(for: nil))
+        XCTAssertTrue(why.contains("Hetzner Cloud") && why.contains("Connect to other machines directly"), why)
+        let draft = Draft(text: "Look", images: [picture])
+        app.drafts["new"] = draft
+        app.send(threadId: nil)
+        XCTAssertEqual(app.errorMessage, why)
+        XCTAssertEqual(app.drafts["new"], draft, "still in the box")
+        XCTAssertTrue(local.params("threads.create").isEmpty)
+    }
+
+    func testThisMacsOwnThreadsAreNeverRefused() async throws {
+        let (app, _) = try await app(direct: true)
+        XCTAssertNil(app.picturesRefusal(for: ThreadSummary(id: "here", title: "Here", cwd: "/Users/me", status: .idle)))
+        XCTAssertNil(app.picturesRefusal(for: nil), "a new thread on this Mac")
+    }
+}

@@ -148,6 +148,9 @@ struct AppDump: Encodable {
         var seq: Int
         var turn: String?
         var text: String
+        /// The reply buttons its text links, as each pill reads with its
+        /// id ("✓ Fill in the form [b7k2abcd]"), or "unknown <id>".
+        var buttons: [String]? = nil
     }
 
     struct Transcript: Encodable {
@@ -165,6 +168,8 @@ struct AppDump: Encodable {
     var banner: BannerInfo?
     /// The Archived note with Undo at the top of the thread panel: its thread.
     var archivedNote: String?
+    /// The milestone note at the top of the thread panel: its first line.
+    var milestoneNote: String?
     var error: String?
     var window: Window?
     var sidebar: Sidebar
@@ -305,7 +310,8 @@ struct AppDump: Encodable {
                 let row = session.displayRow(index)
                 return Row(id: row.id, kind: row.kind.rawValue, height: Int(table.rect(ofRow: index).height.rounded()),
                            expanded: opens(row) ? app.transcript.isExpanded(row) : nil, inGroup: row.inGroup,
-                           onScreen: NSLocationInRange(index, visible), seq: row.seq, turn: row.turnId, text: RowDebug.excerpt(row))
+                           onScreen: NSLocationInRange(index, visible), seq: row.seq, turn: row.turnId, text: RowDebug.excerpt(row),
+                           buttons: Self.buttons(row))
             }
             let state: String
             switch session.state {
@@ -324,6 +330,7 @@ struct AppDump: Encodable {
             runnerVersion: app.runnerVersion,
             banner: app.banner.map { BannerInfo(style: $0.style.rawValue, text: $0.text, detail: $0.detail) },
             archivedNote: app.archivedNote?.threadId,
+            milestoneNote: app.milestoneNote.map { ThreadMilestones.title($0.tier) },
             error: app.errorMessage,
             window: window.map { Window(width: Int(contentSize($0).width), height: Int(contentSize($0).height), appearance: appearance) },
             sidebar: Sidebar(mode: String(describing: app.sidebarMode), sections: sections,
@@ -460,7 +467,7 @@ struct AppDump: Encodable {
     /// pick, its links and the answer picked.
     @MainActor
     static func decisions(_ thread: ThreadSummary, app: AppModel) -> [String]? {
-        guard Decisions.isOpen(thread) else { return nil }
+        guard Decisions.isOpen(thread, card: app.sessions[thread.id]?.openCard) else { return nil }
         let picks = app.picks(for: thread)
         let notes = app.notes(for: thread)
         var lines = ["\(picks.count) picked"]
@@ -528,6 +535,7 @@ struct AppDump: Encodable {
         lines.append(head)
         if let banner { lines.append("banner (\(banner.style)): \(banner.text)" + (banner.detail.map { "  [\($0)]" } ?? "")) }
         if let archivedNote { lines.append("archived note: \(archivedNote), with Undo") }
+        if let milestoneNote { lines.append("milestone note: \(milestoneNote)") }
         if let error { lines.append("error banner: \(error)") }
         lines.append("")
         lines.append("sidebar, \(sidebar.mode) (\(sidebar.snoozed) snoozed, \(sidebar.archived) archived):")
@@ -606,9 +614,22 @@ struct AppDump: Encodable {
             for (row, id) in zip(transcript.rows, ids) {
                 let open = row.expanded.map { $0 ? "open" : "closed" } ?? ""
                 lines.append("\(row.onScreen ? ">" : " ") \(pad(id, rowWidth)) \(pad(row.kind, 10)) \(pad(String(row.height), 5)) \(pad(open, 7)) \(row.text)")
+                for button in row.buttons ?? [] { lines.append("  \(pad("", rowWidth)) button     \(button)") }
             }
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// The pills a reply's buttons show as, for `dump`.
+    static func buttons(_ row: TranscriptRow) -> [String]? {
+        guard case .assistant(let item) = row.content else { return nil }
+        let ids = ReplyButtons.ids(in: item.text)
+        guard !ids.isEmpty else { return nil }
+        return ids.map { id in
+            guard let known = ReplyButtons.shared.known(id) else { return "unknown \(id)" }
+            let look = ReplyButtons.look(known.button, pressing: ReplyButtons.shared.isPressing(id))
+            return "\(ReplyButtons.label(known.button, look: look)) [\(id), \(look.rawValue)]"
+        }
     }
 
     private func pad(_ text: String, _ width: Int) -> String {

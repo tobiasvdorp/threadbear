@@ -470,7 +470,8 @@ function formatSync(y: NonNullable<RunnerStatus['sync']>, now: number): string {
   const behind = y.backend && y.backend.apiVersion < y.backend.expected ? `; its backend is older than this runner (API ${y.backend.apiVersion}, wants ${y.backend.expected}): deploy it with runner/scripts/deploy-backend.mjs` : '';
   const held = y.schedulesHeld ? `; ${y.schedulesHeld} schedule${y.schedulesHeld === 1 ? '' : 's'} too big (or taken) for this runner's key, so its schedules stay in schedules.json on this Mac (tb logs says which)` : '';
   const rotating = y.ownerKeyRotating ? '; RUNNER_KEY_NEXT is still set, so two main keys work: finish with tb runner rotate-owner --finish' : '';
-  const push = y.pushFailing ? `\n${pushFailingText(y.pushFailing)}` : '';
+  // A self-hosted backend can't send phone notifications (docs/self-hosting.md).
+  const push = y.pushOff ? "\nPhone notifications: off, as this backend can't send them (a self-hosted backend can't use the push relay)." : y.pushFailing ? `\n${pushFailingText(y.pushFailing)}` : '';
   const f = y.full;
   const full = f
     ? f.backendTooOld

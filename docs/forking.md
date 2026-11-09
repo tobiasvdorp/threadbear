@@ -25,7 +25,10 @@ Mike's copy (reporting to his Sentry, uploading his debug symbols).
 | Mike's deployments in docs | `docs/convex-backend.md`, `docs/website.md`, `docs/push-relay.md` | Names of Mike's Convex deployments, for his own use. The code never reads them; yours come from setup. |
 
 Code comments that say "Mike's releases" or tell a story from Mike's
-setup are kept on purpose, as the history of why a line is there.
+setup are kept on purpose, as the history of why a line is there. Text
+the app shows or sends to an agent says "the user" instead, except where
+it means Mike himself (his releases, the About credit);
+`runner/test/unit/fork-view.test.ts` checks that too.
 
 ## 2. Where each feature lives, and how to take it out
 
@@ -67,7 +70,14 @@ gone from your fork, not just quiet.
   another Mac over ssh, put `"checkHost": "<ssh host>"` in your
   runner.json, or `"checkHosts"` with a list of them (Mike's is
   `["tinker-desk", "cloud"]`; a Linux one only takes `--quick` runs that
-  don't touch `ios/`); without either, it runs on yours.
+  don't touch `ios/`); without either, it runs on yours. On your Mac it
+  keeps one ssh connection per host through a socket in `~/.ssh/tbc`, and
+  the lock on each checkout's copy in `~/.cache/threadbear-check-locks`,
+  both folders only you can use (mode 700, yours; one that's anything else
+  is never used: ssh then connects afresh each time, and the lock refuses
+  to run). The folder the host reports for its copies must be a plain
+  absolute path (letters, digits, `.`, `_`, `/`, `-`), or that host is
+  passed over.
 
 ### Optional, with a switch
 
@@ -84,17 +94,15 @@ gone from your fork, not just quiet.
 | Connectors gateway | `runner/src/connectors.ts`; app `ConnectorsModel.swift`, `Views/ConnectorsPanel.swift`; Core `Connectors.swift`, `ConnectorsText.swift` | `THREADBEAR_CONNECTORS_URL=off`, or no gateway configured | Self-contained, but Notion task boards read through it. |
 | Notion task boards | `runner/src/notion-tasks.ts`; `useTaskBoards` and `refreshTasks` in `projects.ts`; the board in `Views/ProjectPage.swift` and `HighlightsBoard.swift` | Nothing happens without a gateway and a project with a Notion page | Medium. |
 | Sentry | `runner/src/sentry.ts`, app and iOS `CrashReporting.swift`, `app/SentryBinary/`, dSYM upload in `app/build-app.sh` | `THREADBEAR_SENTRY=off`; a fork never reports from the Mac (section 1) | Self-contained: drop the start calls in `main.ts` and both `ThreadbearApp.swift`, the logger handlers in `main.ts`, the `@sentry/node` dependency and the Swift package references. `HangWatch.swift` keeps its local logs. |
+| The ding when a thread finishes | app `DingPlayer.swift`, Core `Support/CompletionSound.swift` (the sounds, made in code), one call in `AppModel+Connection.swift`, the Notifications section in `Views/SettingsView.swift` | Off by default (Settings > General > Notifications) | Self-contained: drop the two files, the call and the section. |
 | The activity log | `runner/src/activity.ts` (`tb activity`), app `ActivityRecorder.swift`, Core `Support/Activity.swift` | Off by default (Settings > General) | Self-contained: about a dozen `ActivityRecorder.shared` calls in the app. |
 | Following main, upstream releases | `runner/src/update.ts`, `upstream.ts`, `bring-in.ts`, `scripts/release-signers`; app `AppUpdate.swift`, `Views/UpdatesPanel.swift`, `app/stage-update.sh` | `followMain: false` (or `THREADBEAR_FOLLOW_MAIN=0`); upstream is off with no `upstream` remote; `releases.bringIn: "off"` stops the update threads | Medium. Keep `release.ts` and `restart.ts`: handovers and crash rollback use them. |
 | The Xcode 26 build check | `.github/workflows/xcode-26.yml` | GitHub doesn't run a fork's workflows until you turn Actions on for it | Self-contained: delete the file. It builds the Mac and iPhone apps on GitHub's macos-26 runner, as Mike's own Macs only have a newer Xcode. |
 | Thread worktrees, `tb land` | `runner/src/worktrees.ts`, `worktree-setup.sh`, `borrow-worktree.sh`, `docs/thread-worktrees.md` | Only repos whose patch sets `worktree` get them | Medium; AGENTS.md's workflow assumes them. |
-| Review by another lab (experiment) | `runner/src/runner/lab-review.ts`; `waitOnReview` and `deliverReview` in `runner/src/runner/hibernation.ts`; the call in `completeTurn` (`runner.ts`); `src/experiments.ts` | `experiments.labReview` in `runner.json`, off by default | Self-contained: delete the file and those three hooks. Every experiment lives in `experiments.ts`, which stays. |
-| Keep the Mac awake (experiment) | `runner/src/keep-awake.ts`; `workingThreads` in `runner.ts`; built in `main.ts` | `experiments.keepAwake` in `runner.json`, off by default | Self-contained: delete the file and its lines in `main.ts`. |
-| Schedule checks (experiment) | `runner/src/schedule-check.ts`; `checked` and the `check` field in `runner/src/schedules.ts`; `checkArg` in `threadbear-mcp.ts`; `check` on `schedules` in `convex/schema.ts` and `convex/sync.ts` | `experiments.scheduleChecks` in `runner.json`, off by default | Self-contained: delete the file and those lines. Leave the Convex field if rows have it. |
-| Diagrams and pages in replies (experiment) | app `Transcript/RichBlocks.swift`, `RichRenderer.swift`, `Views/PreviewSandbox.swift`, Core `Markdown/RichBlock.swift`, `Resources/Rich/pele.js`; phone `ios/Threadbear/RichBlockView.swift`, `ios/Threadbear/Rich/`, `.rich` in ThreadbearKit `MarkdownBlocks.swift`; `RICH_BLOCKS_LINE` in `threadbear-mcp.ts` | `experiments.richBlocks` in `runner.json` tells agents about it, off by default; the apps draw the blocks either way | Self-contained: the `richBlock` case in `MarkdownRenderer.swift`, `richStamp` in `RowRenderer.swift`, `richChanged` in `TranscriptController.swift` and the rich parts of `TextKit.swift`; on the phone the `.rich` case. `PreviewSandbox` stays, the side pane uses it. |
+| Experiments | One file each, `runner/src/experiments/<id>.md`, read by `runner/src/experiments.ts`; [docs/experiments.md](experiments.md) lists where each lives and how to take it out | `experiments.<id>` in `runner.json`, off by default | Each one: what docs/experiments.md says, then delete its file and run `npm run experiment-docs` in `runner/`. `experiments.ts` stays. |
 | Codex | `runner/src/adapters/codex/`, `runner/src/updates/codex.ts` | No Codex login, and `cliUpdates: { codex: "off" }` | Woven in, but keep `'codex'` decodable as a provider. |
 | BrowserBear link hand-off | `app/Sources/Threadbear/BrowserBear.swift`, called from `PaneModel.swift` | Inert unless BrowserBear (Mike's own tool) is running | Self-contained: one file, one call. |
-| The Browser panel | `app/Sources/Threadbear/Views/AgentBrowserPanel.swift`, and `BrowserBearPipe.swift`, with cases in `PanelsView.swift`, `WindowDock.swift`, `PanelRequests.swift` and `Automation.swift` | Inert without BrowserBear; existing profiles use its private socket, separate agent Chrome retains its CDP path | Self-contained. |
+| The Browser panel | `app/Sources/Threadbear/Views/AgentBrowserPanel.swift`, and `BrowserBearPipe.swift`, with cases in `PanelsView.swift`, `WindowDock.swift`, and `PanelRequests.swift` | Inert without BrowserBear; lists pages, stills and Show window over its private socket | Self-contained. |
 
 ### Core, no switch
 
@@ -103,7 +111,6 @@ runner, app and phone; it's usually better to hide its entry point.
 
 | Feature | Lives in |
 |---|---|
-| Codex small jobs (experiment `codexSmallJobs`) | `runner/src/models/codex-pool.ts`, `models/index.ts`; `models.provider`, `models.model`, `models.effort` in runner.json. Off unless enabled. |
 | The librarian (titles, filing threads into projects, waking hibernating threads by topic) | `runner/src/librarian.ts`, app `Views/LibrarianHome.swift`, `LibrarianView.swift`. Pause it on its page, or set no `models.pool`. |
 | Projects | `runner/src/projects.ts`, `project-icons.ts`; app `Projects.swift`, `Views/Projects*.swift`, `ProjectPage.swift`; the project tools in `threadbear-mcp.ts` |
 | Keyboard shortcuts | Core `Support/Shortcuts.swift` (the commands and their default keys, which a new menu command with a key joins); app `AppShortcuts.swift`, `Views/KeyboardSettings.swift`, and `.shortcut(...)` on the menu items in `ThreadbearApp.swift`; yours in `shortcuts.json` in the data folder |

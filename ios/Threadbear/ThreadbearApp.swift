@@ -18,6 +18,9 @@ struct ThreadbearApp: App {
             RootView()
                 .environment(model)
                 .environment(quick)
+                // Every link in the app: a web page opens, another app's
+                // link asks first (LinkGate).
+                .linksThroughGate()
                 .onAppear {
                     delegate.model = model
                     delegate.pushTaps.open = { [model] threadId in model.openThreadId = threadId }
@@ -42,7 +45,11 @@ struct ThreadbearApp: App {
                     // Not for a scripted quick ask: the prompt would keep the app from going
                     // active, which is when the debug question is asked.
                     if paired, !model.isFake, !ProcessInfo.processInfo.arguments.contains("-QuickAskDebugQuestion") {
-                        delegate.askForNotifications()
+                        // Not for a backend that can't send any (a self-hosted one):
+                        // the permission would be for nothing.
+                        Task {
+                            if await model.backendSendsNotifications() { delegate.askForNotifications() }
+                        }
                     }
                 }
                 // The Camera opens threadbear://pair links from the QR code, and

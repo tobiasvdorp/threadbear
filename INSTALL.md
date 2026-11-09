@@ -63,6 +63,30 @@ Then run it, with their answers:
 ./threadbear setup --yes --existing --project <name>
 ```
 
+**Only if they ask to self-host** (keep their threads off Convex cloud):
+say first that we recommend Convex cloud, and that self-hosting means no
+phone notifications, the phone needing Tailscale on, nothing working while
+this Mac sleeps, and share links only opening on their tailnet
+(docs/self-hosting.md). If they still want it, check `docker info` works
+(**Ask** them to install and start Docker Desktop or OrbStack if not) and
+that `tailscale status` shows this Mac logged in (**Ask** them to install
+and log in to Tailscale if not). Then, in place of the commands above:
+
+```sh
+./threadbear setup --self-hosted --dry-run --yes
+./threadbear setup --self-hosted --yes
+```
+
+No Convex login or team is needed. If it stops asking for HTTPS
+certificates or MagicDNS, **Ask** them to turn those on in the Tailscale
+admin console (DNS), then run it again.
+
+If your own permission check refuses to run setup (Claude Code's auto mode
+does: it's a script you've just downloaded), that's its job, so don't try to
+get round it. **Ask** them to allow it, by running the command themselves
+with `! ` in front or by adding a permission rule for `./threadbear setup`,
+then carry on from what it printed.
+
 New threads start in `~/ThreadbearThreads`, which setup makes (not
 `~/Threadbear`: macOS ignores case, so that would be this repo's folder).
 They can change it in the app's Settings, and pick a folder for each
@@ -106,6 +130,20 @@ yourself: it can run their agents.
 Say what was set up (their Convex project and its URL, where the app is), and
 that the runner and app update themselves when their `main` changes.
 
+## Another Mac (optional)
+
+Running Threadbear on several machines is supported, for example a laptop and a
+Mac mini that's always on. Each runs its own threads in its own folders, and
+project files aren't copied between them. To add a Mac, follow this file on it
+and say yes to joining (`setup --existing`), then on the first Mac run
+`tb runner add <name> --ssh <that Mac>` and `tb restart` on the new one. (With no
+ssh between them, `--out <file> --id <runnerId>` writes the key to a file, which
+goes in the new Mac's `secrets/convex-key`.) Only the first Mac's app lists every
+machine's threads, so that's best as the Mac they sit at; the phone and website
+show them all. The guide's "If you run Threadbear on more than one Mac" has the
+rest, and `docs/setup-and-updates.md`, "A Mac nobody sits at", covers one left on
+its own.
+
 ## 6. A runner on Linux (optional)
 
 Once Threadbear works on the Mac, a Linux server can be a second, always-on
@@ -116,7 +154,8 @@ Hetzner cloud server with 8 GB. Do this as an ordinary user with sudo, not root.
 
 1. **Packages:** `sudo apt-get install -y git build-essential imagemagick
    librsvg2-bin bubblewrap jq lsof` (ImageMagick and rsvg-convert stand in for
-   macOS's sips and Quick Look when pictures are converted; Codex's sandbox
+   macOS's sips and Quick Look when pictures are converted, rsvg-convert
+   alone drawing SVGs; Codex's sandbox
    wants bubblewrap; lsof checks who's on the other end of a handover's
    socket, and minimal images leave it out). zsh isn't needed: patch
    commands run in the account's own shell, else bash. Set the account's full name, which agents are told:

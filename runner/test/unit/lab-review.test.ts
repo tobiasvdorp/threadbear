@@ -490,3 +490,27 @@ test('labReview: an edit that cuts the owed turn drops its review', async () => 
   await b.editMessage(id, first.seq, 'Just explain the login bug');
   assert.equal(b.threads.get(id)!.rec.labReviewOwed, undefined);
 });
+
+test('labReview: a scheduled run that woke an archived thread goes back once its review is dealt with', () => {
+  const h = setup();
+  const id = start(h);
+  turn(h, id);
+  h.runner.update({ threadId: id, archived: true });
+  // The schedule's run changes code and finishes: the review comes first.
+  h.runner.send(id, 'Check the build', [], { origin: 'schedule', scheduleId: 'sch_1' });
+  const s = [...h.adapter.sessions].filter((x) => x.opts.threadId === id).at(-1)!;
+  s.init();
+  turn(h, id, { session: s, diffs: [codeDiff()], reply: 'Fixed the build.' });
+  let t = h.runner.get(id);
+  assert.equal(t.archivedAt, undefined, 'not put away while its review runs');
+  assert.equal(t.waitingOn?.length, 1);
+  const reviewId = t.waitingOn![0].threadId;
+  const rs = h.codex.sessions.find((x) => x.opts.threadId === reviewId)!;
+  rs.init();
+  turn(h, reviewId, { session: rs, reply: 'Nothing wrong with it.' });
+  // It wakes with the findings, deals with them and has nothing for Mike.
+  turn(h, id, { reply: 'The review found nothing.' });
+  t = h.runner.get(id);
+  assert.ok(t.archivedAt, 'back in the archive once the run is really over');
+  assert.equal(t.archivedBy, 'mike');
+});

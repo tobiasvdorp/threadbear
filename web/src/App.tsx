@@ -13,6 +13,7 @@ import type { Id } from '../../convex/_generated/dataModel';
 import { go, threadPath, useRoute } from './route';
 import { useToken } from './token';
 import { MessageText, Pictures, picturesByRow, ToolRun, Worked, type PageMessage } from './messages';
+import { ReplyButton } from './reply-button';
 import { CommandState } from './command-state';
 import { previewOf, ShareControl, SharePage } from './share';
 import { busy, Lists, ResizeHandle, type Row, useSidebarWidth } from './sidebar';
@@ -203,6 +204,14 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
   const lastReply = [...items].reverse().find((i) => i.kind === 'message');
   const meta = !busy(t) && lastReply?.kind === 'message' && lastReply.m.role === 'assistant' ? [lastTurn?.ms && lastTurn.ms >= 1000 ? duration(lastTurn.ms) : null, t.costUsd ? `$${t.costUsd.toFixed(2)}` : null].filter(Boolean).join(' · ') : '';
 
+  // A reply's [title](button:<id>) links, drawn from the row's buttons. An id
+  // the row doesn't carry (an older runner, a button the thread no longer
+  // keeps) is just its title.
+  const buttonFor = (m: PageMessage) => (id: string, title: ReactNode) => {
+    const b = m.buttons?.find((x) => x.id === id);
+    return b ? <ReplyButton key={id} token={token} threadId={threadId} button={b} title={title} threadPath={linkTo} /> : <>{title}</>;
+  };
+
   const renderItem = (item: Item<PageMessage>): ReactNode => {
     if (item.kind === 'worked') {
       return (
@@ -224,7 +233,7 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
     return (
       <div key={m.seq} className={`msg ${m.role}`}>
         {from ? <div className="origin">{from.who}</div> : m.role === 'user' && m.origin && m.origin !== 'user' && m.origin !== 'phone' ? <div className="origin">{originLabel(m.origin)}</div> : null}
-        {from ? <MessageText text={from.body} pictures={inText} seq={m.seq} rows={messages} threadPath={linkTo} /> : <MessageText text={m.text} pictures={inText} seq={m.seq} rows={messages} threadPath={linkTo} pictureChips={m.role === 'user'} pasted={m.role === 'user' ? pastedOf(pictures, m.seq, m.text).byNumber : undefined} />}
+        {from ? <MessageText text={from.body} pictures={inText} seq={m.seq} rows={messages} threadPath={linkTo} /> : <MessageText text={m.text} pictures={inText} seq={m.seq} rows={messages} threadPath={linkTo} pictureChips={m.role === 'user'} pasted={m.role === 'user' ? pastedOf(pictures, m.seq, m.text).byNumber : undefined} button={m.role === 'assistant' ? buttonFor(m) : undefined} />}
         <Pictures items={[...(after.get(m.seq) ?? []), ...(m.role === 'user' ? pastedOf(pictures, m.seq, m.text).unplaced : [])]} />
       </div>
     );

@@ -50,7 +50,7 @@ final class LocalPreviewSiteTests: XCTestCase {
 
     private func site() throws -> LocalPreviewSite {
         let site = try XCTUnwrap(LocalPreviewSite(file: dir.appendingPathComponent("index.html")))
-        XCTAssertEqual(site.serve("/index.html")?.mimeType, "text/html")
+        XCTAssertEqual(site.serve("/index.html")?.mimeType, "text/html; charset=utf-8")
         return site
     }
 
@@ -73,7 +73,7 @@ final class LocalPreviewSiteTests: XCTestCase {
     /// pictures included, and what its stylesheet and script name too.
     func testNamedStylesAndPicturesLoad() throws {
         let site = try site()
-        XCTAssertEqual(site.serve("/style.css")?.mimeType, "text/css")
+        XCTAssertEqual(site.serve("/style.css")?.mimeType, "text/css; charset=utf-8")
         XCTAssertEqual(site.serve("/pic.png")?.mimeType, "image/png")
         XCTAssertNotNil(site.serve("/assets/pic@2x.png"), "from srcset")
         XCTAssertNotNil(site.serve("/assets/bg.png"), "named by the stylesheet")
@@ -226,7 +226,10 @@ final class LocalPreviewSiteTests: XCTestCase {
     }
 
     /// 4 MB of `<` with no `>` held the old regex at every `<` to the end
-    /// of the page: hours. Each of these takes well under a second now.
+    /// of the page: hours. Each of these takes a few seconds at most in a
+    /// debug build now. The budget is this thread's CPU time and generous, as
+    /// what it's guarding against is hours, and a 5 second limit on the clock
+    /// failed with nothing wrong on a busy check host (7 Nov).
     func testHasScriptsIsQuickOnPathologicalPages() {
         let size = LocalPreviewSite.scriptScanBytes
         let pages: [(String, Bool)] = [
@@ -238,9 +241,11 @@ final class LocalPreviewSiteTests: XCTestCase {
             ("<b onx" + String(repeating: " ", count: size - 16) + "y", false),
         ]
         for (page, expected) in pages {
-            let started = Date()
-            XCTAssertEqual(LocalPreviewSite.hasScripts(Data(page.utf8)), expected)
-            XCTAssertLessThan(Date().timeIntervalSince(started), 5, "\(page.prefix(8))...")
+            let data = Data(page.utf8)
+            let seconds = cpuSeconds {
+                XCTAssertEqual(LocalPreviewSite.hasScripts(data), expected)
+            }
+            XCTAssertLessThan(seconds, 30, "\(page.prefix(8))...")
         }
     }
 
@@ -300,10 +305,11 @@ final class LocalPreviewSiteTests: XCTestCase {
             "url(\"" + String(repeating: " ", count: size) + "\"" + String(repeating: " ", count: size),
         ]
         for text in texts {
-            let started = Date()
-            _ = LocalPreviewSite.htmlReferences(in: text)
-            _ = LocalPreviewSite.cssReferences(in: text)
-            XCTAssertLessThan(Date().timeIntervalSince(started), 10, "\(text.prefix(12))...")
+            let seconds = cpuSeconds {
+                _ = LocalPreviewSite.htmlReferences(in: text)
+                _ = LocalPreviewSite.cssReferences(in: text)
+            }
+            XCTAssertLessThan(seconds, 30, "\(text.prefix(12))...")
         }
     }
 
@@ -343,5 +349,64 @@ final class LocalPreviewSiteTests: XCTestCase {
         XCTAssertFalse(consent.allows(path: "/b/page.html", digest: "1"), "another file with the same bytes")
         consent.allow(path: "/a/page.html", digest: "2")
         XCTAssertFalse(consent.allows(path: "/a/page.html", digest: "1"), "one version per file")
+    }
+
+    // Daybreak, 7 Nov 2026: a page or stylesheet up to 64 MB was read whole
+    // for names, and every name kept. Only the start is read now, and the
+    // names kept are capped per file and in all.
+
+    /// CPU time this process has used, in seconds: a busy machine's waits
+    /// don't count.
+    private func cpu() -> Double {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6
+    }
+
+    func testOnlyTheStartOfAPageIsReadForNames() throws {
+        let line = "<p>words words words</p>\n"
+        let filler = String(repeating: line, count: LocalPreviewSite.scanBytes / line.utf8.count + 1)
+        try write("index.html", "<img src=\"early.png\">" + filler + "<img src=\"late.png\">")
+        let served = try site()
+        XCTAssertTrue(served.allows("early.png"))
+        XCTAssertFalse(served.allows("late.png"), "named past scanBytes")
+    }
+
+    func testNamesKeptArePerFileAndInAllCapped() throws {
+        let many = (0..<5_000).map { "<img src=\"p\($0).png\">" }.joined()
+        try write("index.html", many + (0..<8).map { "<link rel=stylesheet href=\"s\($0).css\">" }.joined())
+        for n in 0..<8 { try write("s\(n).css", (0..<3_000).map { "a{b:url(s\(n)-\($0).png)}" }.joined()) }
+        let first = try site()
+        // The page's first maxReferencesPerFile names only, so its stylesheets aren't among them.
+        XCTAssertEqual(first.allowedCount, 1 + LocalPreviewSite.maxReferencesPerFile)
+        XCTAssertTrue(first.allows("p1999.png"))
+        XCTAssertFalse(first.allows("p2000.png"))
+        XCTAssertFalse(first.allows("s0.css"))
+
+        try write("index.html", (0..<8).map { "<link rel=stylesheet href=\"s\($0).css\">" }.joined())
+        let next = try site()
+        for n in 0..<8 { XCTAssertNotNil(next.serve("s\(n).css"), "s\(n).css") }
+        XCTAssertEqual(next.allowedCount, LocalPreviewSite.maxAllowed, "8 x 2000 names, kept to the total")
+    }
+
+    func testAHugePageOfShortNamesStaysCheap() throws {
+        // Near the 64 MB file limit, millions of short names.
+        let unit = "<a src=x href=y data=z>"
+        let page = String(repeating: unit, count: (LocalPreviewSite.maxBytes - 64) / unit.utf8.count)
+        try write("index.html", page)
+        let started = cpu()
+        let huge = try XCTUnwrap(LocalPreviewSite(file: dir.appendingPathComponent("index.html")))
+        XCTAssertNotNil(huge.serve("index.html"))
+        XCTAssertLessThan(cpu() - started, 2, "CPU seconds to serve it")
+        XCTAssertLessThanOrEqual(huge.allowedCount, 1 + LocalPreviewSite.maxReferencesPerFile)
+    }
+
+    func testReferenceLimitsStopEachRead() {
+        let text = String(repeating: "<img src=a.png srcset=\"b.png 1x, c.png 2x\" style=\"background:url(d.png)\">", count: 100)
+        XCTAssertEqual(LocalPreviewSite.htmlReferences(in: text, limit: 7).count, 7)
+        XCTAssertEqual(LocalPreviewSite.htmlReferences(in: text, limit: 150).count, 150)
+        XCTAssertEqual(LocalPreviewSite.htmlReferences(in: text).count, 400)
+        XCTAssertEqual(LocalPreviewSite.cssReferences(in: text, limit: 3), ["d.png", "d.png", "d.png"])
+        XCTAssertEqual(LocalPreviewSite.cssReferences(in: text, limit: 0), [])
     }
 }

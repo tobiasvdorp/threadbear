@@ -129,11 +129,17 @@ struct ReplyPicture: View {
     /// A page of text shouldn't be pushed off screen by one tall picture.
     static let maxHeight: CGFloat = 360
     static let maxPixels = 1400
+    /// More than the top bar or the reply box is tall, even with the slash
+    /// palette (up to 260 pt of results) and photo chips open in it (Codex review).
+    static let underBars: CGFloat = 450
 
     var url: URL
     var alt: String
     var width: Int?
     var height: Int?
+    /// Smaller for the photos over Mike's own bubble, which sit to the right.
+    var tallest: CGFloat = Self.maxHeight
+    var alignment: Alignment = .leading
 
     @State private var loaded: LoadedPicture?
     @State private var failed = false
@@ -167,11 +173,22 @@ struct ReplyPicture: View {
                     .accessibilityHint(loaded?.isVideo == true ? "Plays it full screen" : "Shows it full screen")
             }
         }
-        .onScrollVisibilityChange { visible in
-            if visible { seen = true }
-            // Not while it's open full screen, which shows this one first.
-            offscreen = !visible && !fullScreen
-            if offscreen { loaded = nil }
+        // Watched from a band reaching well past the picture, not the picture
+        // itself. Scroll visibility only counts the clear middle of the screen,
+        // but the top bar and the reply box are see-through: a picture under
+        // either was let go and showed as a gap behind them (8 Nov, Mike's
+        // recording). And any sliver of the band counts, not the default half.
+        .background {
+            Color.clear
+                .onScrollVisibilityChange(threshold: 0.01) { visible in
+                    if visible { seen = true }
+                    // Not while it's open full screen, which shows this one first.
+                    offscreen = !visible && !fullScreen
+                    if offscreen { loaded = nil }
+                }
+                // Taller than either bar, so it's still "on screen" until
+                // it has gone from behind them too.
+                .padding(.vertical, -Self.underBars)
         }
         .task(id: wantsPicture ? url : nil) {
             guard wantsPicture else { return }
@@ -188,7 +205,7 @@ struct ReplyPicture: View {
 
     @ViewBuilder private var picture: some View {
         let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        PictureFit(pixels: size, maxHeight: Self.maxHeight) {
+        PictureFit(pixels: size, maxHeight: tallest) {
             Group {
                 if let loaded {
                     if case .frames = loaded.motion {
@@ -204,7 +221,7 @@ struct ReplyPicture: View {
             .clipShape(shape)
             .overlay(shape.strokeBorder(.quaternary, lineWidth: 0.5))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: alignment)
         .contentShape(Rectangle())
     }
 

@@ -323,7 +323,7 @@ final class QuickAskModel {
     }
 
     func openSystemSettings() {
-        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+        if let url = URL(string: UIApplication.openSettingsURLString) { LinkGate.shared.openOwn(url) }
     }
 
     // MARK: - Buttons and taps

@@ -19,6 +19,9 @@
 //     and must land in a builtin or in that package's own folder in a
 //     node_modules (`node_modules/zod/...`):
 //     packages aren't hashed, by design, as `npm install` put them there.
+//     One the repo commits is its own code, though: every file git tracks
+//     under the repo's node_modules is hashed with the patch and served
+//     from those bytes like a helper (tracked-packages.ts, patchHash).
 //     Anything else is a file of the folder's that nothing hashed, so it
 //     refuses the patch. Node resolves a bare name through the nearest
 //     package.json's own `name` and `exports` before it looks in
@@ -32,12 +35,15 @@ import path from 'node:path';
 import { registerHooks } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cutQueryAndHash } from './linear-text.ts';
+import { repoTopOf, unhashedPackageFile } from './tracked-packages.ts';
 
 // Module URL (the patch file's with its ?v= query, a helper's plain) to
 // the bytes to serve for it.
 const sources = new Map<string, Buffer>();
 // A served module's plain URL to its local specifiers' targets (URLs).
 const edges = new Map<string, Map<string, string>>();
+// A served module's plain URL to its patch's repo top.
+const tops = new Map<string, string>();
 let installed = false;
 
 const plain = (url: string) => cutQueryAndHash(url);
@@ -49,10 +55,12 @@ const plain = (url: string) => cutQueryAndHash(url);
 export function verifiedUrl(root: string, hash: string, code: Map<string, Buffer>, links: Map<string, Map<string, string>>): string {
   install();
   const url = `${pathToFileURL(root).href}?v=${hash}`;
+  const top = repoTopOf(root);
   for (const [file, bytes] of code) {
     // A helper is a module once per process (as before): the first
     // verified version noted is the one Node loads.
     sources.set(file === root ? url : pathToFileURL(file).href, bytes);
+    if (!tops.has(pathToFileURL(file).href)) tops.set(pathToFileURL(file).href, top);
   }
   // The patch file's plain URL too, so a helper importing it back is
   // served the hashed bytes.
@@ -144,6 +152,13 @@ function install(): void {
         if (own !== undefined && own === packageName(specifier)) throw new Error(`${fileURLToPath(plain(parent))} imports ${specifier}, its own package by name, which resolves through package.json to a file patch trust didn't hash: not loaded.`);
         const out = nextResolve(specifier, context);
         if (!isPackageUrl(out.url, specifier)) throw new Error(`${fileURLToPath(plain(parent))} imports ${specifier}, which resolves to ${describe(out.url)}, not a package in node_modules, and patch trust didn't hash it: not loaded.`);
+        // One the repo commits loads only from hashed bytes (patchHash
+        // hashes them all once a patch has a bare import).
+        const top = tops.get(plain(parent));
+        if (top && out.url.startsWith('file:')) {
+          const why = unhashedPackageFile(fileURLToPath(plain(out.url)), top, (f) => !!served(pathToFileURL(f).href));
+          if (why) throw new Error(`${fileURLToPath(plain(parent))} imports ${specifier}, and ${why}: not loaded.`);
+        }
         return out;
       }
       const key = specifier.startsWith('file:') ? fileURLToPath(specifier) : specifier;

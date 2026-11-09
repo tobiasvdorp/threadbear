@@ -98,3 +98,14 @@ test('with no owner-key Mac known, no runner is marked main, so the phone leaves
   assert.equal(rows.filter((r) => r.main).length, 0);
   assert.equal(await s.startsOn(), 'any');
 });
+
+test("the Mac sets the same order with the main key, and a runner key can't read or move it", async () => {
+  const s = await setup({ m5Awake: false });
+  await call(s.ctx, sync.setRunnerOrder, { key: OWNER, runnerIds: [M5, BRUCE, CLOUD] });
+  assert.deepEqual(await call(s.ctx, sync.runnerOrder, { key: OWNER }), [M5, BRUCE, CLOUD]);
+  assert.deepEqual(await s.listed(), [M5, BRUCE, CLOUD]);
+  assert.equal(await s.startsOn(), BRUCE);
+  assert.equal(await outcome(call(s.ctx, sync.setRunnerOrder, { key: BRUCE_KEY, runnerIds: [BRUCE, M5] })), 'forbidden');
+  assert.equal(await outcome(call(s.ctx, sync.runnerOrder, { key: BRUCE_KEY })), 'forbidden');
+  assert.deepEqual(s.rows('runnerOrder')[0]!.runnerIds, [M5, BRUCE, CLOUD]);
+});

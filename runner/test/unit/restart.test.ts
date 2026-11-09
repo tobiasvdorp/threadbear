@@ -123,6 +123,29 @@ test('a background subagent asking for approval after its turn ended keeps the r
   assert.equal(state.restarts, 0);
 });
 
+test('an idle restart waits for a running turn.end hook, and goes once it has ended', async () => {
+  const root = tmpDir();
+  const project = path.join(root, 'app');
+  fs.mkdirSync(path.join(project, '.threadbear/patches'), { recursive: true });
+  fs.writeFileSync(path.join(project, '.threadbear/patches/h.ts'), `export default { hooks: [{ title: "Slow", on: "turn.end", run: "sleep 0.3", tell: "never" }] };`);
+  const h = makeHarness(undefined, {}, { panelsRoot: root, actionShell: ['/bin/sh', '-c'], actionTimeoutMs: 5000 });
+  const { r, state } = withRestarter(h);
+  const { thread } = create(h, { cwd: project });
+  await tick();
+  await h.runner.patchesIdle();
+  const s = h.adapter.last;
+  s.init();
+  s.result('completed');
+  assert.equal(h.runner.get(thread.id).status, 'idle', 'nothing else holds it');
+  assert.deepEqual(r.request({ when: 'idle' }).waitingFor, [thread.id]);
+  await tick();
+  assert.equal(state.restarts, 0);
+  const end = Date.now() + 5000;
+  while (state.restarts === 0 && Date.now() < end) await new Promise((res) => setTimeout(res, 10));
+  assert.equal(state.restarts, 1);
+  assert.ok(h.events(thread.id).some((e) => e.type === 'action.run' && e.trigger === 'turn.end'), 'with its result in the thread');
+});
+
 test('a send while a restart is pending still works, and the restart waits for it', async () => {
   const h = makeHarness();
   const { r, state } = withRestarter(h);

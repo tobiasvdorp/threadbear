@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { ImageRef } from './protocol.ts';
-import { convertImage, svgToPng } from './images.ts';
+import { convertImage, pictureKindOf, svgToPng } from './images.ts';
 
 export type IconCandidate = {
   path: string;
@@ -180,9 +180,20 @@ async function fromManifest(file: string, root: string): Promise<IconCandidate |
   if (!rel) return undefined;
   // A built copy's manifest (dist/) points at a built copy; the walk skips
   // those folders, so this is the source's.
+  // A picture by its name, as the walk takes (IMAGE_EXTS), and a file of the
+  // repo's own: not a link out of it, nor through a linked folder. A
+  // manifest names whatever it likes (Daybreak, 8 Nov: "icon.msl").
   const full = path.resolve(dir, rel.replace(/^\//, ''));
-  if (!full.startsWith(root + path.sep) || !fs.existsSync(full)) return undefined;
-  const size = await imageSize(full, path.extname(full).toLowerCase());
+  const ext = path.extname(full).toLowerCase();
+  if (!IMAGE_EXTS.has(ext) || !full.startsWith(root + path.sep)) return undefined;
+  try {
+    if (!(await fs.promises.lstat(full)).isFile()) return undefined;
+    const [real, realRoot] = await Promise.all([fs.promises.realpath(full), fs.promises.realpath(root)]);
+    if (!real.startsWith(realRoot + path.sep)) return undefined;
+  } catch {
+    return undefined;
+  }
+  const size = await imageSize(full, ext);
   return { path: full, score, ...size };
 }
 
@@ -244,6 +255,9 @@ export async function storeIcon(src: string, dir: string, projectId: string, has
     await fs.promises.copyFile(src, dest);
     ref = { path: dest, mediaType: 'image/svg+xml', ...(await imageSize(dest, '.svg')) };
   } else {
+    // Only a picture by its bytes is copied or converted (images.ts,
+    // pictureKind): one named .png that's something else is no icon.
+    if (!pictureKindOf(src)) throw new Error(`Not a picture: ${path.basename(src)}`);
     const dest = path.join(dir, `${projectId}-${hash}.png`);
     const size = await imageSize(src, ext);
     const small = Boolean(size?.width) && Math.max(size?.width ?? 0, size?.height ?? 0) <= ICON_PX;

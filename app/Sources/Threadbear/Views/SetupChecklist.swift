@@ -216,7 +216,7 @@ private struct SetupRow: View {
                     opening = false
                 }
             }
-            .disabled(opening)
+            .busy(opening)
             .tip("Opens your Threadbear website in \(DefaultBrowser.current()?.name ?? "your browser"), signed in for 90 days")
         }
     }

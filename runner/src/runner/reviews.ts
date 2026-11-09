@@ -33,7 +33,7 @@ export const reviewsPart = {
         // than that one picture.
         return {...option, image: shots[0].image, ...(shots.length > 1 || shots[0].title || 'media' in shots[0] ? {shots} : {})};
       });
-      const review: DesignReview = { id, title: input.title, ...(input.note ? {note: input.note} : {}), options,
+      const review: DesignReview = { id, title: input.title, ...(input.note ? {note: input.note} : {}), ...(input.recommended ? {recommended: input.recommended} : {}), options,
         status: 'pending', revision: 0, createdAt: now, updatedAt: now, draft: {notes: {}} };
       this.persistReview(st, review);
       return {review: structuredClone(review)};

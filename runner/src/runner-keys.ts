@@ -14,6 +14,7 @@ import path from 'node:path';
 import os from 'node:os';
 import type { Config } from './config.ts';
 import { CONVEX_BIN } from './convex-keys.ts';
+import { convexEnv, readConvexAdmin, SELF_HOSTED_ENV_FILE, type ConvexAdmin } from './convex-admin.ts';
 import { convexPoster, forbiddenText, readSyncKey, type Post } from './sync.ts';
 
 type Run = { ok: boolean; out: string; err: string };
@@ -56,20 +57,21 @@ const validRunnerId = (id: string) => RUNNER_ID.test(id) && id !== 'any';
 // What a Mac with a runner key shouldn't also have, as any of them can do
 // anything to the deployment (read RUNNER_KEY, issue phone tokens, deploy),
 // so with one the runner key keeps nothing out: setup's deploy key, the
-// Convex panel's cached deploy keys (convex-keys.ts, by name), a Convex CLI login.
-type Admin = { deployEnv: boolean; cliLogin: boolean; panels: string[]; teamToken?: boolean };
-const hasAdmin = (a: Admin) => a.deployEnv || a.cliLogin || a.panels.length > 0 || Boolean(a.teamToken);
+// Convex panel's cached deploy keys (convex-keys.ts, by name), a Convex CLI
+// login, or a self-hosted backend's admin key (setup --self-hosted).
+type Admin = { deployEnv: boolean; cliLogin: boolean; panels: string[]; teamToken?: boolean; selfHostedEnv?: boolean };
+const hasAdmin = (a: Admin) => a.deployEnv || a.cliLogin || a.panels.length > 0 || Boolean(a.teamToken) || Boolean(a.selfHostedEnv);
 
 function adminAdvice(a: Admin, where: string, url: string): string {
   const deployment = deploymentOf(url);
   const good = a.panels.filter((n) => PANEL_KEY.test(n));
   const odd = a.panels.length - good.length;
-  const have = [a.deployEnv && "setup's deploy key (secrets/convex-deploy.env, named threadbear-runner-<that Mac's name>)", ...good.map((n) => `the Convex panel's deploy key ${n}`), odd && `${odd} panel key file${odd === 1 ? '' : 's'} with an unrecognised name (secrets/convex-panels/)`, a.cliLogin && 'a Convex CLI login (~/.convex/config.json)', a.teamToken && 'a Convex team access token (secrets/convex-team-token, which reaches every project on the team)'].filter(Boolean);
+  const have = [a.deployEnv && "setup's deploy key (secrets/convex-deploy.env, named threadbear-runner-<that Mac's name>)", ...good.map((n) => `the Convex panel's deploy key ${n}`), odd && `${odd} panel key file${odd === 1 ? '' : 's'} with an unrecognised name (secrets/convex-panels/)`, a.cliLogin && 'a Convex CLI login (~/.convex/config.json)', a.teamToken && 'a Convex team access token (secrets/convex-team-token, which reaches every project on the team)', a.selfHostedEnv && `the self-hosted backend's admin key (secrets/${SELF_HOSTED_ENV_FILE})`].filter(Boolean);
   const settings = deployment ? `https://dashboard.convex.dev/d/${deployment}/settings` : "the deployment's settings in the Convex dashboard";
   const commands = deployment && good.length ? `, or from this Mac: ${good.map((n) => `npx convex deployment token delete ${n} --deployment ${deployment}`).join('; ')}` : '';
   return [
     `${where} also has ${have.join(', ')}. Any of them can do anything to the deployment, so its runner key keeps nothing out, and deleting the files doesn't stop a copy someone already took. In this order:`,
-    `  1. Revoke them on Convex's side: the deploy keys in ${settings} (Deploy keys)${commands}.${odd ? ' Look there for any you don\'t recognise too.' : ''}${a.cliLogin ? " The CLI login: in the Convex dashboard's account settings, revoke that Mac's access token (named after its hostname)." : ''}${a.teamToken ? " The team token: in the Convex dashboard's team settings (Access tokens)." : ''}`,
+    `  1. Revoke them on Convex's side: the deploy keys in ${settings} (Deploy keys)${commands}.${odd ? ' Look there for any you don\'t recognise too.' : ''}${a.cliLogin ? " The CLI login: in the Convex dashboard's account settings, revoke that Mac's access token (named after its hostname)." : ''}${a.teamToken ? " The team token: in the Convex dashboard's team settings (Access tokens)." : ''}${a.selfHostedEnv ? " A self-hosted admin key can't be revoked on its own: every one comes from the backend's instance secret, so changing that is the only way (docs/self-hosting.md, \"Keys\")." : ''}`,
     `  2. Then remove them there: the files above${a.cliLogin ? ', and npx convex logout' : ''}.`,
     "  3. Then rotate the main key, which they could read: tb runner rotate-owner here. Only the main Mac needs any of these.",
   ].join('\n');
@@ -122,6 +124,7 @@ export const REMOTE_ADMIN_CHECK = [
   '[ -e "$d/convex-deploy.env" ] && echo deploy-env',
   '[ -e "$HOME/.convex/config.json" ] && echo cli-login',
   '[ -e "$d/convex-team-token" ] && echo team-token',
+  `[ -e "$d/${SELF_HOSTED_ENV_FILE}" ] && echo self-hosted-env`,
   // Only each key's name, never the key: sed picks the "name" field.
   'for f in "$d"/convex-panels/*.json; do [ -e "$f" ] && echo "panel $(sed -n \'s/.*"name":"\\([^"]*\\)".*/\\1/p\' "$f")"; done',
   'echo checked',
@@ -131,7 +134,7 @@ function remoteAdmin(ssh: Ssh, host: string): Admin | undefined {
   const r = ssh(host, REMOTE_ADMIN_CHECK);
   const lines = r.out.split('\n').map((l) => l.trim()).filter(Boolean);
   if (!r.ok || lines.at(-1) !== 'checked') return undefined;
-  return { deployEnv: lines.includes('deploy-env'), cliLogin: lines.includes('cli-login'), teamToken: lines.includes('team-token'), panels: lines.filter((l) => l.startsWith('panel ')).map((l) => l.slice(6).trim() || '(no name)') };
+  return { deployEnv: lines.includes('deploy-env'), cliLogin: lines.includes('cli-login'), teamToken: lines.includes('team-token'), selfHostedEnv: lines.includes('self-hosted-env'), panels: lines.filter((l) => l.startsWith('panel ')).map((l) => l.slice(6).trim() || '(no name)') };
 }
 
 function localAdmin(home: string, userHome: string): Admin {
@@ -152,7 +155,7 @@ function localAdmin(home: string, userHome: string): Admin {
   } catch {
     // no panel keys
   }
-  return { deployEnv: fs.existsSync(path.join(home, 'secrets', 'convex-deploy.env')), cliLogin: fs.existsSync(path.join(userHome, '.convex', 'config.json')), teamToken: fs.existsSync(path.join(home, 'secrets', 'convex-team-token')), panels };
+  return { deployEnv: fs.existsSync(path.join(home, 'secrets', 'convex-deploy.env')), cliLogin: fs.existsSync(path.join(userHome, '.convex', 'config.json')), teamToken: fs.existsSync(path.join(home, 'secrets', 'convex-team-token')), selfHostedEnv: fs.existsSync(path.join(home, 'secrets', SELF_HOSTED_ENV_FILE)), panels };
 }
 
 // Every ssh to the other Mac, which may have been tampered with: no
@@ -177,9 +180,13 @@ export function convexScratchDir(): string {
 const realConvex =
   (home: string): ConvexCli =>
   (args, input) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, CONVEX_DEPLOY_KEY: deployKey(home) ?? '' };
-    // Only the deploy key picks the deployment.
-    delete env.CONVEX_DEPLOYMENT;
+    // Only this Mac's deploy key (or a self-hosted backend's admin key) picks the deployment.
+    let env: NodeJS.ProcessEnv;
+    try {
+      env = convexEnv(readConvexAdmin(home));
+    } catch (e) {
+      return { ok: false, out: '', err: (e as Error).message };
+    }
     const cwd = convexScratchDir();
     try {
       const r = spawnSync(process.execPath, [CONVEX_BIN, ...args], { cwd, env, input, encoding: 'utf8' });
@@ -189,9 +196,12 @@ const realConvex =
     }
   };
 
-function deployKey(home: string): string | undefined {
+// This Mac's admin credential for the backend, or undefined (none, or both
+// kinds at once, which convex-admin.ts refuses).
+function adminOf(home: string): ConvexAdmin | undefined {
   try {
-    return fs.readFileSync(path.join(home, 'secrets', 'convex-deploy.env'), 'utf8').match(/^CONVEX_DEPLOY_KEY=["']?([^"'\n]+)/m)?.[1];
+    const a = readConvexAdmin(home);
+    return a.kind === 'none' ? undefined : a;
   } catch {
     return undefined;
   }
@@ -227,6 +237,7 @@ export async function runnerKeysCommand(cfg: Pick<Config, 'home' | 'sync'>, args
   };
   const url = cfg.sync.url;
   const key = readSyncKey(cfg.home);
+  if (cfg.sync.urlRefused) return fail(`This Mac doesn't mirror to Convex: ${cfg.sync.urlRefused}.`);
   if (!url || !key) return fail("This Mac doesn't mirror to Convex (no sync.url in runner.json, or no secrets/convex-key), so it has no runner keys to manage. Run ./threadbear setup first.");
   const post = deps.post ?? convexPoster(url);
   const call = async (kind: 'query' | 'mutation', fn: string, a: Record<string, unknown>) => {
@@ -271,7 +282,7 @@ export async function runnerKeysCommand(cfg: Pick<Config, 'home' | 'sync'>, args
       print(`Took out everything runner ${id} wrote: its threads with their messages and pictures, sidebar rows, Pocket cards, schedules, projects and accounts.`);
       return 0;
     }
-    if (sub === 'add') return await add(rest[0], f, call, deps.ssh ?? realSsh, print, fail, url, cfg.sync.runnerId);
+    if (sub === 'add') return await add(rest[0], f, call, deps.ssh ?? realSsh, print, fail, url, cfg.sync.runnerId, cfg.sync.site);
     if (sub === 'logins') return await logins(rest, f, call, print, fail);
     // After a rotation, what the old key could have left (auditCommand).
     return fail('tb runner add <name> --ssh <host> | --out <file> [--id <runnerId>], tb runner list, tb runner logins [<runnerId> <provider:email>... | none], tb runner revoke <runnerId>, tb runner check [--ssh <host>], or tb runner rotate-owner [--finish].');
@@ -280,7 +291,7 @@ export async function runnerKeysCommand(cfg: Pick<Config, 'home' | 'sync'>, args
   }
 }
 
-async function add(name: string | undefined, f: Flags, call: (kind: 'query' | 'mutation', fn: string, a: Record<string, unknown>) => Promise<unknown>, ssh: Ssh, print: (s: string) => void, fail: (s: string) => number, url: string, ownId: string | undefined): Promise<number> {
+async function add(name: string | undefined, f: Flags, call: (kind: 'query' | 'mutation', fn: string, a: Record<string, unknown>) => Promise<unknown>, ssh: Ssh, print: (s: string) => void, fail: (s: string) => number, url: string, ownId: string | undefined, site?: string): Promise<number> {
   if (!name?.trim()) return fail('tb runner add <name>: what to call the runner ("bruce").');
   if (Boolean(f.ssh) === Boolean(f.out)) return fail('Say where the key goes: --ssh <host> writes it into that Mac\'s secrets/convex-key, --out <file> into a file of your own. It is never printed.');
   if (!ownId) return fail("This Mac has no sync.runnerId in runner.json yet (its runner makes one when it starts), so it can't tell its own id from another Mac's. Start it, then run this again.");
@@ -292,7 +303,7 @@ async function add(name: string | undefined, f: Flags, call: (kind: 'query' | 'm
   if (f.ssh) {
     const r = ssh(f.ssh, `cat ${REMOTE_HOME}/runner.json`);
     if (!r.ok) return fail(`Couldn't read Threadbear's runner.json on ${f.ssh} over ssh: ${clean(r.err || 'no answer')}. Is Threadbear set up there?`);
-    let json: { sync?: { runnerId?: string; url?: string } } & Record<string, unknown>;
+    let json: { sync?: { runnerId?: string; url?: string; site?: string } } & Record<string, unknown>;
     try {
       json = JSON.parse(r.out);
     } catch {
@@ -309,12 +320,15 @@ async function add(name: string | undefined, f: Flags, call: (kind: 'query' | 'm
     if (asked && there && there !== asked) return fail(`${f.ssh}'s runner says it's ${there}, not ${asked}.`);
     if (!asked && there === ownId) return fail(`${f.ssh}'s runner.json says it's ${there}, which is this Mac's own runner id. Not making a key for it.`);
     runnerId = asked ?? there;
-    if (!there || !json.sync?.url) {
+    // A self-hosted backend's website address (sync.site) can't be worked
+    // out from its URL, so it goes there whenever it's missing or different.
+    const siteStale = Boolean(site) && json.sync?.site !== site;
+    if (!there || !json.sync?.url || siteStale) {
       // A runner that has never started: this Mac picks its id (or takes
       // --id) and writes it there. One set up with no Convex of its own
       // (setup --existing) gets this deployment's URL too.
       runnerId ??= crypto.randomBytes(6).toString('hex');
-      const next = { ...json, sync: { ...json.sync, url, runnerId } };
+      const next = { ...json, sync: { ...json.sync, url, ...(site ? { site } : {}), runnerId } };
       const w = ssh(f.ssh, `d=${REMOTE_HOME}; cat > "$d/runner.json.new" && mv "$d/runner.json.new" "$d/runner.json"`, JSON.stringify(next, null, 2) + '\n');
       if (!w.ok) return fail(`Couldn't write ${f.ssh}'s runner.json: ${clean(w.err || 'no answer')}.`);
     }
@@ -411,7 +425,7 @@ function check(cfg: Pick<Config, 'home'>, key: string, f: Flags, ssh: Ssh, print
     const a = remoteAdmin(ssh, f.ssh);
     if (!a) return fail(`Couldn't look on ${f.ssh} over ssh, so this says nothing about it: check ssh reaches it, then run this again.`);
     if (hasAdmin(a)) return fail(adminAdvice(a, f.ssh, url));
-    print(`${f.ssh} has no deploy key or panel keys in its Threadbear data folder and no Convex login.`);
+    print(`${f.ssh} has no deploy key, self-hosted admin key or panel keys in its Threadbear data folder and no Convex login.`);
     return 0;
   }
   if (!key.startsWith('tbr_')) {
@@ -422,7 +436,7 @@ function check(cfg: Pick<Config, 'home'>, key: string, f: Flags, ssh: Ssh, print
   }
   const a = localAdmin(cfg.home, userHome);
   if (hasAdmin(a)) return fail(adminAdvice(a, 'This Mac', url));
-  print('This Mac has a runner key of its own, and no deploy key, panel keys or Convex login beside it.');
+  print('This Mac has a runner key of its own, and no deploy key, self-hosted admin key, panel keys or Convex login beside it.');
   return 0;
 }
 
@@ -434,7 +448,8 @@ function check(cfg: Pick<Config, 'home'>, key: string, f: Flags, ssh: Ssh, print
 // key for the env vars. The key is never printed.
 async function rotateOwner(home: string, key: string, f: Flags, call: (kind: 'query' | 'mutation', fn: string, a: Record<string, unknown>) => Promise<unknown>, convex: ConvexCli, print: (s: string) => void, fail: (s: string) => number, url: string, keys: () => Promise<DeployKey[] | undefined>, ownRunnerId: string | undefined, now: number): Promise<number> {
   if (key.startsWith('tbr_')) return fail('This Mac has a runner key, not the main key: run tb runner rotate-owner on the main Mac.');
-  if (!deployKey(home)) return fail(`No deploy key in ${path.join(home, 'secrets', 'convex-deploy.env')}, so this can't set the deployment's env vars. Run it on the main Mac, or make one with npx convex deployment token create --prod --save-env <that file>.`);
+  const admin = adminOf(home);
+  if (!admin) return fail(`No deploy key in ${path.join(home, 'secrets', 'convex-deploy.env')} (or self-hosted admin key in secrets/${SELF_HOSTED_ENV_FILE}), so this can't set the deployment's env vars. Run it on the main Mac, or make one with npx convex deployment token create --prod --save-env <that file>.`);
   // Owner only, so this also says the key in secrets/convex-key is the main key.
   const { rotating } = await listKeys(call);
   const keyFile = path.join(home, 'secrets', 'convex-key');
@@ -442,30 +457,36 @@ async function rotateOwner(home: string, key: string, f: Flags, call: (kind: 'qu
     if (rotating) return fail(`${ROTATING} Or, to start again, remove it first: npx convex env remove --prod RUNNER_KEY_NEXT.`);
     const stranded = await onMainKey(call, ownRunnerId, now, f.lockOut);
     if (stranded.refuse) return fail(stranded.refuse);
-    // A deploy key can read the new main key as easily as the old, so not
-    // while Convex lists any this Mac didn't make, unless Mike has looked
-    // at them (--keys-checked), by Convex's own list rather than another
-    // Mac's word. CLI logins can't be listed at all.
-    const deployment = deploymentOf(url);
-    const settings = deployment ? `https://dashboard.convex.dev/d/${deployment}/settings` : "the deployment's settings in the Convex dashboard";
-    const logins = "A Convex CLI login on another Mac can read it too and can't be listed here: revoke any in the Convex dashboard's account settings.";
-    let listed: DeployKey[] | undefined;
-    let why = '';
-    try {
-      listed = await keys();
-      if (!listed) why = 'no CONVEX_TEAM_TOKEN was given for this run (a team access token from the Convex dashboard\'s team settings; it isn\'t kept)';
-    } catch (e) {
-      why = clean((e as Error).message, 200);
-    }
-    if (!listed) {
-      if (!f.keysChecked) return fail(`Can't list the deployment's deploy keys from Convex's side: ${why}. Any made for another Mac could read the new key. Look in ${settings} (Deploy keys), delete any for another Mac or that you don't know, then run this again with --keys-checked, or with CONVEX_TEAM_TOKEN set for the run. ${logins}`);
-    } else {
-      const made = madeDeployKeys(home);
-      const review = listed.filter((k) => !made.has(k.name));
-      if (review.length) {
-        const lines = review.map((k, i) => `  ${i + 1}. ${clean(k.name, 80)}, made ${new Date(k.creationTime).toISOString()}${k.lastUsedTime ? `, last used ${new Date(k.lastUsedTime).toISOString()}` : ''}`);
-        if (!f.keysChecked) return fail([`Convex lists deploy keys this Mac didn't make itself, and any of them could read the new main key. Delete in ${settings} (Deploy keys) any for another Mac or that you don't know, then run this again with --keys-checked:`, ...lines, logins].join('\n'));
-        print(['Going ahead (--keys-checked) with these deploy keys still on the deployment:', ...lines, logins].join('\n'));
+    // A self-hosted backend has no deploy keys to list: its admin keys all
+    // come from the instance secret and none can be listed or revoked, so
+    // say so and go on (docs/self-hosting.md, "Keys").
+    if (admin.kind === 'selfHosted') print(`A self-hosted backend's admin keys can't be listed: any Mac you gave one to (secrets/${SELF_HOSTED_ENV_FILE}) can read the new main key too. tb runner check --ssh <host> looks for one on another Mac.`);
+    else {
+      // A deploy key can read the new main key as easily as the old, so not
+      // while Convex lists any this Mac didn't make, unless Mike has looked
+      // at them (--keys-checked), by Convex's own list rather than another
+      // Mac's word. CLI logins can't be listed at all.
+      const deployment = deploymentOf(url);
+      const settings = deployment ? `https://dashboard.convex.dev/d/${deployment}/settings` : "the deployment's settings in the Convex dashboard";
+      const logins = "A Convex CLI login on another Mac can read it too and can't be listed here: revoke any in the Convex dashboard's account settings.";
+      let listed: DeployKey[] | undefined;
+      let why = '';
+      try {
+        listed = await keys();
+        if (!listed) why = 'no CONVEX_TEAM_TOKEN was given for this run (a team access token from the Convex dashboard\'s team settings; it isn\'t kept)';
+      } catch (e) {
+        why = clean((e as Error).message, 200);
+      }
+      if (!listed) {
+        if (!f.keysChecked) return fail(`Can't list the deployment's deploy keys from Convex's side: ${why}. Any made for another Mac could read the new key. Look in ${settings} (Deploy keys), delete any for another Mac or that you don't know, then run this again with --keys-checked, or with CONVEX_TEAM_TOKEN set for the run. ${logins}`);
+      } else {
+        const made = madeDeployKeys(home);
+        const review = listed.filter((k) => !made.has(k.name));
+        if (review.length) {
+          const lines = review.map((k, i) => `  ${i + 1}. ${clean(k.name, 80)}, made ${new Date(k.creationTime).toISOString()}${k.lastUsedTime ? `, last used ${new Date(k.lastUsedTime).toISOString()}` : ''}`);
+          if (!f.keysChecked) return fail([`Convex lists deploy keys this Mac didn't make itself, and any of them could read the new main key. Delete in ${settings} (Deploy keys) any for another Mac or that you don't know, then run this again with --keys-checked:`, ...lines, logins].join('\n'));
+          print(['Going ahead (--keys-checked) with these deploy keys still on the deployment:', ...lines, logins].join('\n'));
+        }
       }
     }
     const fresh = crypto.randomBytes(32).toString('hex');

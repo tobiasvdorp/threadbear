@@ -553,3 +553,53 @@ test('tb runner logins sets exactly the logins given, or none, and lists what ea
   assert.match(out, /says it has: claude:mike@example\.com, claude:guess@/);
   assert.equal(out.includes('\u001b'), false, 'what that Mac wrote prints with no escapes');
 });
+
+// A self-hosted backend (docs/self-hosting.md): its admin key is an admin
+// credential like a deploy key, and its website address goes to a Mac
+// joining it, which can't work it out from the URL.
+const SELF_HOSTED_ENV = 'CONVEX_SELF_HOSTED_URL=http://127.0.0.1:13210\nCONVEX_SELF_HOSTED_ADMIN_KEY=convex-self-hosted|secret\n';
+
+test('tb runner check counts a self-hosted admin key, here or on another Mac', async () => {
+  const s = setup();
+  fs.writeFileSync(path.join(s.cfg.home, 'secrets', 'convex-key'), 'tbr_mine\n');
+  fs.writeFileSync(path.join(s.cfg.home, 'secrets', 'convex-self-hosted.env'), SELF_HOSTED_ENV);
+  assert.equal(await runnerKeysCommand(s.cfg, ['check'], {}, s.deps), 1);
+  assert.match(s.printed.join('\n'), /convex-self-hosted\.env/);
+  assert.match(s.printed.join('\n'), /instance secret/);
+  assert.doesNotMatch(s.printed.join('\n'), /convex-self-hosted\|secret/);
+  assert.match(REMOTE_ADMIN_CHECK, /convex-self-hosted\.env" \] && echo self-hosted-env/);
+  const r = setup(undefined, [], ['self-hosted-env']);
+  assert.equal(await runnerKeysCommand(r.cfg, ['check'], { ssh: 'bruce' }, r.deps), 1);
+  assert.match(r.printed.join('\n'), /convex-self-hosted\.env/);
+});
+
+test("tb runner add gives a new Mac a self-hosted backend's website address too", async () => {
+  const site = 'https://mac.tail1.ts.net:3211';
+  const url = 'https://mac.tail1.ts.net:3210';
+  const s = setup({ sync: { name: 'new' } });
+  const cfg = { ...s.cfg, sync: { ...s.cfg.sync, url, site } };
+  assert.equal(await runnerKeysCommand(cfg, ['add', 'new'], { ssh: 'new' }, s.deps), 0);
+  const json = JSON.parse(s.sshCalls.find((c) => c.command.includes('runner.json.new'))!.input!);
+  assert.equal(json.sync.url, url);
+  assert.equal(json.sync.site, site);
+  // A Mac that already has its id and URL but no site (or an old one) gets it too, its id kept.
+  for (const old of [undefined, 'https://old.tail1.ts.net:3211']) {
+    const r = setup({ sync: { name: 'bruce', url, runnerId: 'cb921b2447ea', ...(old ? { site: old } : {}) } });
+    assert.equal(await runnerKeysCommand(cfg, ['add', 'bruce'], { ssh: 'bruce' }, r.deps), 0);
+    const written = JSON.parse(r.sshCalls.find((c) => c.command.includes('runner.json.new'))!.input!);
+    assert.deepEqual(written.sync, { name: 'bruce', url, runnerId: 'cb921b2447ea', site });
+  }
+});
+
+test("rotate-owner on a self-hosted backend goes ahead without a deploy-key list, and says why", async () => {
+  const s = setup();
+  fs.writeFileSync(path.join(s.cfg.home, 'secrets', 'convex-self-hosted.env'), SELF_HOSTED_ENV);
+  s.keys(undefined);
+  assert.equal(await runnerKeysCommand(s.cfg, ['rotate-owner'], {}, s.deps), 0);
+  assert.match(s.printed.join('\n'), /can't be listed/);
+  assert.equal(s.convexCalls[0]?.args.join(' '), 'env set RUNNER_KEY_NEXT');
+  // With no admin credential at all, nothing happens.
+  const n = setup();
+  assert.equal(await runnerKeysCommand(n.cfg, ['rotate-owner'], {}, n.deps), 1);
+  assert.deepEqual(n.convexCalls, []);
+});

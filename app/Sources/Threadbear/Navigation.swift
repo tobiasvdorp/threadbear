@@ -13,6 +13,11 @@ struct NavigationPlace: Equatable, Sendable {
     var librarianHome = false
     /// The Scheduled page (`showsScheduledHome`).
     var scheduledHome = false
+
+    /// The new-thread screen: no thread, sub-agent or page open.
+    var isNewThreadScreen: Bool {
+        threadId == nil && subagent == nil && projectId == nil && !projectsHome && !librarianHome && !scheduledHome
+    }
 }
 
 /// Back and forward, like a browser's: ⌘[ and ⌘] in the Go menu, the
@@ -46,6 +51,20 @@ extension AppModel {
         ActivityRecorder.shared.view(place)
     }
 
+    /// Opens a thread just started from the composer. Started from the
+    /// new-thread screen, the thread takes that screen's place in the
+    /// history, so Back goes to wherever Mike was before he pressed New
+    /// thread rather than to an empty composer he's done with (8 Nov).
+    func showStartedThread(_ id: String) {
+        flushNavigation()
+        let fromNewThreadScreen = place.isNewThreadScreen
+        select(id)
+        guard fromNewThreadScreen else { return }
+        // select's own step is still queued; once this has the place, that
+        // finds it already current and adds nothing.
+        history.replaceCurrent(with: place)
+    }
+
     var canGoBack: Bool { history.canGoBack }
     var canGoForward: Bool { history.canGoForward }
 
@@ -57,6 +76,32 @@ extension AppModel {
     func goForward() {
         flushNavigation()
         if let place = history.forward(where: canShow) { show(place) }
+    }
+
+    /// Where Back or Forward would go, named for a swipe's card: the
+    /// thread's title and its place line, or the page.
+    func destination(back: Bool) -> (title: String, detail: String?)? {
+        guard let place = history.peek(back: back, where: canShow) else { return nil }
+        return describe(place)
+    }
+
+    func describe(_ place: NavigationPlace) -> (title: String, detail: String?) {
+        if let subagent = place.subagent, let thread = threads[subagent.threadId] {
+            return (thread.title.isEmpty ? "Untitled" : thread.title, "Sub-agent")
+        }
+        if let id = place.projectId, let project = project(id) { return (project.title, "Project") }
+        if place.projectsHome { return ("Projects", nil) }
+        if place.librarianHome { return ("Librarian", nil) }
+        if place.scheduledHome { return ("Scheduled", nil) }
+        if let id = place.threadId, let thread = threads[id] {
+            return (thread.title.isEmpty ? "Untitled" : thread.title, ProjectMark.place(thread))
+        }
+        switch place.mode {
+        case .inbox: return ("New thread", nil)
+        case .scheduled: return ("Scheduled", nil)
+        case .projects: return ("Projects", nil)
+        case .librarian: return ("Librarian", nil)
+        }
     }
 
     /// A deleted thread, a merged project or a view the runner no longer

@@ -36,9 +36,12 @@ public protocol Backend: Sendable {
     /// (backend API 16), for the search to find ones older than the den's
     /// newest 100. Once, not live: it runs again as the words change.
     func search(_ text: String) async throws -> [PhoneThread]
-    /// Every runner's schedules, for the inbox's Waiting section: which
-    /// threads have booked themselves a message for later.
+    /// Every runner's schedules whole, for a backend older than API 45.
     func schedules() -> AsyncThrowingStream<[PhoneSchedule], Error>
+    /// The active schedules, for the inbox's Hibernating section: which
+    /// threads have booked themselves a message for later (backend API 45,
+    /// phone:wakes). Only id, threadId and nextRunAt are filled in.
+    func wakes() -> AsyncThrowingStream<[PhoneSchedule], Error>
     /// How many threads are hibernating and archived (backend API 16), for
     /// the folded headings, so those lists needn't be loaded.
     func counts() -> AsyncThrowingStream<PhoneCounts, Error>
@@ -62,6 +65,12 @@ public protocol Backend: Sendable {
     /// Takes back a photo that was uploaded and then never sent (backend API 25).
     func discardPhoto(_ storageId: String) async throws
     func respond(threadId: String, approvalId: String, decision: ApprovalOption) async throws -> String
+    /// Presses a reply button (backend API 59): queues it for the thread's
+    /// runner, which presses it once however many times it's asked.
+    func press(threadId: String, buttonId: String) async throws -> String
+    /// Asks the thread's runner for the slash commands it can run (backend
+    /// API 62). The list comes back as the command's `commands`.
+    func slashCommands(threadId: String) async throws -> String
     /// Answers keyed by question text, several choices joined with ", ",
     /// as the Mac app sends them. `summary` goes in the transcript.
     func answer(threadId: String, approvalId: String, answers: [String: String], summary: String) async throws -> String
@@ -82,6 +91,9 @@ public protocol Backend: Sendable {
     /// (backend API 2). Reads Convex alone, so it works while the Mac sleeps;
     /// more history is a bigger limit.
     func messages(_ threadId: String, limit: Int) -> AsyncThrowingStream<MessagePage, Error>
+    /// API 2: up to `limit` messages and tool lines before `beforeSeq`, once,
+    /// for scrolling back past what the live page holds (MessageHistory).
+    func olderMessages(_ threadId: String, beforeSeq: Int, limit: Int) async throws -> MessagePage
     /// For a backend before API 2: asks the runner for up to 50 text messages older than `beforeSeq`;
     /// they turn up in `thread(_:)` once it has written them.
     func loadEarlier(threadId: String, beforeSeq: Int) async throws -> String
@@ -241,6 +253,27 @@ public final class ConvexBackend: Backend, @unchecked Sendable {
         live("phone:schedules", [:], as: [PhoneSchedule].self)
     }
 
+    /// A small row per active schedule (scheduleWakes), which a claim or a run
+    /// only rewrites when its next time changes. phone:schedules reads every
+    /// schedule's whole message, about 200 KB, and re-runs on every claim and
+    /// run: kept open by every phone, it was 8% of the project's Database I/O.
+    public func wakes() -> AsyncThrowingStream<[PhoneSchedule], Error> {
+        let rows = live("phone:wakes", [:], as: [ScheduleWake].self)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await list in rows {
+                        continuation.yield(list.map { PhoneSchedule(id: $0.scheduleId, threadId: $0.threadId, nextRunAt: $0.nextRunAt) })
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     public func counts() -> AsyncThrowingStream<PhoneCounts, Error> {
         live("phone:counts", [:], as: PhoneCounts.self)
     }
@@ -251,6 +284,11 @@ public final class ConvexBackend: Backend, @unchecked Sendable {
 
     public func messages(_ threadId: String, limit: Int) -> AsyncThrowingStream<MessagePage, Error> {
         live("phone:messages", ["threadId": .string(threadId), "limit": .number(Double(limit)), "tools": .bool(true)], as: MessagePage.self)
+    }
+
+    public func olderMessages(_ threadId: String, beforeSeq: Int, limit: Int) async throws -> MessagePage {
+        let answer = try await transport.query("phone:messages", args(["threadId": .string(threadId), "beforeSeq": .number(Double(beforeSeq)), "limit": .number(Double(limit)), "tools": .bool(true)]))
+        return try Self.decode(MessagePage.self, answer)
     }
 
     public func command(_ commandId: String) -> AsyncThrowingStream<CommandStatus?, Error> {
@@ -289,6 +327,14 @@ public final class ConvexBackend: Backend, @unchecked Sendable {
             args["answers"] = .array(answers.map { .object(["action": .string($0.action), "answer": .string($0.answer)]) })
         }
         return try await command("phone:send", args)
+    }
+
+    public func press(threadId: String, buttonId: String) async throws -> String {
+        try await command("phone:press", ["threadId": .string(threadId), "buttonId": .string(buttonId)])
+    }
+
+    public func slashCommands(threadId: String) async throws -> String {
+        try await command("phone:slashCommands", ["threadId": .string(threadId)])
     }
 
     public func respond(threadId: String, approvalId: String, decision: ApprovalOption) async throws -> String {
@@ -462,5 +508,22 @@ struct InboxChanges: Sendable {
         }
         for id in answer.gone { byId[id] = nil }
         rows = byId.values.sorted { $0.lastActivityAt > $1.lastActivityAt }
+    }
+}
+
+/// A row of phone:wakes (backend API 45): an active schedule, the thread it
+/// messages, and when.
+struct ScheduleWake: Decodable, Sendable {
+    var scheduleId: String
+    var threadId: String?
+    @OptionalFlexibleDate var nextRunAt: Date?
+
+    private enum Keys: String, CodingKey { case scheduleId, threadId, nextRunAt }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        scheduleId = try c.decode(String.self, forKey: .scheduleId)
+        threadId = (try? c.decodeIfPresent(String.self, forKey: .threadId)).flatMap { $0 }
+        _nextRunAt = try c.decode(OptionalFlexibleDate.self, forKey: .nextRunAt)
     }
 }

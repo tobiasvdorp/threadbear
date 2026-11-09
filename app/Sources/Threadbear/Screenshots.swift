@@ -289,6 +289,27 @@ enum ScreenshotRunner {
                 app.settingsTab = .models
                 try? await Task.sleep(for: .milliseconds(600))
                 await capture(settings, dir.appendingPathComponent("15h-settings-models.png"))
+                // Settings › Runners: every runner in Mike's order, which
+                // the phone shares, each with its drag handle.
+                app.settingsTab = .runners
+                try? await Task.sleep(for: .milliseconds(600))
+                await capture(settings, dir.appendingPathComponent("15i-settings-runners.png"))
+                // The top runner mid-drag, over the third slot, as nothing
+                // can hold a real drag still to photograph it.
+                app.settingsTab = .general
+                app.runnerDragPreview = CGSize(width: 24, height: 84)
+                try? await Task.sleep(for: .milliseconds(300))
+                app.settingsTab = .runners
+                try? await Task.sleep(for: .milliseconds(700))
+                await capture(settings, dir.appendingPathComponent("15j-settings-runners-dragging.png"))
+                // And past the top of the list, the nearest it gets to the group's edge.
+                app.settingsTab = .general
+                app.runnerDragPreview = CGSize(width: -40, height: -60)
+                try? await Task.sleep(for: .milliseconds(300))
+                app.settingsTab = .runners
+                try? await Task.sleep(for: .milliseconds(700))
+                await capture(settings, dir.appendingPathComponent("15k-settings-runners-drag-top.png"))
+                app.runnerDragPreview = nil
                 settings.close()
             } else {
                 print("settings: the window didn't open")
@@ -308,6 +329,18 @@ enum ScreenshotRunner {
             await capture(window, dir.appendingPathComponent("14b-usage-went-back.png"))
             app.usageShown = false
             try? await Task.sleep(for: .milliseconds(300))
+        }
+        // 14r. The Runners panel in Mike's order, then its top card mid-drag
+        // (Mike, 8 Nov: the panel rearranges the same order as Settings).
+        if wanted("14r") {
+            app.runnersShown = true
+            try? await Task.sleep(for: .milliseconds(800))
+            await capture(window, dir.appendingPathComponent("14r-runners-panel.png"))
+            app.runnerPanelDragPreview = CGSize(width: 18, height: 70)
+            try? await Task.sleep(for: .milliseconds(800))
+            await capture(window, dir.appendingPathComponent("14s-runners-panel-dragging.png"))
+            app.runnerPanelDragPreview = nil
+            app.runnersShown = false
         }
         // 15. The sidebar's Projects view: rows under a project's heading
         // name only the thread's other projects, or its folder.

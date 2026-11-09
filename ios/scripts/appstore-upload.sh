@@ -4,15 +4,31 @@
 # ~/.config/poddle (no Xcode account or local distribution certificate needed).
 #
 #   ios/scripts/appstore-upload.sh            archive, export and validate a signed .ipa; no upload
-#   UPLOAD=1 ios/scripts/appstore-upload.sh   the same, then upload it to App Store Connect
+#   UPLOAD=1 ios/scripts/appstore-upload.sh   archive, export, then upload it to App Store Connect
+#   UPLOAD=1 BUILD_NUMBER=<b> ios/scripts/appstore-upload.sh
+#                                             upload a build this script already archived in
+#                                             OUT, without archiving it again
 #
 # Each run gets a new build number, the UTC time as YYMMDDHHMM (always increasing), unless
 # BUILD_NUMBER is set, like Walkies' and Quick Ask's (this script is theirs, copied). The version
-# (MARKETING_VERSION, 1.0.0) comes from the project. Everything
-# lands in OUT (default /tmp/threadbear-appstore/<build>). VALIDATE=0 skips `altool --validate-app`.
+# (MARKETING_VERSION, 1.0.0) comes from the project. Everything lands in OUT (default
+# ~/Library/Caches/Threadbear/ios-builds/appstore/<build>).
+#
+# OUT and the derived data (DD) must be this account's alone, mode 700 with no ACL letting anyone
+# else in (scripts/private-dir.mjs; move an old one away and a fresh one is made): they were
+# fixed names under /tmp until 8 Nov, where another account on the Mac could make the folder
+# first and plant an archive this script would then sign and upload. An archive already in OUT is
+# only reused when BUILD_NUMBER names it, this script finished it (archived.txt beside it), and
+# nothing in it belongs to or can be written by another account; otherwise it's archived afresh.
+#
+# `altool --validate-app` runs without UPLOAD=1 (VALIDATE=0 skips it) and is skipped with it, as
+# the upload validates the build anyway: on 7 Nov it sat silent for 8+ minutes while the upload on
+# its own took two and came back VALID. VALIDATE=1 runs it before an upload too. It gets
+# VALIDATE_TIMEOUT seconds (default 300); running out is a warning, not a failure.
 # The API key is Poddle's team-wide one (same team), read from ~/.config/poddle and never printed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+umask 077  # what this makes is ours alone
 
 ASC_KEY_ID=${ASC_KEY_ID:-7SS6J9F98P}
 ASC_ISSUER_ID=${ASC_ISSUER_ID:-69a6de6f-a06e-47e3-e053-5b8c7c11a4d1}
@@ -20,15 +36,18 @@ KEY_DIR=${KEY_DIR:-$HOME/.config/poddle}
 ASC_KEY="$KEY_DIR/AuthKey_$ASC_KEY_ID.p8"
 TEAM_ID=4DTAZSZL6B
 BUILD=${BUILD_NUMBER:-$(date -u +%y%m%d%H%M)}
-OUT=${OUT:-/tmp/threadbear-appstore/$BUILD}
-DD=${DD:-/tmp/threadbear-dd-appstore}
-ARCHIVE="$OUT/Threadbear.xcarchive"
+BUILDS=$HOME/Library/Caches/Threadbear/ios-builds
+OUT=${OUT:-$BUILDS/appstore/$BUILD}
+DD=${DD:-$BUILDS/dd-appstore}
 
 [[ -f "$ASC_KEY" ]] || { echo "No App Store Connect API key at $ASC_KEY" >&2; exit 1; }
 auth=(-allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY"
   -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
-mkdir -p "$OUT"
-echo "Build number: $BUILD"
+# Makes OUT and DD (mode 700) if they're missing, stops if another account could get into either
+# or change a folder above, and from here on uses the real paths that were checked.
+OUT=$(node scripts/private-dir.mjs "$OUT") || exit 1
+DD=$(node scripts/private-dir.mjs "$DD") || exit 1
+ARCHIVE="$OUT/Threadbear.xcarchive"
 
 # The export options: App Store Connect distribution, Xcode-managed (cloud) signing.
 export_options() {
@@ -49,12 +68,26 @@ PLIST
   echo "$OUT/ExportOptions-$1.plist"
 }
 
-echo "Archiving Release for iOS…"
-xcodebuild archive -project Threadbear.xcodeproj -scheme Threadbear -configuration Release \
-  -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" -derivedDataPath "$DD" \
-  CURRENT_PROJECT_VERSION="$BUILD" THREADBEAR_APS_ENVIRONMENT=production "${auth[@]}" > "$OUT/archive.log" 2>&1 \
-  || { grep -E " error:|ARCHIVE FAILED" "$OUT/archive.log" >&2; echo "Archive failed, see $OUT/archive.log" >&2; exit 1; }
+if [[ -n "${BUILD_NUMBER:-}" && -e "$ARCHIVE" ]]; then
+  # Asked for by build number: one an earlier run archived (say its validate step hung). Upload
+  # that, not a rebuild, but only if this script finished it and it's still ours alone.
+  [[ -f "$OUT/archived.txt" && -f "$ARCHIVE/Info.plist" ]] \
+    || { echo "$ARCHIVE wasn't finished by this script; move it away to archive build $BUILD again." >&2; exit 1; }
+  node scripts/private-dir.mjs --tree "$ARCHIVE" > /dev/null || exit 1
+  echo "Using the archive already at $ARCHIVE ($(cat "$OUT/archived.txt"); HEAD is $(git rev-parse --short HEAD 2>/dev/null || echo unknown))"
+else
+  rm -rf "$ARCHIVE" "$OUT/archived.txt"
+  echo "Archiving Release for iOS, build number $BUILD…"
+  xcodebuild archive -project Threadbear.xcodeproj -scheme Threadbear -configuration Release \
+    -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" -derivedDataPath "$DD" \
+    CURRENT_PROJECT_VERSION="$BUILD" THREADBEAR_APS_ENVIRONMENT=production "${auth[@]}" > "$OUT/archive.log" 2>&1 \
+    || { grep -E " error:|ARCHIVE FAILED" "$OUT/archive.log" >&2; echo "Archive failed, see $OUT/archive.log" >&2; exit 1; }
+  # What says this run finished it, for a later BUILD_NUMBER run to reuse.
+  echo "archived from commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown)" > "$OUT/archived.txt"
+fi
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :ApplicationProperties:CFBundleShortVersionString" "$ARCHIVE/Info.plist")
+# A reused archive carries its own build number, whatever BUILD_NUMBER said.
+BUILD=$(/usr/libexec/PlistBuddy -c "Print :ApplicationProperties:CFBundleVersion" "$ARCHIVE/Info.plist")
 echo "Archived Threadbear $VERSION ($BUILD)"
 # The App Store build knows no deployment of Mike's (it only has what it's paired with), has none
 # of the Debug-only launch arguments in it (the sample threads and -ThreadbearFake stay: they're
@@ -72,6 +105,7 @@ APS=$(/usr/libexec/PlistBuddy -c "Print :ThreadbearAPSEnvironment" "$APPDIR/Info
 [[ -f "$APPDIR/PrivacyInfo.xcprivacy" ]] || { echo "No privacy manifest in the app" >&2; exit 1; }
 
 echo "Exporting for App Store Connect…"
+rm -rf "$OUT/export"
 xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$OUT/export" \
   -exportOptionsPlist "$(export_options export)" "${auth[@]}" > "$OUT/export.log" 2>&1 \
   || { grep -E "error|EXPORT FAILED" "$OUT/export.log" >&2; echo "Export failed, see $OUT/export.log" >&2; exit 1; }
@@ -84,11 +118,29 @@ codesign -dvv "$CHECK/Payload/Threadbear.app" 2>&1 | grep -E "^Authority=" | hea
 security cms -D -i "$CHECK/Payload/Threadbear.app/embedded.mobileprovision" 2>/dev/null \
   | plutil -extract Name raw -o - - 2>/dev/null | sed 's/^/Profile: /' || true
 
-if [[ "${VALIDATE:-1}" == 1 ]]; then
-  echo "Validating with App Store Connect…"
-  # altool finds AuthKey_<id>.p8 in API_PRIVATE_KEYS_DIR.
+if [[ "${UPLOAD:-0}" == 1 ]]; then VALIDATE=${VALIDATE:-0}; else VALIDATE=${VALIDATE:-1}; fi
+if [[ "$VALIDATE" == 1 ]]; then
+  limit=${VALIDATE_TIMEOUT:-300}
+  echo "Validating with App Store Connect (up to ${limit}s)…"
+  # altool can go quiet for many minutes, and macOS has no `timeout`: run it in the background
+  # into its log and kill it (and anything it started) when the time's up. altool finds
+  # AuthKey_<id>.p8 in API_PRIVATE_KEYS_DIR.
   API_PRIVATE_KEYS_DIR="$KEY_DIR" xcrun altool --validate-app -f "$IPA" -t ios \
-    --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" 2>&1 | tee "$OUT/validate.log" | grep -vE "^\s*$" | tail -5
+    --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" > "$OUT/validate.log" 2>&1 &
+  pid=$!
+  waited=0
+  while kill -0 $pid 2>/dev/null && (( waited < limit )); do sleep 1; (( waited += 1 )); done
+  if kill -0 $pid 2>/dev/null; then
+    pkill -TERM -P $pid 2>/dev/null || true
+    kill -TERM $pid 2>/dev/null || true
+    wait $pid 2>/dev/null || true
+    echo "WARNING: validation gave no answer in ${limit}s and was stopped (see $OUT/validate.log)."
+    [[ "${UPLOAD:-0}" == 1 ]] && echo "Carrying on to the upload, which validates the build itself."
+  else
+    rc=0; wait $pid || rc=$?
+    grep -vE "^\s*$" "$OUT/validate.log" | tail -5
+    (( rc == 0 )) || { echo "Validation failed, see $OUT/validate.log" >&2; exit 1; }
+  fi
 fi
 
 if [[ "${UPLOAD:-0}" != 1 ]]; then

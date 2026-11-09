@@ -26,6 +26,21 @@ public struct NavigationHistory<Place: Equatable>: Sendable where Place: Sendabl
         index = entries.count - 1
     }
 
+    /// Puts `place` where the current entry is, for a place that's turned
+    /// into another: the new-thread screen once its thread has started.
+    /// Back from it then goes to wherever was before, not to what it was.
+    /// Like going somewhere new, it drops whatever was ahead.
+    public mutating func replaceCurrent(with place: Place) {
+        guard current != nil else { return record(place) }
+        entries.removeSubrange((index + 1)...)
+        entries[index] = place
+        // Never the same place twice in a row, as `record` keeps it.
+        if index > 0, entries[index - 1] == place {
+            entries.removeLast()
+            index -= 1
+        }
+    }
+
     /// The nearest earlier place that `isValid` still allows (a thread
     /// that's been deleted, say, is skipped), or nil with nowhere to go.
     public mutating func back(where isValid: (Place) -> Bool = { _ in true }) -> Place? {
@@ -34,6 +49,13 @@ public struct NavigationHistory<Place: Equatable>: Sendable where Place: Sendabl
 
     public mutating func forward(where isValid: (Place) -> Bool = { _ in true }) -> Place? {
         step(by: 1, where: isValid)
+    }
+
+    /// Where `back` or `forward` would go, without going: what a swipe's
+    /// card names before the fingers lift.
+    public func peek(back: Bool, where isValid: (Place) -> Bool = { _ in true }) -> Place? {
+        var copy = self
+        return back ? copy.back(where: isValid) : copy.forward(where: isValid)
     }
 
     private mutating func step(by delta: Int, where isValid: (Place) -> Bool) -> Place? {

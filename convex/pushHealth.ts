@@ -9,6 +9,16 @@
 
 export type PushVia = 'apple' | 'relay';
 
+// Whether this backend can't send pushes at all: the relay is off
+// (PUSH_RELAY=off, which setup sets on a self-hosted backend, as the relay
+// only calls back to Convex's own hosts: relay/convex/verify.ts) and it has
+// no Apple key of its own. The phone's Settings and the Mac's Phone & browser
+// say so, rather than notifications just never coming (docs/self-hosting.md).
+export function pushOff(env: Record<string, string | undefined>): boolean {
+  const ownKey = Boolean(env.APNS_KEY_P8 && env.APNS_KEY_ID && env.APNS_TEAM_ID && env.APNS_TOPIC);
+  return env.PUSH_RELAY === 'off' && !ownKey;
+}
+
 export type PushHealth = {
   lastOkAt?: number;
   // The first failure since the last push that got through, the latest,

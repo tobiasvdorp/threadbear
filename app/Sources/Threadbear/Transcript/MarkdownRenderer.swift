@@ -40,6 +40,16 @@ enum MarkdownRenderer {
         return components.url
     }
 
+    /// The button a `button:<id>` destination names.
+    static func replyButtonId(_ destination: String) -> String? {
+        URL(string: destination.trimmingCharacters(in: .whitespaces)).flatMap(ReplyButtons.id(of:))
+    }
+
+    /// A reply button pill's padding past its glyphs on each side, and the
+    /// gap kept between it and the words around it.
+    static var replyPad: CGFloat { zoomed(8) }
+    static var replyGap: CGFloat { zoomed(3) }
+
     nonisolated(unsafe) static let urlDetector = try! NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
 
     struct Rendered {
@@ -68,6 +78,25 @@ enum MarkdownRenderer {
         cache.totalCostLimit = 2_000_000 // UTF-16 code units
         return cache
     }()
+
+    /// Whether a picture in the words (`![](/path/shot.png)`) may be read
+    /// from this Mac and drawn: not for another Mac's thread, whose paths
+    /// are that Mac's, as a runner could otherwise put any picture on this
+    /// Mac into its reply (Codex review, 7 Nov). Set for one render on the
+    /// thread doing it (RenderCache.render), so the cache keys on it too.
+    static var localPictures: Bool {
+        (Thread.current.threadDictionary[localPicturesKey] as? Bool) ?? true
+    }
+
+    private static let localPicturesKey = "com.mikerosoft.threadbear.localPictures"
+
+    static func withLocalPictures<T>(_ allowed: Bool, _ body: () -> T) -> T {
+        let dictionary = Thread.current.threadDictionary
+        let saved = dictionary[localPicturesKey]
+        dictionary[localPicturesKey] = allowed
+        defer { dictionary[localPicturesKey] = saved }
+        return body()
+    }
 
     static func render(_ text: String) -> Rendered {
         let blocks = MarkdownBlocks.split(text)
@@ -98,17 +127,64 @@ enum MarkdownRenderer {
         return NSAttributedString(string: "\u{200B}\n", attributes: [.font: NSFont.systemFont(ofSize: 1), .paragraphStyle: style])
     }()
 
+    /// How deep quotes and lists may nest before a block is drawn as words.
+    static let maxNesting = 32
+    /// Emphasis, links and pictures nest too (`*a *b … b* a*`, `![![x](u)](u)`),
+    /// a level for each of these marks at most. A block with more than a
+    /// few is parsed on a thread with room for every level; past the most
+    /// it's words.
+    static let inlineMarksOnWorkerStack = 48
+    static let maxInlineMarks = 4_000
+    /// Short rows are padded to a table's header, so 9 KB can ask for 1.6
+    /// million cells (cross-lab review, 7 Nov 2026). Past this it's words.
+    static let maxTableCells = 20_000
+
     static func renderBlock(_ block: String) -> NSAttributedString {
+        // Counted in what the parser gets: escaping work: links decodes
+        // `%2A` into `*` (cross-lab review, 7 Nov 2026).
+        let marks = MarkdownNesting.inlineMarks(WorkLinks.escapeDestinations(block))
+        guard marks > inlineMarksOnWorkerStack, marks <= maxInlineMarks else { return renderBlockHere(block) }
+        // 256 MB holds 4,000 levels with room to spare (each takes a few KB
+        // between swift-markdown and the Builder); a worker's is 512 KB.
+        let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var result: NSAttributedString?
+        let thread = Thread {
+            result = renderBlockHere(block)
+            done.signal()
+        }
+        thread.stackSize = 256 << 20
+        thread.start()
+        done.wait()
+        return result ?? NSAttributedString(string: block)
+    }
+
+    private static func renderBlockHere(_ block: String) -> NSAttributedString {
         // The zoom is in the key: a block's layout is all sizes. A block
         // that may hold a ```mermaid or ```html box also keys on whether
         // those have been drawn, or flipped to their source (RichBlocks).
         let rich = RichBlocks.mayHoldRich(block)
-        let key = "\(TypeScale.percent)|\(rich ? RichBlocks.shared.generation : -1)|\(block)" as NSString
+        // One that links a reply button keys on the buttons' states.
+        let buttons = ReplyButtons.mayHold(block) ? ReplyButtons.shared.generation : -1
+        let key = "\(TypeScale.percent)|\(rich ? RichBlocks.shared.generation : -1)|\(buttons)|\(localPictures ? 1 : 0)|\(block)" as NSString
         if let cached = cache.object(forKey: key) { return cached }
         // `[tests pass](work:npm test)`: a space ends a link's destination
         // for the parser, so work: and thread: links are escaped first.
-        let document = Document(parsing: WorkLinks.escapeDestinations(block), options: [.disableSmartOpts])
         var builder = Builder()
+        // Quotes or lists nested past this are plain words: parsing and
+        // drawing them recurse once a level, on worker threads with small
+        // stacks, and 8,000 `>`s from a reply ran one out (Daybreak, 7 Nov
+        // 2026). Nothing anyone writes nests this deep.
+        let source = WorkLinks.escapeDestinations(block)
+        if MarkdownNesting.bound(source) > maxNesting || MarkdownNesting.inlineMarks(source) > maxInlineMarks || MarkdownNesting.tableCells(source) > maxTableCells {
+            let start = builder.output.length
+            builder.append(block, Context())
+            builder.finishParagraph(from: start, style: builder.paragraphStyle(Context()))
+            builder.trimTrailingNewline()
+            let result = NSAttributedString(attributedString: builder.output)
+            cache.setObject(result, forKey: key, cost: block.utf16.count)
+            return result
+        }
+        let document = Document(parsing: source, options: [.disableSmartOpts])
         // Split where cmark ends lines: "\n", "\r" and "\r\n" (one
         // Character), not U+2028 and the other separators Swift counts.
         if rich || DraftBlock.mayHold(block) {
@@ -424,12 +500,14 @@ enum MarkdownRenderer {
             return draft
         }
 
-        /// Whether the fence has its closing line: the same character as
-        /// it opened with, at least as many, after whatever the fence sits
-        /// in (a quote's ">", a list item's indent) and at most three
-        /// spaces. cmark ends an unclosed fence's range on its last line of
-        /// code, so a line of code that only looks like a fence ("> ```"
-        /// in a fence that isn't in a quote) doesn't count.
+        /// Whether the fence has its closing line. cmark ends an unclosed
+        /// fence's range on its last line of code, so the range's last line
+        /// is checked: the same character the fence opened with, at least
+        /// as many, behind as many quote markers as the opening line. Its
+        /// indent isn't checked: list indents are cmark's to work out
+        /// (three tries at it each broke a nested case, 6 Nov), and the
+        /// worst a line of code indented like a fence can do is show a
+        /// box a moment early while it streams in.
         private func isClosed(_ code: CodeBlock) -> Bool {
             guard !sourceLines.isEmpty, let range = code.range, range.lowerBound.line >= 1,
                   range.upperBound.line > range.lowerBound.line, range.upperBound.line <= sourceLines.count else { return false }
@@ -441,15 +519,13 @@ enum MarkdownRenderer {
             guard let mark = opening.first, mark == "`" || mark == "~" else { return false }
             let width = opening.prefix(while: { $0 == mark }).count
             guard width >= 3 else { return false }
-            // The closing line has the same container in front: the quote's
-            // markers, or as many spaces as the list item's indent.
-            let closingLine = sourceLines[range.upperBound.line - 1].utf8
-            let prefix = closingLine.prefix(container)
-            guard prefix.count == container, prefix.allSatisfy({ $0 == UInt8(ascii: " ") || $0 == UInt8(ascii: ">") || $0 == UInt8(ascii: "\t") }) else { return false }
-            var closing = Substring(closingLine.dropFirst(container))
-            let indent = closing.prefix(while: { $0 == " " }).count
-            guard indent <= 3 else { return false }
-            closing = closing.dropFirst(indent)
+            let quotes = openingLine.prefix(container).filter { $0 == UInt8(ascii: ">") }.count
+            var closing = Substring(sourceLines[range.upperBound.line - 1])
+            for _ in 0..<quotes {
+                closing = closing.drop(while: { $0 == " " || $0 == "\t" })
+                guard closing.first == ">" else { return false }
+                closing = closing.dropFirst()
+            }
             let fence = closing.trimmingCharacters(in: .whitespaces)
             return fence.count >= width && fence.allSatisfy({ $0 == mark })
         }
@@ -666,6 +742,39 @@ enum MarkdownRenderer {
             }
         }
 
+        /// `[title](button:<id>)`: the button the agent made with add_button,
+        /// as a pill in the colours of its state (Theme.replyButton). Its
+        /// words alone, not clickable, for a button this app doesn't know
+        /// (another runner's, or one the list hasn't brought yet). The
+        /// render depends on the button's state, so a block that may hold
+        /// one keys its cache on `ReplyButtons.generation`.
+        mutating func replyButton(_ id: String, words: String, _ context: Context) {
+            var plain = context
+            plain.link = nil
+            guard let known = ReplyButtons.shared.known(id) else {
+                append(words, plain)
+                return
+            }
+            let button = known.button
+            let look = ReplyButtons.look(button, pressing: ReplyButtons.shared.isPressing(id))
+            let room = MarkdownRenderer.replyPad + MarkdownRenderer.replyGap
+            let start = output.length
+            // Room for the pill's padding and a gap, kerned into the
+            // character before it as for inline code.
+            if start > 0, ![9, 10, 0x2028].contains(output.mutableString.character(at: start - 1)) {
+                output.addAttribute(.kern, value: room, range: NSRange(location: start - 1, length: 1))
+            }
+            // No-break spaces, so a pill doesn't wrap apart.
+            let label = ReplyButtons.label(button, look: look).replacingOccurrences(of: " ", with: "\u{00A0}")
+            output.append(NSAttributedString(string: label, attributes: [
+                .font: NSFont.systemFont(ofSize: TypeScale.label, weight: .medium),
+                .foregroundColor: Theme.replyButton(look).text,
+                .tbReplyButton: id, .tbReplyLook: look.rawValue,
+                .toolTip: ReplyButtons.tip(button, look: look),
+            ]))
+            output.addAttribute(.kern, value: room, range: NSRange(location: output.length - 1, length: 1))
+        }
+
         mutating func inlines(_ children: MarkupChildren, _ context: Context) {
             for child in children { inline(child, context) }
         }
@@ -692,6 +801,8 @@ enum MarkdownRenderer {
                 var inner = context
                 inner.code = true
                 if inner.link == nil, FilePathRefs.looksLikePath(code.code) { inner.link = FilePathRefs.url(for: code.code) }
+                // A web address in code (`github.com/owner/repo`) is a link too, kept looking like code.
+                else if inner.link == nil, let web = CodeWebAddress.url(code.code) { inner.link = web }
                 // BackgroundLayoutManager draws the pill `pillPad` past the
                 // glyphs on each side, which ate most of the word space
                 // around it. Kerning the characters either side reserves
@@ -705,6 +816,8 @@ enum MarkdownRenderer {
                 if output.length > start {
                     output.addAttribute(.kern, value: MarkdownRenderer.pillKern, range: NSRange(location: output.length - 1, length: 1))
                 }
+            case let link as Markdown.Link where link.destination.flatMap(MarkdownRenderer.replyButtonId) != nil:
+                replyButton(MarkdownRenderer.replyButtonId(link.destination!)!, words: link.plainText, context)
             case let link as Markdown.Link:
                 var inner = context
                 inner.link = link.destination.flatMap(MarkdownRenderer.linkURL)
@@ -718,7 +831,7 @@ enum MarkdownRenderer {
                 let alt = image.plainText.isEmpty ? (image.source ?? "image") : image.plainText
                 // A picture on this Mac is drawn in the text; a web address,
                 // or a file that's gone, stays a link with its alt text.
-                if let url = inner.link, url.isFileURL, let attachment = MarkdownRenderer.picture(path: url.path, alt: alt) {
+                if let url = inner.link, url.isFileURL, MarkdownRenderer.localPictures, let attachment = MarkdownRenderer.picture(path: url.path, alt: alt) {
                     let run = NSMutableAttributedString(attachment: attachment)
                     run.addAttributes([.link: url, .toolTip: alt], range: NSRange(location: 0, length: run.length))
                     output.append(run)

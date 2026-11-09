@@ -24,7 +24,8 @@ docs/setup-and-updates.md section 2.3 explains the thinking behind it.
   Merge that commit id (it's in the message that started this thread
   too), never `upstream/main` (Mike's main can be halfway through
   something) and never anything under `refs/threadbear/upstream-incoming/`,
-  which is what upstream serves before it's checked. If `tb updates` no
+  which is where an older runner put what upstream served before it was
+  checked. If `tb updates` no
   longer lists the release, or names a different commit for it, stop and
   say so rather than merging anything.
 - Mike's changes: `git log --no-merges main..<commit>`. His commit

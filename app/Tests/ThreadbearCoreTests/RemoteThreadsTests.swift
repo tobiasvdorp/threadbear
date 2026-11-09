@@ -10,6 +10,14 @@ final class RemoteThreadsTests: XCTestCase {
         try JSONDecoder().decode(RemoteThreads.self, from: Data(E.json(object).utf8))
     }
 
+    /// Mike's runner order (backend API 58), the same one the phone sets,
+    /// for Settings > Runners. An older runner has none: nil, not empty.
+    func testCarriesTheRunnerOrder() throws {
+        XCTAssertEqual(try decode(["runners": [], "threads": [], "order": ["r_m5", "r_bruce"]]).order, ["r_m5", "r_bruce"])
+        XCTAssertNil(try decode(["runners": [], "threads": []]).order)
+        XCTAssertNil(try decode(["runners": [], "threads": [], "order": "nonsense"]).order)
+    }
+
     func testDecodesTolerantly() throws {
         let list = try decode([
             "runners": [

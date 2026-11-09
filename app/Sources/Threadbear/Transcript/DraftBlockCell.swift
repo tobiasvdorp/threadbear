@@ -28,6 +28,8 @@ final class DraftBlockCell: NSTextAttachmentCell {
     // Only touched on the main thread (clicks and drawing).
     nonisolated(unsafe) private static var copied: [String: Date] = [:]
     static let copiedFor: TimeInterval = 1.5
+    /// Where a click's Copy goes; tests give it a pasteboard of their own.
+    nonisolated(unsafe) static var pasteboard: NSPasteboard = .general
 
     func wasJustCopied(now: Date = Date()) -> Bool {
         guard let at = Self.copied[draft.source] else { return false }
@@ -36,7 +38,10 @@ final class DraftBlockCell: NSTextAttachmentCell {
 
     /// Puts the draft on the clipboard as plain text and as HTML, so a
     /// paste into Slack or Mail keeps its links and bold.
-    func copy(to pasteboard: NSPasteboard = .general) {
+    /// Not `copy(to:)`: called with no pasteboard, that name is NSCell's
+    /// own copy(), which makes a shallow copy of the cell whose release
+    /// crashed the app on the first click of Copy (7 Nov).
+    func copyDraft(to pasteboard: NSPasteboard = DraftBlockCell.pasteboard) {
         pasteboard.clearContents()
         pasteboard.declareTypes([.html, .string], owner: nil)
         pasteboard.setString(draft.html, forType: .html)
@@ -56,7 +61,7 @@ final class DraftBlockCell: NSTextAttachmentCell {
     override func wantsToTrackMouse() -> Bool { false }
 
     private func buttonTitle(copied: Bool) -> NSAttributedString {
-        NSAttributedString(string: copied ? "Copied" : "Copy", attributes: [.font: Self.buttonFont, .foregroundColor: NSColor.secondaryLabelColor])
+        NSAttributedString(string: copied ? "Copied" : "Copy", attributes: [.font: Self.buttonFont, .foregroundColor: copied ? NSColor.systemGreen : NSColor.secondaryLabelColor])
     }
 
     /// The Copy button, at the right of `frame` (as wide as "Copied", so
@@ -82,9 +87,10 @@ final class DraftBlockCell: NSTextAttachmentCell {
         let rect = button(in: cellFrame)
         let copied = wasJustCopied()
         let title = buttonTitle(copied: copied)
+        // Green with a tick for a moment after a click (Mike, 7 Nov).
         let symbol = copied ? "checkmark" : "doc.on.doc"
-        let config = NSImage.SymbolConfiguration(pointSize: TypeScale.detail - 1, weight: .regular)
-            .applying(.init(paletteColors: [.secondaryLabelColor]))
+        let config = NSImage.SymbolConfiguration(pointSize: TypeScale.detail - 1, weight: copied ? .bold : .regular)
+            .applying(.init(paletteColors: [copied ? .systemGreen : .secondaryLabelColor]))
         var x = rect.minX + zoomed(6)
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(config) {
             let s = image.size

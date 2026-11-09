@@ -123,7 +123,7 @@ final class ReviewWindowTests: XCTestCase {
         XCTAssertNotNil(anchor("Try A running live: http://localhost:5190/a", in: host))
         click("C. Option C", in: host, window)
         XCTAssertNil(anchor("Try A running live: http://localhost:5190/a", in: host))
-        XCTAssertEqual(session.focusedShot?.image.path, "/tmp/C.png", "one image is one shot")
+        XCTAssertEqual(session.focusedShot?.image.path, Self.images + "C.png", "one image is one shot")
     }
 
     func testTodayCanBeFlickedToByItsButtonOrHoldingSpace() {
@@ -133,7 +133,7 @@ final class ReviewWindowTests: XCTestCase {
         pump()
         click("Flick to Today: click, or hold Space", in: host, window)
         XCTAssertEqual(session.shownOption?.id, "Today")
-        XCTAssertEqual(session.shownShot?.image.path, "/tmp/today2.png", "today's shot of the same name")
+        XCTAssertEqual(session.shownShot?.image.path, Self.images + "today2.png", "today's shot of the same name")
         XCTAssertEqual(at(session), ["A", "1"], "flicking isn't moving")
         click("Back to A (or let go of Space)", in: host, window)
         XCTAssertEqual(session.shownOption?.id, "A")
@@ -149,7 +149,7 @@ final class ReviewWindowTests: XCTestCase {
         session.enlarge(1, shot: 1)
         XCTAssertEqual(session.peeking, false)
         session.peeking = true
-        XCTAssertEqual(session.shownShot?.image.path, "/tmp/today.png", "no shot of that name: today's first")
+        XCTAssertEqual(session.shownShot?.image.path, Self.images + "today.png", "no shot of that name: today's first")
         session.browse(1)
         XCTAssertFalse(session.peeking, "moving turns it off")
         session.enlarge(3)
@@ -169,7 +169,7 @@ final class ReviewWindowTests: XCTestCase {
         XCTAssertEqual(session.mode, .all)
     }
 
-    func testASentReviewHasNothingToPress() async {
+    func testASentReviewHasNothingToPress() {
         var answered = review()
         answered.status = "answered"
         answered.response = ReviewDraft(pickedIds: ["A", "C"], notes: ["C": "Fainter"], reply: "Both")
@@ -280,6 +280,22 @@ final class ReviewWindowTests: XCTestCase {
         XCTAssertGreaterThan(image.magnification, fit, "natural scrolling's swipe up")
     }
 
+    func testAHeldKeyMakesASwipeZoomInTheDirectionItGoes() {
+        let (_, host, window) = make(tall())
+        defer { window.close() }
+        let image = stage(in: host)
+        let fit = image.magnification
+        image.scrollWheel(with: swipe(.began, 40, held: .maskCommand))
+        image.scrollWheel(with: swipe(.changed, 40, held: .maskCommand))
+        pump()
+        let zoomedIn = image.magnification
+        XCTAssertGreaterThan(zoomedIn, fit)
+        image.scrollWheel(with: swipe(.ended, 0, held: .maskCommand))
+        image.scrollWheel(with: swipe(.began, -20, held: .maskCommand))
+        image.scrollWheel(with: swipe(.changed, -20, held: .maskCommand))
+        XCTAssertLessThan(image.magnification, zoomedIn, "held, it zooms even once zoomed, and down is out")
+    }
+
     func testTheMinimapShowsThePartOnShowAndGoesWhereItsPressed() {
         let (session, host, window) = make(tall())
         defer { window.close() }
@@ -341,10 +357,28 @@ final class ReviewWindowTests: XCTestCase {
         XCTAssertEqual(session.mode, .all)
     }
 
+    /// Where the shots are said to be: nowhere, so each test's geometry is
+    /// the sizes given here. Under /tmp, a picture another program left as
+    /// A.png would be decoded and change the page's shape mid-test.
+    private static let images = "/nonexistent/ReviewWindowTests-\(UUID().uuidString)/"
+
+    func testEscStraightAfterAZoomComesOutOfTheZoom() {
+        let (session, host, window) = make(tall(), native: true)
+        defer { window.close() }
+        let image = stage(in: host)
+        image.scrollWheel(with: wheel(lines: 5))
+        // No pump: the session hasn't heard about the zoom yet, as when
+        // the app is busy and the keys are queued behind the wheel.
+        window.keyDown(with: key("\u{1B}", modifiers: [], code: 53))
+        pump()
+        XCTAssertEqual(session.mode, .single, "Esc comes out of the zoom first")
+        XCTAssertTrue(image.isFittedForTests)
+    }
+
     /// A page as long as the phone shots that prompted zooming, with today's
     /// version of the same size to flick to, and a shot after it to move to.
     private func tall(width: Int = 780) -> DesignReview {
-        func image(_ name: String) -> ImageRef { ImageRef(path: "/tmp/\(name).png", mediaType: "image/png", width: width, height: 20852) }
+        func image(_ name: String) -> ImageRef { ImageRef(path: Self.images + "\(name).png", mediaType: "image/png", width: width, height: 20852) }
         var page = ReviewOption(id: "A", title: "Option A", image: image("A"))
         page.shots = [ReviewShot(title: "Phone", image: image("A")), ReviewShot(title: "Top", image: image("A2"))]
         return DesignReview(id: "review", title: "Page", options: [
@@ -356,7 +390,7 @@ final class ReviewWindowTests: XCTestCase {
     /// Too big for the stage both ways, so zooming has room in every direction.
     private func wide() -> DesignReview {
         DesignReview(id: "review", title: "Page", options: [
-            ReviewOption(id: "A", title: "Option A", image: ImageRef(path: "/tmp/A.png", mediaType: "image/png", width: 6000, height: 6000)),
+            ReviewOption(id: "A", title: "Option A", image: ImageRef(path: Self.images + "A.png", mediaType: "image/png", width: 6000, height: 6000)),
         ])
     }
 
@@ -366,12 +400,19 @@ final class ReviewWindowTests: XCTestCase {
 
     /// A notched mouse wheel, as lines with no finer deltas.
     private func wheel(lines: Int32) -> NSEvent {
-        NSEvent(cgEvent: CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0)!)!
+        let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0)!
+        event.flags = []
+        return NSEvent(cgEvent: event)!
     }
 
     /// Part of a two-finger swipe on a trackpad.
-    private func swipe(_ phase: RowSwipeEvents.Phase, _ points: Double) -> NSEvent {
+    private func swipe(_ phase: RowSwipeEvents.Phase, _ points: Double, held: CGEventFlags = []) -> NSEvent {
         let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: 0, wheel2: 0, wheel3: 0)!
+        // Set, not left alone: a CGEvent starts with whatever modifier keys
+        // are really down on the machine at that moment. A Command held on
+        // the Mac running the tests turned these into the stage's "held"
+        // zoom, so a swipe down zoomed out instead of moving around (7 Nov).
+        event.flags = held
         event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         event.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase.rawValue)
         event.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: points)
@@ -391,7 +432,7 @@ final class ReviewWindowTests: XCTestCase {
     }
 
     private func review() -> DesignReview {
-        func image(_ name: String) -> ImageRef { ImageRef(path: "/tmp/\(name).png", mediaType: "image/png") }
+        func image(_ name: String) -> ImageRef { ImageRef(path: Self.images + "\(name).png", mediaType: "image/png") }
         var options = ["A", "B", "C"].map {
             ReviewOption(id: $0, title: "Option \($0)", note: "Why \($0)", image: image($0))
         }
@@ -424,7 +465,7 @@ final class ReviewWindowTests: XCTestCase {
             reviewWindow.reviewSession = session
             window = reviewWindow
         } else {
-            window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)
+            window = ReviewTestWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)
         }
         window.isReleasedWhenClosed = false
         window.contentView = host
@@ -440,11 +481,45 @@ final class ReviewWindowTests: XCTestCase {
         window.orderFrontRegardless()
         window.makeKey()
         host.layoutSubtreeIfNeeded()
+        shown = window
         pump()
         return (session, host, window)
     }
 
-    private func pump() { RunLoop.main.run(until: Date().addingTimeInterval(0.2)) }
+    /// Lets everything a change sets off land: SwiftUI's update, the layout
+    /// after it, and the stage's zoom report, which it queues for later. It
+    /// goes by what's still to do, not a set time: a fixed 0.2 seconds could
+    /// all go on the layout on a loaded machine, leaving `session.zoomed`
+    /// stale, so Esc left the shot rather than the zoom (6 Nov).
+    private func pump() {
+        let deadline = Date().addingTimeInterval(20)
+        var quiet = 0
+        while quiet < Self.quietTurns, Date() < deadline {
+            // Queued behind whatever's waiting, so that's all been run when it is.
+            var drained = false
+            DispatchQueue.main.async { drained = true }
+            while !drained, Date() < deadline {
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            }
+            // A moment idle too, as SwiftUI and AppKit flush just before the
+            // run loop waits.
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            quiet = (shown?.contentView).map(needsLayout) == true ? 0 : quiet + 1
+        }
+        // The main queue can't drain under a test that is itself running on
+        // it (an `async` one), so such a test fails here rather than every
+        // pump quietly taking the whole 20 seconds.
+        if quiet < Self.quietTurns { XCTFail("the window never settled: is this test async?") }
+    }
+
+    // Each layout can set off one more update, then one more report.
+    private static let quietTurns = 3
+    /// The window `make` put up, which `pump` waits on.
+    private var shown: NSWindow?
+
+    private func needsLayout(_ view: NSView) -> Bool {
+        view.needsLayout || view.subviews.contains { needsLayout($0) }
+    }
 
     private func noteBoxes(in host: NSView) -> Int {
         func boxes(_ view: NSView) -> Int {
@@ -473,4 +548,10 @@ final class ReviewWindowTests: XCTestCase {
         }
         pump()
     }
+}
+
+/// These image fixtures and their pixel-to-point assertions use a 2× display.
+/// An off-screen window can report 1× when the Mac is locked or headless.
+private final class ReviewTestWindow: NSWindow {
+    override var backingScaleFactor: CGFloat { 2 }
 }

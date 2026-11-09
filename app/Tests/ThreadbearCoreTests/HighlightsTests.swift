@@ -161,35 +161,6 @@ final class HighlightsTests: XCTestCase {
         XCTAssertEqual(HighlightText.commitLine(Highlight(id: "c", kind: .commit, title: "x", branch: "", pushed: true)), "pushed")
     }
 
-    func testAutoShowOnlyForANewShowPinAfterTheFirstFetch() {
-        var auto = HighlightAutoShow()
-        let old = Highlight(id: "file:/a.html", kind: .file, title: "a.html", path: "/a.html", how: .pinned, show: true, seq: 10)
-        let plain = Highlight(id: "file:/b.md", kind: .file, title: "b.md", path: "/b.md", how: .written, seq: 12)
-        // The first fetch only learns what's there.
-        XCTAssertNil(auto.receive(ThreadHighlights(highlights: [old, plain]), threadId: "t1"))
-        XCTAssertNil(auto.receive(ThreadHighlights(highlights: [old, plain]), threadId: "t1"))
-        // A new pin asked to be shown: once.
-        let fresh = Highlight(id: "file:/c.html", kind: .file, title: "c.html", path: "/c.html", how: .pinned, show: true, seq: 30)
-        XCTAssertEqual(auto.receive(ThreadHighlights(highlights: [fresh, old, plain]), threadId: "t1")?.id, fresh.id)
-        XCTAssertNil(auto.receive(ThreadHighlights(highlights: [fresh, old, plain]), threadId: "t1"))
-        // Something found earlier, now pinned with show: its seq is old, but
-        // it wasn't shown before.
-        var pinned = plain
-        pinned.how = .pinned
-        pinned.show = true
-        pinned.lastSeq = 40
-        XCTAssertEqual(auto.receive(ThreadHighlights(highlights: [pinned, fresh, old]), threadId: "t1")?.id, plain.id)
-        // Two at once: the newest.
-        let a = Highlight(id: "a", kind: .file, title: "a", how: .pinned, show: true, seq: 50)
-        let b = Highlight(id: "b", kind: .file, title: "b", how: .pinned, show: true, seq: 51)
-        XCTAssertEqual(auto.receive(ThreadHighlights(highlights: [a, b, pinned, fresh, old]), threadId: "t1")?.id, "b")
-        // Another thread starts afresh.
-        XCTAssertNil(auto.receive(ThreadHighlights(highlights: [fresh]), threadId: "t2"))
-        // Unpinned and pinned again: shown again.
-        XCTAssertNil(auto.receive(ThreadHighlights(highlights: []), threadId: "t2"))
-        XCTAssertEqual(auto.receive(ThreadHighlights(highlights: [fresh]), threadId: "t2")?.id, fresh.id)
-    }
-
     func testSummaryCarriesHighlightsAt() throws {
         let thread = try JSONDecoder().decode(ThreadSummary.self, from: Data(#"{"id":"t","highlightsAt":"2026-10-27T08:00:00Z"}"#.utf8))
         XCTAssertEqual(thread.highlightsAt, ISO8601.parse("2026-10-27T08:00:00Z"))

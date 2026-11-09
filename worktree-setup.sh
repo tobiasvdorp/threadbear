@@ -27,7 +27,7 @@ NPM="$(dirname "$NODE")/npm"
 # The checkout with main checked out, from git's own list.
 MAIN="$(git -C "$ROOT" worktree list --porcelain | awk '
   /^worktree / { path = substr($0, 10) }
-  /^branch refs\/heads\/main$/ { print path; exit }
+  /^branch refs\/heads\/main$/ && !found { print path; found = 1 }
 ')"
 
 # Brings the main checkout's install in `$1` up to its package-lock.json
@@ -36,7 +36,10 @@ MAIN="$(git -C "$ROOT" worktree list --porcelain | awk '
 # every thread was linking to a runner/node_modules a day behind its lock,
 # without @sentry/node. An install in place, not `npm ci`, as other
 # threads' worktrees link to it and ci empties the folder first; a lock
-# folder keeps two setups from installing at once.
+# folder keeps two setups from installing at once. Never with anything
+# uncommitted there, as npm runs a package.json's scripts: an agent that may
+# only edit files would have this run them, with nobody asked (Codex's review,
+# 7 Nov). This thread's worktree gets its own install from what's committed.
 refresh_main() {
   local there="$1" lock="$MAIN/.git/threadbear-npm.lock" tries=0
   [ "$there/package-lock.json" -nt "$there/node_modules/.package-lock.json" ] || return 0
@@ -46,6 +49,15 @@ refresh_main() {
     sleep 1
   done
   if [ "$there/package-lock.json" -nt "$there/node_modules/.package-lock.json" ]; then
+    # The whole checkout, not a list of what npm reads (binding.gyp is on it
+    # too), and a git that can't say counts as not clean.
+    local changes
+    if ! changes="$(git -C "$MAIN" status --porcelain)" || [ -n "$changes" ] \
+      || [ -n "$(git -C "$MAIN" status --porcelain --ignored -- .npmrc "$there/.npmrc")" ]; then
+      echo "${there#"$MAIN"/}: the main checkout has uncommitted changes, so no npm install there"
+      rmdir "$lock"
+      return 1
+    fi
     echo "${there#"$MAIN"/}: the main checkout's node_modules is older than its lock; npm install there"
     (cd "$there" && "$NPM" install --no-audit --no-fund --loglevel=error) || { rmdir "$lock"; return 1; }
   fi

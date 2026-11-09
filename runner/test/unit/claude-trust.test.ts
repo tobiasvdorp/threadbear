@@ -633,9 +633,12 @@ test('F23: reading frontmatter and following commands stays quick on a hostile f
   fs.writeFileSync(path.join(dir, '.claude', 'agents', 'a.md'), `\n${'\n'.repeat(50_000)}${spaces}\n---\nname: a${spaces}x\nhooks:\n  Stop:\n    - hooks:\n        - type: command\n          command: x${spaces}y${spaces}\n${':'.repeat(50_000)}${spaces}\n---\n`);
   const cpu = process.cpuUsage();
   claudeCommands(dir, home);
-  // Backtracking spends CPU; time waiting for a busy Mac or disk does not.
   const { user, system } = process.cpuUsage(cpu);
-  assert.ok((user + system) / 1000 < 3000, `took ${(user + system) / 1000} ms of CPU`);
+  // About 40 ms here; a regex that backtracks over those runs takes minutes.
+  // CPU time rather than the clock: a busy update build took 3.6 s of the
+  // clock on it (7 Nov).
+  const ms = (user + system) / 1000;
+  assert.ok(ms < 3000, `took ${Math.round(ms)} ms of CPU`);
 });
 
 test("F23: a thread in home starts without the project source, which would pick up any cloned repo's nested skills under home", () => {
@@ -776,7 +779,7 @@ test("review 2: a test runner finding its own tests, or a program that loads its
     assert.equal((trust.checkClaude(dir) as { reason?: string }).reason, 'unchecked', command);
   }
   // Ones that load nothing from the folder still can be.
-  for (const command of ['say done', 'afplay /System/Library/Sounds/Glass.aiff', 'echo hi | tee -a log.txt', 'ls -la']) {
+  for (const command of ['say done', 'afplay /System/Library/Sounds/Glass.aiff', 'echo hi | wc -l', 'ls -la']) {
     settingsIn(dir, { hooks: { Stop: [{ hooks: [{ type: 'command', command }] }] } });
     assert.notEqual((trust.checkClaude(dir) as { reason?: string }).reason, 'unchecked', command);
   }
@@ -826,8 +829,11 @@ test('review 3: a program that loads its config from the folder is caught inside
     hook(command);
     assert.equal((trust.checkClaude(dir) as { reason?: string }).reason, 'unchecked', command);
   }
-  // A script's own functions are its own words.
+  // A script's own functions are off the short list of shell now
+  // (shell-allowlist.ts, 7 Nov): one without them is fine.
   hook('sh fine.sh');
+  assert.match((trust.checkClaude(dir) as { problem?: string }).problem ?? '', /fine\.sh line 1 uses a `\(` after a word \(a function/);
+  fs.writeFileSync(path.join(dir, 'fine.sh'), 'echo start\nsay done\n');
   assert.notEqual((trust.checkClaude(dir) as { reason?: string }).reason, 'unchecked');
 });
 

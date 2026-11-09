@@ -10,9 +10,11 @@
 // are read once and kept on the runner, a thread's row is one document, and
 // a command's state is one get by id.
 import { ConvexError, v } from 'convex/values';
-import { mutation, query } from './_generated/server';
-import { checkRunnerId, forbidden, runnerAuth } from './lib';
+import { internalMutation, internalQuery, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
+import type { Id } from './_generated/dataModel';
+import { checkRunnerId, forbidden, pageLimit, runnerAuth, sha256 } from './lib';
 import { docBytes } from './runnerAccess';
+import { deleteIfUnused, MAX_COMMAND_FILES, MAX_RUNNER_UPLOAD_BYTES, storageInUse } from './sync';
 
 // The live tail: enough for a message or two of tool rows between texts.
 export const TAIL_MAX = 15;
@@ -54,7 +56,7 @@ export const remoteTail = query({
   returns: v.object({ messages: v.array(relayRow), hasMore: v.boolean() }),
   handler: async (ctx, { key, threadId, limit }) => {
     await runnerAuth(ctx, key, 'remoteTail');
-    const want = Math.max(1, Math.min(TAIL_MAX, Math.floor(limit ?? TAIL_MAX)));
+    const want = pageLimit(limit, TAIL_MAX, TAIL_MAX);
     const rows = await ctx.db.query('messages').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId)).order('desc').take(want + 1);
     return { messages: rows.slice(0, want).reverse().map(toRow), hasMore: rows.length > want };
   },
@@ -69,7 +71,7 @@ export const remoteMessages = query({
   returns: v.object({ messages: v.array(relayRow), hasMore: v.boolean() }),
   handler: async (ctx, { key, threadId, beforeSeq, afterSeq, limit }) => {
     await runnerAuth(ctx, key, 'remoteMessages');
-    const want = Math.max(1, Math.min(PAGE_MAX, Math.floor(limit ?? PAGE_DEFAULT)));
+    const want = pageLimit(limit, PAGE_DEFAULT, PAGE_MAX);
     if (afterSeq !== undefined) {
       const rows = await ctx.db.query('messages').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId).gt('seq', afterSeq)).order('asc').take(want + 1);
       return { messages: rows.slice(0, want).map(toRow), hasMore: rows.length > want };
@@ -100,6 +102,8 @@ export const remoteThread = query({
 // What a command from the main Mac may carry, kind by kind: only what that
 // runner's apply() reads, so nothing else is stored. Each gets `from: "mac"`,
 // so a message it sends isn't marked as the phone's (phone.ts never sets it).
+// The modes a new thread can start on (runner/src/protocol.ts, PERMISSION_MODES).
+const PERMISSION_MODES = ['full', 'ask', 'auto', 'plan'] as const;
 const KINDS = ['send', 'respond', 'update', 'create', 'interrupt', 'call', 'share'] as const;
 type Kind = (typeof KINDS)[number];
 // Methods a `call` may run on the other runner, and nothing else: answers
@@ -140,10 +144,22 @@ export function commandArgs(kind: Kind, raw: unknown): Record<string, unknown> {
       if (out.archive === true && a.by === 'agent') out.by = 'agent';
       break;
     case 'create':
-      if (str(a.text) === undefined || !str(a.text)!.trim()) throw bad('a new thread needs text');
+      // Pictures alone will do (API 63), as a new thread from this Mac's own composer.
+      if (str(a.text) === undefined || (!str(a.text)!.trim() && !(Array.isArray(a.images) && a.images.length))) throw bad('a new thread needs text');
       out = pick(a, ['text', 'cwd', 'accountId', 'model', 'effort']);
-      // "Ask before edits" from the composer: left out, the thread gets full access.
-      if (a.permissionMode === 'ask' || a.permissionMode === 'full' || a.permissionMode === 'auto') out.permissionMode = a.permissionMode;
+      // Left out, the thread gets full access, so every mode is kept and an
+      // unknown one refused, never dropped (Daybreak, 7 Nov 2026: Plan first
+      // arrived as Full access). Plan first comes as "ask" with plan: true
+      // (runner/src/protocol.ts, remoteCreateMode), which a runner from
+      // before it reads as Ask.
+      if (a.permissionMode !== undefined) {
+        if (!PERMISSION_MODES.includes(a.permissionMode as never)) throw bad(`permissionMode must be one of ${PERMISSION_MODES.join(', ')}`);
+        out.permissionMode = a.permissionMode;
+      }
+      if (a.plan !== undefined) {
+        if (a.plan !== true || a.permissionMode !== 'ask') throw bad('plan: true goes with permissionMode "ask"');
+        out.plan = true;
+      }
       break;
     case 'interrupt':
       out = {};
@@ -184,7 +200,118 @@ export const queueCommand = mutation({
     } else if (kind !== 'create' && kind !== 'call') {
       throw new ConvexError({ kind: 'badArgs', message: `a ${kind} needs a thread` });
     }
-    return ctx.db.insert('commands', { runnerId, ...(threadId !== undefined ? { threadId } : {}), kind, args: { ...commandArgs(kind, args), from: 'mac' }, state: 'pending', createdAt: Date.now() });
+    const images = kind === 'send' || kind === 'create' ? await commandPictures(ctx, (args as { images?: unknown } | null)?.images) : [];
+    const commandId = await ctx.db.insert('commands', { runnerId, ...(threadId !== undefined ? { threadId } : {}), kind, args: { ...commandArgs(kind, args), ...(images.length ? { images } : {}), from: 'mac' }, state: 'pending', createdAt: Date.now() });
+    // On their way, so nothing deletes them before that runner has fetched
+    // them; sync:finishCommand deletes them once it has (as a phone's photos).
+    for (const image of images) await ctx.db.insert('commandFiles', { storageId: image.storageId, commandId });
+    return commandId;
+  },
+});
+
+// ------------------------------------------------------------ pictures
+// A picture pasted into a message for another runner's thread (API 63). The
+// main Mac's runner uploads each one to /relay/upload (pictureUploadUrl),
+// which records it (relayUploads), and names it here, and the command
+// carries a URL for each, in the shape a phone's photos have, so every
+// runner fetches them as it already does for the phone (runner/src/sync.ts
+// withPhoneImages). They're in Convex only on their way: finishing the
+// command deletes them, and one that never went out goes after a day
+// (sync:pruneFiles), whatever happened to the runner meanwhile.
+
+const RELAY_TICKET_MS = 60 * 60_000;
+
+/** A one-use URL on /relay/upload for one picture, at most 10 MB. */
+export const pictureUploadUrl = mutation({
+  args: { key: v.string() },
+  returns: v.string(),
+  handler: async (ctx, { key }) => {
+    await runnerAuth(ctx, key, 'pictureUploadUrl');
+    const site = process.env.CONVEX_SITE_URL;
+    if (!site) throw new ConvexError({ kind: 'config', message: 'CONVEX_SITE_URL is not set' });
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    const ticket = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    await ctx.db.insert('relayUploads', { ticketHash: await sha256(ticket), issuedAt: Date.now() });
+    return `${site.replace(/\/+$/, '')}/relay/upload?ticket=${ticket}`;
+  },
+});
+
+// Unused and under an hour old.
+async function liveRelayTicket(ctx: QueryCtx | MutationCtx, ticket: string) {
+  if (!/^[0-9a-f]{48}$/.test(ticket)) return null;
+  const hash = await sha256(ticket);
+  const row = await ctx.db.query('relayUploads').withIndex('by_hash', (q) => q.eq('ticketHash', hash)).first();
+  return row && !row.usedAt && row.issuedAt > Date.now() - RELAY_TICKET_MS ? row : null;
+}
+
+// For /relay/upload, before it stores anything.
+export const relayTicketOk = internalQuery({
+  args: { ticket: v.string() },
+  returns: v.boolean(),
+  handler: async (ctx, { ticket }) => (await liveRelayTicket(ctx, ticket)) !== null,
+});
+
+// The stored file is this upload's. False (the route then deletes the file):
+// a dead or used ticket, or a file over the cap. Spent whatever happens.
+export const redeemRelayUpload = internalMutation({
+  args: { ticket: v.string(), storageId: v.id('_storage'), bytes: v.number() },
+  returns: v.boolean(),
+  handler: async (ctx, { ticket, storageId, bytes }) => {
+    const row = await liveRelayTicket(ctx, ticket);
+    if (!row) return false;
+    const ok = bytes >= 0 && bytes <= MAX_RUNNER_UPLOAD_BYTES;
+    await ctx.db.patch(row._id, { usedAt: Date.now(), ...(ok ? { storageId } : {}) });
+    return ok;
+  },
+});
+
+// Each named file: one uploaded for this (relayUploads; a runner key's,
+// a phone's or any other stored file never is), and named by nothing else,
+// another command included: finishing would delete it from under that.
+async function commandPictures(ctx: MutationCtx, raw: unknown): Promise<{ storageId: Id<'_storage'>; url: string }[]> {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.some((x) => typeof x !== 'string')) throw new ConvexError({ kind: 'badArgs', message: 'images are storage ids' });
+  if (raw.length > MAX_COMMAND_FILES) throw new ConvexError({ kind: 'badArgs', message: `at most ${MAX_COMMAND_FILES} pictures in a message to another Mac` });
+  const out: { storageId: Id<'_storage'>; url: string }[] = [];
+  for (const id of raw as Id<'_storage'>[]) {
+    if (out.some((o) => o.storageId === id)) throw new ConvexError({ kind: 'badArgs', message: 'the same picture twice' });
+    const url = (await stored(ctx, id)) ? await ctx.storage.getUrl(id) : null;
+    if (!url) throw new ConvexError({ kind: 'notFound', message: 'that picture has gone' });
+    if (!(await isRelayUpload(ctx, id)) || (await storageInUse(ctx, id))) throw forbidden('send a stored file that is something else');
+    out.push({ storageId: id, url });
+  }
+  return out;
+}
+
+// Whether a file is there; an id that isn't one at all (Convex throws on it) isn't.
+async function stored(ctx: MutationCtx, id: Id<'_storage'>): Promise<boolean> {
+  try {
+    return (await ctx.db.system.get(id)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+async function isRelayUpload(ctx: MutationCtx, storageId: Id<'_storage'>): Promise<boolean> {
+  return (await ctx.db.query('relayUploads').withIndex('by_storageId', (q) => q.eq('storageId', storageId)).first()) !== null;
+}
+
+/**
+ * Pictures the main Mac's runner uploaded for a command that then wasn't
+ * queued: deleted, but only ones of its own that nothing names (one that
+ * did get queued stays until its command is over).
+ */
+export const discardPictures = mutation({
+  args: { key: v.string(), storageIds: v.array(v.string()) },
+  returns: v.null(),
+  handler: async (ctx, { key, storageIds }) => {
+    await runnerAuth(ctx, key, 'discardPictures');
+    for (const id of storageIds.slice(0, MAX_COMMAND_FILES) as Id<'_storage'>[]) {
+      if (!(await stored(ctx, id)) || !(await isRelayUpload(ctx, id))) continue;
+      await deleteIfUnused(ctx, id);
+    }
+    return null;
   },
 });
 

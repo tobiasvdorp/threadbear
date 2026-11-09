@@ -17,8 +17,19 @@ import path from 'node:path';
 // Said on the approval card, after the edit's own title.
 export const RUNS_AS_CODE = 'Threadbear runs this file as code';
 
+// Said instead when this file isn't known to run, but a patch that loads
+// without a hash does something Threadbear can't follow, so any edit might be
+// what it runs. The card asks the same; it just doesn't claim more than that.
+export const MAYBE_RUNS_AS_CODE = "Threadbear can't tell whether this file runs as code";
+
+// Whether a write runs as code, or might: 'unsure' is the catch-all above.
+export type CodeWrite = boolean | 'unsure';
+
+// What the approval card says for a write that asks.
+export const codeWriteNote = (kind: CodeWrite): string => (kind === 'unsure' ? MAYBE_RUNS_AS_CODE : RUNS_AS_CODE);
+
 // What a PreToolUse hook tells the CLI when it makes such an edit ask.
-export const RUNS_AS_CODE_REASON = `${RUNS_AS_CODE}, so it always asks outside Full access.`;
+export const codeWriteReason = (kind: CodeWrite): string => `${codeWriteNote(kind)}, so it always asks outside Full access.`;
 
 // By name alone, wherever it is: a patch file (a project's or
 // ~/.threadbear/patches, which is trusted whatever it holds), anything else

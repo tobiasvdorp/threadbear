@@ -142,6 +142,20 @@ final class Dictation {
         }
     }
 
+    #if DEBUG
+    /// Whisper working after the mic's off, for screenshots (-ThreadbearTypingOut).
+    func fakeTypingOut() { isTranscribing = true }
+    func fakeTypedOut() { isTranscribing = false }
+    func fakeStopped() { isListening = false; level.reset() }
+
+    /// Looks 8 seconds into listening, for screenshots (-ThreadbearDictating).
+    func fakeListening() {
+        isListening = true
+        startedAt = .now.addingTimeInterval(-8)
+        level.fake()
+    }
+    #endif
+
     /// The mic tapped off: Whisper now types out what it heard. Apple's has
     /// typed as it went, so it just stops.
     func finish() {
@@ -347,19 +361,32 @@ nonisolated final class MicLevel: @unchecked Sendable {
     private let lock = NSLock()
     private var levels = [Float](repeating: 0, count: MicLevel.count)
 
-    /// Each buffer's RMS, as 0 to 1 over -50 to -10 dB, so speech fills the
-    /// bars and room noise barely moves them.
+    /// Each buffer's RMS, as 0 to 1 over -70 to -10 dB. The mic's in
+    /// measurement mode, with no automatic gain, so speech can sit well under
+    /// -40 dB: over -50 to -10 it barely moved the bars (Mike, 8 Nov). `shown`
+    /// then scales them to the last couple of seconds.
     func push(_ buffer: AVAudioPCMBuffer) {
         guard let channel = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
         var sum: Float = 0
         for i in 0..<Int(buffer.frameLength) { sum += channel[i] * channel[i] }
         let db = 10 * log10(max(sum / Float(buffer.frameLength), 1e-10))
-        let value = min(max((db + 50) / 40, 0), 1)
+        let value = min(max((db + 70) / 60, 0), 1)
         lock.lock()
         levels.removeFirst()
         levels.append(value)
         lock.unlock()
     }
+
+    #if DEBUG
+    /// Made-up talking that keeps moving, for screenshots: a still pattern
+    /// hid that the real bars weren't moving.
+    private var fakeSince: Date?
+    func fake() {
+        lock.lock()
+        fakeSince = .now
+        lock.unlock()
+    }
+    #endif
 
     func reset() {
         lock.lock()
@@ -370,6 +397,25 @@ nonisolated final class MicLevel: @unchecked Sendable {
     var history: [Float] {
         lock.lock()
         defer { lock.unlock() }
+        #if DEBUG
+        if let fakeSince {
+            let t = Date.now.timeIntervalSince(fakeSince) * 15
+            return (0..<Self.count).map { i in
+                let x = t + Double(i)
+                return Float(0.45 + 0.2 * sin(x * 0.9) + 0.15 * sin(x * 2.3))
+            }
+        }
+        #endif
         return levels
+    }
+
+    /// For the bars: the history stretched between its quietest and loudest,
+    /// so whatever the mic's level, talking fills them. At least 0.12 apart,
+    /// so near silence stays near flat rather than blowing up room noise.
+    var shown: [Float] {
+        let values = history
+        let low = values.min() ?? 0
+        let span = max((values.max() ?? 0) - low, 0.12)
+        return values.map { ($0 - low) / span }
     }
 }

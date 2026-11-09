@@ -47,7 +47,10 @@ public enum RowDebug {
             let state = switch card.state { case .waiting: "waiting"; case .approved: "approved"; case .sentBack: "sent back" }
             return "plan (\(state))" + (card.entries.isEmpty ? ": " + PlanCardText.summary(card.text) : ", " + card.entries.map(\.text).joined(separator: "; "))
         case .asks(let card):
-            if card.isDone { return "\(card.isOpen ? "open" : "closed"), nothing needed" + (card.next.isEmpty ? "" : ", next: " + card.next.enumerated().map { (card.pickedNext.contains($0.offset) ? "[x] " : "") + $0.element }.joined(separator: "; ")) }
+            if card.isDone {
+                let loose = card.looseEnds.map { $0.isEmpty ? ", loose ends: none" : ", loose ends: " + $0.map(\.text).joined(separator: "; ") } ?? ""
+                return "\(card.isOpen ? "open" : "closed"), nothing needed" + loose + (card.next.isEmpty ? "" : ", next: " + card.next.enumerated().map { (card.pickedNext.contains($0.offset) ? "[x] " : "") + $0.element }.joined(separator: "; "))
+            }
             return "\(card.isOpen ? "open" : "closed"), \(card.tickedCount) of \(card.asks.count) ticked: " + card.asks.map(\.action).joined(separator: "; ")
         case .footer(let completion):
             var text = RelativeTime.duration(milliseconds: completion.durationMs)
@@ -169,6 +172,7 @@ extension TranscriptModel {
         case .toolResult(let result): return ["t:" + result.itemId] + (result.images.isEmpty ? [] : ["i:" + result.itemId])
         case .editDiff(let diff): return ["t:" + diff.itemId]
         case .approvalRequested(let request): return ["ap:" + request.approvalId]
+        case .approvalQueued(let queue): return ["ap:" + queue.approvalId]
         case .questionRequested(let request): return ["q:" + request.approvalId]
         case .secretRequested(let request): return ["s:" + request.approvalId]
         case .reviewUpdated(let review): return ["review:" + review.id]
@@ -199,7 +203,7 @@ public enum TokenText {
     /// no counts.
     public static func line(_ usage: JSONValue?) -> String? {
         guard let usage else { return nil }
-        func count(_ key: String) -> Int? { usage[key]?.doubleValue.map { Int($0) } }
+        func count(_ key: String) -> Int? { usage[key]?.doubleValue.flatMap { $0.wholeCount() } }
         var parts: [String] = []
         if let input = count("inputTokens") {
             var part = format(input) + " in"

@@ -52,7 +52,7 @@ public enum AccountUsageText {
 
     /// A percentage as shown: whole numbers, never "100%" for 99.6.
     public static func percent(_ value: Double) -> String {
-        "\(Int(value.rounded(.down)))%"
+        "\(Int(saturating: value.rounded(.down)))%"
     }
 
     /// "5h", "week": the short names the menu uses.

@@ -12,7 +12,8 @@
 // disk for when the backend can't be reached), and sends only its own,
 // each run taken with a claim first so it's sent once.
 import { experimentOn } from './experiments.ts';
-import { type KeptCheck, CHECK_TIMEOUT_MS, checkLimitMs, checkOutcome, checkRunningElsewhere, clearCheckRunning, dropKeptCheck, keepCheck, markCheckRunning, MAX_CHECK_CHARS, MAX_CHECK_TIMEOUT_SECS, readKeptCheck, runCheck, type CheckResult } from './schedule-check.ts';
+import type { CheckCard } from './patch-trust.ts';
+import { type KeptCheck, CHECK_TIMEOUT_MS, checkLimitMs, checkOutcome, checkRunningElsewhere, clearCheckRunning, dropKeptCheck, HELD_EXTRA, HELD_SKIP, heldToldAbout, keepCheck, markCheckRunning, MAX_CHECK_CHARS, MAX_CHECK_TIMEOUT_SECS, noteHeldTold, readKeptCheck, runCheck, type CheckResult } from './schedule-check.ts';
 import { forbiddenText } from './sync.ts';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,10 +26,12 @@ import { EFFORT_LEVELS, ErrorCode, RpcError, isEffortLevel } from './protocol.ts
 import { atomicWriteFileSync, isDirectory, readJsonSync } from './fsutil.ts';
 import { expandHome } from './config.ts';
 import { CronError, checkZone, describeAt, describeCron, localZone, nextRun, nextRuns, parseCron } from './cron.ts';
+import { cutSafely, firstLineSafely } from './safe-cut.ts';
 
 // What a check printed, carried by a run: kept (when it was kept) and the
 // command, so a sent run drops that command's kept file.
-type Carried = { extra: string; kept?: string; check?: string };
+// `held`: it says a check wasn't run, for this digest of what it'd run.
+type Carried = { extra: string; kept?: string; check?: string; held?: string };
 
 // What schedules.json holds for each: everything but whenText, which is
 // worked out when it's sent, and runnerName, from the backend's runners.
@@ -100,9 +103,11 @@ const ONLINE_MS = 3 * 60_000;
 // offered in runners.list: an old install, or a test's.
 const FORGET_MS = 30 * 86_400_000;
 
-export type ScheduleRunner = Pick<Runner, 'create' | 'send' | 'get' | 'hello' | 'onNotification' | 'publish'>;
+export type ScheduleRunner = Pick<Runner, 'create' | 'send' | 'get' | 'hello' | 'onNotification' | 'publish' | 'patchTrust'>;
 
 export type CreateScheduleParams = {
+  // A card's approval of `check` (patch-trust.ts, approveCheck). Not from a client.
+  checkCard?: CheckCard;
   text: string;
   title?: string;
   at?: string;
@@ -142,6 +147,7 @@ export type UpdateScheduleParams = {
   permissionMode?: PermissionMode;
   // null or "" takes the check off.
   check?: string | null;
+  checkCard?: CheckCard;
   // null: back to a minute.
   checkTimeoutSecs?: number | null;
 };
@@ -391,9 +397,15 @@ export class Scheduler {
 
   private onRows(rows: StoredSchedule[]): void {
     if (this.stopped) return;
+    const before = new Map(this.items);
     this.items.clear();
     for (const r of rows) {
       const { whenText: _w, ...rec } = r;
+      // Another schedule under the same id (gone and made again, or moved
+      // to another runner): what the old one's check printed isn't this
+      // one's to send (stillClaimed).
+      const was = before.get(rec.id);
+      if (was && (was.createdAt !== rec.createdAt || was.runnerId !== rec.runnerId)) this.dropKept(rec.id);
       this.items.set(rec.id, rec);
       if (!this.names.has(rec.runnerId)) this.namesDue = true;
     }
@@ -546,7 +558,7 @@ export class Scheduler {
     const now = this.iso();
     const rec: ScheduleRecord = {
       id: crypto.randomUUID(),
-      title: p.title?.trim() ? p.title.trim().slice(0, 200) : firstLine(text),
+      title: p.title?.trim() ? cutSafely(p.title.trim(), 200) : firstLine(text),
       text,
       paused: Boolean(p.paused),
       createdAt: now,
@@ -581,6 +593,7 @@ export class Scheduler {
     if (p.createdBy) rec.createdBy = p.createdBy;
     if (this.mode === 'backend') rec.runnerId = runnerId;
     this.plan(rec);
+    if (!away) this.approveCheck(rec, p.checkCard);
     await this.put(rec);
     // An `at` that's already passed runs now rather than on the next tick.
     this.tick();
@@ -603,7 +616,7 @@ export class Scheduler {
     const rec: ScheduleRecord = structuredClone(this.mustGet(p.scheduleId));
     const away = !this.mine(rec);
     let replan = false;
-    if (p.title !== undefined) rec.title = p.title.trim() ? p.title.trim().slice(0, 200) : firstLine(rec.text);
+    if (p.title !== undefined) rec.title = p.title.trim() ? cutSafely(p.title.trim(), 200) : firstLine(rec.text);
     if (p.text !== undefined) {
       if (!p.text.trim()) throw bad('text cannot be empty');
       rec.text = p.text.trim();
@@ -641,6 +654,7 @@ export class Scheduler {
       if (p.checkTimeoutSecs === null) delete rec.checkTimeoutSecs;
       else rec.checkTimeoutSecs = checkedTimeout(p.checkTimeoutSecs);
     }
+    const moved = !rec.threadId && p.cwd !== undefined;
     if (!rec.threadId) {
       if (p.cwd !== undefined) rec.cwd = away ? p.cwd.trim() || undefined : this.checkedFolder(p.cwd);
       if (rec.cwd === undefined) delete rec.cwd;
@@ -664,6 +678,9 @@ export class Scheduler {
     }
     rec.updatedAt = this.iso();
     if (replan) this.plan(rec);
+    // Passing the check again, or moving it, approves it as it is now. Any
+    // other change leaves its approval alone.
+    if (!away && (p.check !== undefined || moved)) this.approveCheck(rec, p.checkCard);
     await this.put(rec);
     this.tick();
     return this.view(rec);
@@ -820,19 +837,13 @@ export class Scheduler {
         // The record as it is now: the subscription may have brought a
         // newer one (its check changed) or none (deleted, maybe by another
         // runner) while the claim was out, and again while it checked.
-        const fresh = this.items.get(rec.id);
-        if (!fresh) {
-          this.dropKept(rec.id);
-          continue;
-        }
+        const fresh = this.stillClaimed(backend, rec);
+        if (!fresh) continue;
         rec = fresh;
         const checked = await this.checked(rec);
         if (this.stopped) continue;
-        const after = this.items.get(rec.id);
-        if (!after) {
-          this.dropKept(rec.id);
-          continue;
-        }
+        const after = this.stillClaimed(backend, rec);
+        if (!after) continue;
         rec = after;
         if (checked === 'later') {
           await backend.release(rec.id).catch(() => {});
@@ -872,8 +883,9 @@ export class Scheduler {
     const request = row.runRequestedAt!;
     const claimed = await backend.claim(row.id, 'request', request).catch(() => false);
     if (!claimed || this.stopped) return;
-    // As it is now (backendTick says why): deleted meanwhile, it isn't sent.
-    const rec = this.items.get(row.id);
+    // As it is now (backendTick says why): deleted meanwhile, or no longer
+    // the one claimed, it isn't sent.
+    const rec = this.stillClaimed(backend, row);
     if (!rec) return;
     let res: ReturnType<Scheduler['send']>;
     try {
@@ -893,20 +905,35 @@ export class Scheduler {
     await this.recordRun(rec, res.outcome === 'sent', request);
   }
 
+  // The schedule a claim was taken for, as the subscription has it now, or
+  // undefined when that one isn't there to send any more: deleted, moved to
+  // another runner, or a different schedule under the same id. The claim
+  // was the backend saying this runner may send that row; a row that came in
+  // under its id meanwhile wasn't claimed. Daybreak's finding (6 Nov): the
+  // owner deletes a schedule while its check runs, a runner key saves one
+  // of its own under the gone id (same check, its own text, Full access),
+  // and the main Mac's subscription, which has every runner's rows, handed
+  // the new row to send() in place of the claimed one. So it must still be
+  // this runner's (only the owner key or this runner's own can write a row
+  // with our runnerId) and the same schedule (createdAt, which update
+  // keeps). Its kept check output went with the old one (onRows).
+  private stillClaimed(backend: ScheduleBackend, claimed: ScheduleRecord): ScheduleRecord | undefined {
+    const now = this.items.get(claimed.id);
+    if (now && this.mine(now) && now.createdAt === claimed.createdAt) return now;
+    // Let go, in case the claim is still on a row of ours (moved away keeps
+    // it): only the holder's is cleared.
+    if (now) void backend.release(claimed.id).catch(() => {});
+    else this.dropKept(claimed.id);
+    return undefined;
+  }
+
   // Its check, when it has one and checks are on (schedule-check.ts):
   // undefined to run as usual.
   // 'later': not now, leave it due (its check is running in another runner
   // process, or the check was changed while it ran).
   private async checked(rec: ScheduleRecord): Promise<{ skip: string } | Carried | 'later' | undefined> {
     if (!rec.check || !this.checksOn()) return undefined;
-    let cwd = rec.cwd ? path.resolve(expandHome(rec.cwd)) : this.home;
-    if (rec.threadId) {
-      try {
-        cwd = this.runner.get(rec.threadId).cwd;
-      } catch {
-        // A thread that's gone: send says so.
-      }
-    }
+    const cwd = this.checkFolder(rec);
     // What it printed last time and no run has carried yet (a restart
     // refused the send, or the runner stopped mid-check): send that rather
     // than asking again, as a check that keeps state won't print it twice.
@@ -916,6 +943,12 @@ export class Scheduler {
     const kept = this.keptFor(rec);
     if (kept) return kept;
     if (checkRunningElsewhere(this.home, id, this.clock.now())) return 'later';
+    // Approved once, it runs unattended from then on, so it must still be
+    // what was approved: the command, in this folder, reaching these bytes.
+    // Read afresh now. What's in a row isn't enough, as the backend's row
+    // says what to run but only this runner's own store says it was approved.
+    const hold = this.heldCheck(command, cwd, id);
+    if (hold) return hold;
     try {
       markCheckRunning(this.home, id, this.clock.now(), timeoutMs);
     } catch {
@@ -963,6 +996,51 @@ export class Scheduler {
     }
   }
 
+  // Where a check runs: its thread's folder, its own, or the runner's.
+  private checkFolder(rec: ScheduleRecord): string {
+    if (rec.threadId) {
+      try {
+        return this.runner.get(rec.threadId).cwd;
+      } catch {
+        // A thread that's gone: send says so.
+      }
+    }
+    return rec.cwd ? path.resolve(expandHome(rec.cwd)) : this.home;
+  }
+
+  // Binds a schedule's check to what it runs as this is called, in this
+  // runner's own store: making or changing one is what approves it (a thread
+  // that asks first has had its card by now, threadbear-mcp.ts). A failure
+  // only means the check is held at its next run.
+  private approveCheck(rec: ScheduleRecord, card?: CheckCard): void {
+    if (!rec.check) return;
+    try {
+      this.runner.patchTrust.approveCheck(rec.check, this.checkFolder(rec), card);
+    } catch (e) {
+      // A card's approval that doesn't hold changes nothing.
+      if (card) throw bad(e instanceof Error ? e.message : String(e));
+      this.log.warn("could not approve a schedule's check", { scheduleId: rec.id, error: String(e) });
+    }
+  }
+
+  // What to do instead of running a check that isn't approved as it is now,
+  // or undefined when it is. Said once per version of what it runs, on the
+  // run that's sent with it (see send), then skipped: a failed check going
+  // quiet would be worse, and an agent every five minutes no better. A folder
+  // that's gone counts, as the check would run somewhere else (runCheck).
+  private heldCheck(command: string, cwd: string, id: string): { skip: string } | Carried | undefined {
+    let hash: string;
+    try {
+      const v = this.runner.patchTrust.checkApproved(command, cwd);
+      if (v.approved && fs.existsSync(cwd)) return undefined;
+      hash = v.hash;
+    } catch (e) {
+      hash = `unreadable: ${String(e)}`;
+    }
+    if (heldToldAbout(this.home, id) === hash) return { skip: HELD_SKIP };
+    return { extra: HELD_EXTRA, held: hash };
+  }
+
   // Run now doesn't run the check, but sends what it kept and no thread
   // has seen, rather than leaving it to a next run a one-off won't have.
   private keptFor(rec: ScheduleRecord): Carried | undefined {
@@ -1003,6 +1081,14 @@ export class Scheduler {
       if (outcome === 'sent' && checked && 'extra' in checked && checked.check) {
         this.delivered.add(`${rec.id}\n${checked.check}\n${checked.kept}`);
         this.dropKept(rec.id, checked.check);
+      }
+      if (outcome === 'sent' && checked && 'extra' in checked && checked.held) {
+        try {
+          noteHeldTold(this.home, rec.id, checked.held);
+        } catch (e) {
+          // Told again next run, rather than not told.
+          this.log.warn('could not note that a held check was told about', { scheduleId: rec.id, error: String(e) });
+        }
       }
       this.log.info('schedule ran', { scheduleId: rec.id, outcome, threadId, note });
     };
@@ -1196,7 +1282,7 @@ function bad(message: string): RpcError {
 }
 
 function firstLine(text: string): string {
-  return (text.split('\n').map((l) => l.trim()).find(Boolean) ?? 'Scheduled message').slice(0, 80);
+  return firstLineSafely(text, 80) || 'Scheduled message';
 }
 
 function checkedTimeout(secs: number): number {
@@ -1236,6 +1322,7 @@ export function scheduleMethods(s: Scheduler): Record<string, (p: Record<string,
         effort: effort(p.effort) ?? undefined,
         permissionMode: mode(p.permissionMode),
         check: str(p, 'check'),
+        ...checkCardOf(p),
         checkTimeoutSecs: num(p, 'checkTimeoutSecs'),
         paused: bool(p, 'paused'),
         createdBy: str(p, 'createdBy'),
@@ -1257,6 +1344,7 @@ export function scheduleMethods(s: Scheduler): Record<string, (p: Record<string,
       if (p.permissionMode !== undefined) upd.permissionMode = mode(p.permissionMode);
       if (p.paused !== undefined) upd.paused = bool(p, 'paused');
       if (p.check !== undefined) upd.check = p.check === null ? null : str(p, 'check');
+      Object.assign(upd, checkCardOf(p));
       if (p.checkTimeoutSecs !== undefined) upd.checkTimeoutSecs = p.checkTimeoutSecs === null ? null : num(p, 'checkTimeoutSecs');
       return { schedule: await s.update(upd) };
     },
@@ -1268,6 +1356,17 @@ export function scheduleMethods(s: Scheduler): Record<string, (p: Record<string,
       return s.preview({ cron: str(p, 'cron'), at: str(p, 'at'), timezone: str(p, 'timezone'), count: count as number | undefined });
     },
   };
+}
+
+// A card's approval passing through from a draining runner's tool call
+// (handover.ts). It can only refuse more: leaving it out approves as things
+// are, which is what the app and tb do.
+function checkCardOf(p: Record<string, unknown>): { checkCard?: CheckCard } {
+  const c = p.checkCard;
+  if (c === undefined || c === null) return {};
+  if (typeof c !== 'object') throw bad('checkCard must be an object');
+  const { hash, folder } = c as { hash?: unknown; folder?: unknown };
+  return { checkCard: { ...(typeof hash === 'string' ? { hash } : {}), ...(typeof folder === 'string' ? { folder } : {}) } };
 }
 
 function str(p: Record<string, unknown>, k: string): string | undefined {

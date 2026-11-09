@@ -310,7 +310,7 @@ async function landCommand(cfg: ReturnType<typeof loadConfig>, dryRun: boolean):
     }
   }
   if (!target) {
-    const found = await landTargetFromGit(here);
+    const found = await landTargetFromGit(here, threadId);
     if (!found.target) {
       console.error(found.reason);
       return 1;

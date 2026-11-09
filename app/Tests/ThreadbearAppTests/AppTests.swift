@@ -585,6 +585,20 @@ final class DraftTests: XCTestCase {
         XCTAssertEqual(app.errorMessage, "Busy")
     }
 
+    /// A new schedule runs its threads on the composer's mode, Auto
+    /// included, rather than Auto turning into Ask.
+    func testNewScheduleTakesTheComposersPermission() {
+        let app = AppModel()
+        app.newSchedule(from: nil)
+        XCTAssertEqual(app.scheduleEditor?.permissionMode, .full)
+        app.newThreadPermission = .auto
+        app.newSchedule(from: nil)
+        XCTAssertEqual(app.scheduleEditor?.permissionMode, .auto)
+        app.newThreadPermission = .ask
+        app.newSchedule(from: nil)
+        XCTAssertEqual(app.scheduleEditor?.permissionMode, .ask)
+    }
+
     /// The folder, "Ask before edits" and a picked account were for the
     /// one thread; the model and effort are what the next thread starts on
     /// too, and survive a relaunch. The account used becomes the last-used

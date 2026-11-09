@@ -96,8 +96,8 @@ public struct RunnerSettings: Sendable, Hashable, Decodable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         defaultCwd = (try? c.decodeIfPresent(String.self, forKey: .defaultCwd)) ?? ""
-        idleMinutes = c.number(.idleMinutes).map { Int($0.rounded()) } ?? 30
-        maxLiveCLIs = c.number(.maxLiveCLIs).map { Int($0.rounded()) } ?? 6
+        idleMinutes = c.number(.idleMinutes).flatMap { Int(checked: $0.rounded()) } ?? 30
+        maxLiveCLIs = c.number(.maxLiveCLIs).flatMap { Int(checked: $0.rounded()) } ?? 6
         followMain = (try? c.decodeIfPresent(Bool.self, forKey: .followMain)) ?? true
         bulletReplies = (try? c.decodeIfPresent(Bool.self, forKey: .bulletReplies)) ?? true
         oneReply = (try? c.decodeIfPresent(Bool.self, forKey: .oneReply)) ?? false

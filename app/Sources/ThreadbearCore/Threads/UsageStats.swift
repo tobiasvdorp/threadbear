@@ -54,9 +54,14 @@ public struct AccountTokens: Sendable, Equatable, Decodable {
         // [startMs, input, output, cacheRead, cacheWrite]; a short or odd
         // row is skipped rather than failing the lot.
         let rows = (try? c.decodeIfPresent([[Double]].self, forKey: .hours)) ?? []
+        // A count past ten trillion an hour is no real reading, and the
+        // sums over a month of them stay inside Int (Int(_:) of 1e100, or
+        // an overflowing sum, would stop the app).
         hours = rows.compactMap { row in
-            guard row.count >= 5, row.allSatisfy(\.isFinite) else { return nil }
-            return TokenHour(start: Date(timeIntervalSince1970: row[0] / 1000), input: Int(row[1]), output: Int(row[2]), cacheRead: Int(row[3]), cacheWrite: Int(row[4]))
+            guard row.count >= 5, row[0].isFinite, abs(row[0]) <= 8.64e15,
+                  let input = row[1].wholeCount(atMost: 1e13), let output = row[2].wholeCount(atMost: 1e13),
+                  let cacheRead = row[3].wholeCount(atMost: 1e13), let cacheWrite = row[4].wholeCount(atMost: 1e13) else { return nil }
+            return TokenHour(start: Date(timeIntervalSince1970: row[0] / 1000), input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite)
         }.sorted { $0.start < $1.start }
     }
 
@@ -78,10 +83,13 @@ public struct TokenHour: Sendable, Equatable {
         self.cacheWrite = cacheWrite
     }
 
-    public var total: Int { input + output + cacheRead + cacheWrite }
+    // Sums held at Int.max: every row can be in range and a quarter of a
+    // million of them not (cross-lab review, 7 Nov).
+    public var total: Int { input.adding(saturating: output).adding(saturating: cacheRead).adding(saturating: cacheWrite) }
 
     static func + (a: TokenHour, b: TokenHour) -> TokenHour {
-        TokenHour(start: a.start, input: a.input + b.input, output: a.output + b.output, cacheRead: a.cacheRead + b.cacheRead, cacheWrite: a.cacheWrite + b.cacheWrite)
+        TokenHour(start: a.start, input: a.input.adding(saturating: b.input), output: a.output.adding(saturating: b.output),
+                  cacheRead: a.cacheRead.adding(saturating: b.cacheRead), cacheWrite: a.cacheWrite.adding(saturating: b.cacheWrite))
     }
 }
 
@@ -158,7 +166,7 @@ public enum UsageStatsMath {
         let elapsed = now.timeIntervalSince(thisHour) / 3600
         let current = total(stats, accounts: accounts, from: thisHour, to: thisHour.addingTimeInterval(3600)).total
         let before = total(stats, accounts: accounts, from: previous, to: thisHour).total
-        return current + Int((Double(before) * (1 - elapsed)).rounded())
+        return current.adding(saturating: Int(saturating: (Double(before) * (1 - elapsed)).rounded()))
     }
 
     /// What a usual day had spent by this time of day: the average of the
@@ -172,7 +180,7 @@ public enum UsageStatsMath {
         var sum = 0
         for back in 1...days {
             guard let day = calendar.date(byAdding: .day, value: -back, to: today) else { continue }
-            sum += total(stats, accounts: accounts, from: day, to: day.addingTimeInterval(sinceMidnight + 1)).total
+            sum = sum.adding(saturating: total(stats, accounts: accounts, from: day, to: day.addingTimeInterval(sinceMidnight + 1)).total)
         }
         return sum / days
     }
@@ -210,7 +218,7 @@ public enum UsageStatsMath {
         for bar in bars {
             let key = "\(bar.start.timeIntervalSince1970)|\(bar.accountId)"
             if var have = sums[key] {
-                have.tokens += bar.tokens
+                have.tokens = have.tokens.adding(saturating: bar.tokens)
                 sums[key] = have
             } else {
                 order.append(key)
@@ -226,7 +234,7 @@ public enum UsageStatsMath {
     public static func tokens(_ n: Int) -> String {
         let value = Double(n)
         func short(_ v: Double, _ suffix: String) -> String {
-            let text = v < 10 ? String(format: "%.1f", v) : String(Int(v.rounded()))
+            let text = v < 10 ? String(format: "%.1f", v) : String(Int(saturating: v.rounded()))
             return (text.hasSuffix(".0") ? String(text.dropLast(2)) : text) + suffix
         }
         if value >= 1_000_000_000 { return short(value / 1_000_000_000, "B") }
@@ -356,16 +364,16 @@ public struct LimitPace: Sendable, Equatable {
     /// as nobody plans around "1 day 7 hours".
     static func gap(_ seconds: TimeInterval) -> String {
         let hours = seconds / 3600
-        if hours >= 36 { return "\(Int((hours / 24).rounded())) days" }
+        if hours >= 36 { return "\(Int(saturating: (hours / 24).rounded())) days" }
         if hours >= 24 { return "1 day" }
-        if hours >= 1.5 { return "\(Int(hours.rounded())) hours" }
+        if hours >= 1.5 { return "\(Int(saturating: hours.rounded())) hours" }
         if hours >= 1 { return "1 hour" }
-        return "\(max(1, Int((seconds / 60).rounded()))) min"
+        return "\(max(1, Int(saturating: (seconds / 60).rounded()))) min"
     }
 
     /// "9% a day", "12% an hour".
     public func rateText(kind: String) -> String {
-        let value = rate < 1 ? String(format: "%.1f", rate) : String(Int(rate.rounded()))
+        let value = rate < 1 ? String(format: "%.1f", rate) : String(Int(saturating: rate.rounded()))
         return value + (kind == "five_hour" ? "% an hour" : "% a day")
     }
 }

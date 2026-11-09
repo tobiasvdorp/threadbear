@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeHarness, tmpDir } from '../helpers/fakes.ts';
+import { makeHarness, tick, tmpDir } from '../helpers/fakes.ts';
+import { PANEL_ACK_WAIT_MS } from '../../src/panel-requests.ts';
 import { checkSummary } from '../helpers/protocol-check.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
 import type { PersistedEvent } from '../../src/protocol.ts';
@@ -110,7 +111,7 @@ test('pins come first, merge with a found item, and unpin or remove take them of
   upsert(state, pinItem({ path: '/Users/mike/dev/app/mock.html', title: 'Sidebar mockup', note: 'Pick one of the three', show: true }, 5, '2026-10-27T10:01:00.000Z'));
   const v = view(state);
   assert.equal(v.highlights.length, 2);
-  assert.deepEqual([v.highlights[0]!.how, v.highlights[0]!.title, v.highlights[0]!.note, v.highlights[0]!.show, v.highlights[0]!.seq], ['pinned', 'Sidebar mockup', 'Pick one of the three', true, 5]);
+  assert.deepEqual([v.highlights[0]!.how, v.highlights[0]!.title, v.highlights[0]!.note, v.highlights[0]!.show, v.highlights[0]!.seq], ['pinned', 'Sidebar mockup', 'Pick one of the three', undefined, 5]);
   assert.equal(unpin(state, 'file:/Users/mike/dev/app/mock.html'), true);
   assert.equal(unpin(state, 'link:https://a.dev/x'), false, 'only pins unpin');
   assert.equal(remove(state, 'link:https://a.dev/x'), true);
@@ -151,7 +152,11 @@ test('the runner keeps a thread\'s highlights from its events, pins from the too
 
   const tools = buildThreadbearTools(h.runner, thread.id);
   const pin = tools.find((t) => t.name === 'pin')!;
-  const res = await pin.handler({ path: 'mock.html', note: 'Pick a layout', show: true } as never, {} as never);
+  // With show it waits a moment for the app to show it (show-panel.test.ts).
+  const showing = pin.handler({ path: 'mock.html', note: 'Pick a layout', show: true } as never, {} as never);
+  await tick();
+  h.clock.advance(PANEL_ACK_WAIT_MS);
+  const res = await showing;
   assert.equal(res.isError, undefined, JSON.stringify(res));
   assert.doesNotMatch(JSON.stringify(res), /has scripts/, 'a page without scripts gets no warning');
   // One that draws itself is blank in the Mac app's static preview: say so.
@@ -165,7 +170,7 @@ test('the runner keeps a thread\'s highlights from its events, pins from the too
   assert.deepEqual(checkSummary(after as never), []);
   assert.ok(after.highlightsAt);
   const pinned = h.runner.highlights(thread.id).highlights[0]!;
-  assert.deepEqual([pinned.how, pinned.note, pinned.show], ['pinned', 'Pick a layout', true]);
+  assert.deepEqual([pinned.how, pinned.note, pinned.show], ['pinned', 'Pick a layout', undefined]);
 
   h.runner.removeHighlight(thread.id, 'pr:https://github.com/mikecann/app/pull/3');
   assert.deepEqual(h.runner.highlights(thread.id).highlights.map((x) => x.kind), ['file']);

@@ -30,8 +30,9 @@ import { extForMediaType, sniffImage } from './media.ts';
 import { makeFunctionReference } from 'convex/server';
 import type { Clock, TimerHandle } from './clock.ts';
 import type { Logger } from './log.ts';
-import { agentsStillWorking, ARCHIVE_VERDICTS, ErrorCode, isEffortLevel } from './protocol.ts';
-import type { Account, ArchiveVerdict, ApprovalDecision, ApprovalOption, AskAnswer, EffortLevel, ImageRef, OpenAsk, PersistedEvent, Project, Question, Schedule, ThreadSummary } from './protocol.ts';
+import { agentsStillWorking, ARCHIVE_VERDICTS, ErrorCode, isEffortLevel, remoteCreateModeOf } from './protocol.ts';
+import type { Account, ArchiveVerdict, ApprovalDecision, ApprovalOption, AskAnswer, EffortLevel, ImageRef, OpenAsk, PermissionMode, PersistedEvent, Project, Question, ReplyButton, Schedule, ThreadSummary } from './protocol.ts';
+import { REMOTE_ALLOW_REFUSED, remoteCardShowsAll, summaryField } from './tools.ts';
 import type { Notification } from './runner.ts';
 import type { ScheduleBackend, StoredSchedule } from './schedules.ts';
 import { followSchedules } from './schedule-follow.ts';
@@ -44,6 +45,11 @@ import { Scrubber, type ScrubStatus } from './scrub.ts';
 import { scrubEveryString } from './redaction.ts';
 import { withholdReason } from './withhold.ts';
 import { BodyCollector, prepareBody, type BodyDoc, type RawBody } from './full-sync.ts';
+import { cutSafely } from './safe-cut.ts';
+import { siteOf } from './convex-admin.ts';
+import { credentialUrlProblem } from './secure-url.ts';
+// How soon what the backend left out of a closed thread id goes again.
+const CLOSED_RETRY_MS = 30_000;
 // A `call` for files.list answers with at most this many entries (the backend keeps it a day).
 const CALL_ENTRIES = 500;
 
@@ -87,6 +93,10 @@ export const USAGE_COPY_MS = 10 * 60_000;
 // thread's patch links load a moment after the runner starts, so comparing at
 // once sees every thread with links as changed (464 of Mike's 716, each start).
 export const SETTLE_MS = 20_000;
+// linkSent's "the mirror's link isn't known": never a slug.
+const LINK_UNKNOWN = '?';
+// How often a row whose thread's messages are held for it is tried again.
+export const ROW_RETRY_MS = 60_000;
 // How often what's been sent is saved (sync-cache.ts), and on stopping.
 const CACHE_SAVE_MS = 30_000;
 const BACKOFF_MIN_MS = 5000;
@@ -99,6 +109,10 @@ const ALL: ('inbox' | 'snoozed' | 'archived')[] = ['inbox', 'snoozed', 'archived
 export type SyncConfig = {
   enabled: boolean;
   url?: string;
+  site?: string;
+  // Why runner.json's (or THREADBEAR_SYNC_URL's) url wasn't used (config.ts):
+  // the off reason in place of "no sync.url".
+  urlRefused?: string;
   name?: string;
   runnerId?: string;
   icon?: string;
@@ -115,7 +129,14 @@ export type SyncConfig = {
 // lower one means its backend hasn't been deployed since this runner was:
 // said in runner.status, tb status and the log rather than stopping, since
 // the runner only adds to what it sends while the number stays the same.
-export const BACKEND_API_VERSION = 57;
+export const BACKEND_API_VERSION = 63;
+// From this one sync:sharedThreads lists a runner's rows shared by link, which
+// it checks against its own threads on every start and every
+// SHARE_RECONCILE_MS (reconcileShares).
+export const SHARED_THREADS_API_VERSION = 60;
+// How often the shared rows are checked again while the runner keeps running:
+// a stop or a delete the mirror missed doesn't wait for the next start.
+export const SHARE_RECONCILE_MS = 60 * 60_000;
 // From this one a runner key's archived threads stay in the sidebar table, so
 // those an older backend dropped go again, once (thread-index.ts resendArchived).
 export const ARCHIVED_INDEX_API_VERSION = 54;
@@ -124,6 +145,8 @@ export const ARCHIVED_INDEX_API_VERSION = 54;
 // pending approval carries its event's seq (docs/protocol.md, "Other
 // runners' threads through the backend").
 export const RELAY_API_VERSION = 44;
+// Pictures in a message to another runner's thread (relay.ts, relay:queueCommand's images).
+export const RELAY_PICTURES_API_VERSION = 63;
 // From this one the Mac app's Runners panel can ask for every runner's machine
 // figures (runners.stats): sync:watchRunnersFromMac and sync:runnerStatsList,
 // on top of the website's runnerStats rows (API 45).
@@ -171,6 +194,10 @@ export function sharedUsageArgs<K>(key: K, runnerId: string | undefined, backend
 // bullets), so the phone shows end-of-turn cards. An older backend's
 // validators would turn the write down, so it gets them without.
 export const ASKS_API_VERSION = 14;
+// From this one an ask on that card keeps its optionNotes (what each answer
+// does), so the relay's card on a Mac draws them; an older backend's
+// validator doesn't know the field, so it gets the asks without.
+export const OPTION_NOTES_API_VERSION = 61;
 // From this backend version a project's picture goes up to file storage
 // (sync:iconUploadUrl, sync:setProjectIcon); an older backend gets the
 // project without it and the phone shows its symbol or first letter.
@@ -234,6 +261,8 @@ export const LINKS_API_VERSION = 28;
 // (sync:otherRunnersList and sync:threadIndexSince), rather than read whole
 // on every change.
 export const INDEX_SINCE_API_VERSION = 29;
+// sync:runnerOrder and sync:setRunnerOrder, for the Mac's Settings > Runners.
+export const RUNNER_ORDER_API_VERSION = 58;
 // Only the projects that changed go up (sync:upsertProjects), after the
 // whole list once per start.
 export const PROJECTS_DIFF_API_VERSION = 30;
@@ -259,6 +288,11 @@ export const INDEX_ASKED_API_VERSION = 32;
 // phone's "6 min later · Mine the repo finished" divider. An older
 // backend's validator would turn the row down, so it goes without.
 export const WOKE_BY_API_VERSION = 33;
+// From this one a message row whose text links button:<id> carries those
+// buttons' state (docs/protocol.md, "Reply buttons"), sent again when one is
+// pressed, and the phone can queue a `press` command. An older backend's
+// validator would turn the row down, so it goes without.
+export const BUTTONS_API_VERSION = 59;
 // From this one a thread row's pendingApproval can be a secret (docs/protocol.md,
 // "Secrets"), answered with phone:secret. An older backend's validator would
 // turn the whole row down, so it goes without the card.
@@ -278,6 +312,7 @@ export type SyncStatus = {
   state: 'off' | 'ok' | 'error';
   reason?: string; // why it's off
   url?: string;
+  site?: string; // the website: sync.site, else the .convex.site twin of url
   runnerId?: string;
   name?: string;
   threads?: number; // rows written since start
@@ -299,6 +334,9 @@ export type SyncStatus = {
   // The backend says RUNNER_KEY_NEXT is still set (the owner key only hears
   // it): a rotation (tb runner rotate-owner) waiting for --finish.
   ownerKeyRotating?: boolean;
+  // The backend can't send phone notifications at all (convex/pushHealth.ts
+  // pushOff): a self-hosted backend, where the push relay doesn't reach.
+  pushOff?: boolean;
   // Schedules a runner key couldn't put in the backend, so all of them stay
   // in this runner's schedules.json (schedules.ts heldLocal; the log says which).
   schedulesHeld?: number;
@@ -368,12 +406,35 @@ export type ThreadDoc = {
 // An open ask as the phone sees it (convex/schema.ts): no `where`, which the
 // paragraph already says, and only web links, as a file on the Mac can't
 // be opened from the phone.
-export type PhoneAsk = { action: string; why?: string; reply?: string; options?: string[]; suggested?: number; links?: { title: string; url: string }[]; ticked?: boolean };
+export type PhoneAsk = { action: string; why?: string; reply?: string; options?: string[]; optionNotes?: string[]; suggested?: number; links?: { title: string; url: string }[]; ticked?: boolean };
 
 // A text message, or one line for a tool call (role "tool", since backend
 // API 2): what the phone and the website show of a thread.
 export type WokeByDoc = { kind: string; description: string };
-export type MessageDoc = { threadId: string; seq: number; role: 'user' | 'assistant' | 'tool'; text: string; origin?: string; toolKind?: string; summary?: true; turn?: string; wokeBy?: WokeByDoc[]; at: string; pagedAt?: number };
+export type MessageDoc = { threadId: string; seq: number; role: 'user' | 'assistant' | 'tool'; text: string; origin?: string; toolKind?: string; summary?: true; turn?: string; wokeBy?: WokeByDoc[]; buttons?: MessageButton[]; at: string; pagedAt?: number };
+// A reply button as a message row carries it (API 59): enough to draw it
+// and say where it goes, never its brief or message, which stay on the Mac.
+// target: the new thread's folder name, or the title of the thread it messages.
+export type MessageButton = { id: string; title: string; kind: 'start' | 'send'; target?: string; pressedThreadId?: string; failed?: string };
+
+// The button ids an assistant message links, as [title](button:<id>).
+export function linkedButtonIds(text: string): string[] {
+  const ids = new Set<string>();
+  for (const m of text.matchAll(/\]\(button:([a-z0-9]{8})\)/g)) ids.add(m[1]!);
+  return [...ids];
+}
+
+export function messageButton(b: ReplyButton): MessageButton {
+  const target = b.start ? path.basename(b.start.cwd) : b.send?.threadTitle;
+  return {
+    id: b.id,
+    title: b.title,
+    kind: b.start ? 'start' : 'send',
+    ...(target ? { target } : {}),
+    ...(b.pressed ? { pressedThreadId: b.pressed.threadId } : {}),
+    ...(b.failed && !b.pressed ? { failed: b.failed.error } : {}),
+  };
+}
 
 // What woke each turn the CLI started itself (turn.started's wokeBy), held
 // until that turn's first message row takes it. Rows are what the phone
@@ -384,7 +445,7 @@ export class WokeRows {
   see(e: PersistedEvent): void {
     if (e.type === 'turn.started' && e.wokeBy?.length) {
       // A few short lines: a shell's description can be its whole command.
-      this.pending.set(e.turnId, e.wokeBy.slice(0, 5).map((t) => ({ kind: t.kind, description: t.description.slice(0, 200) })));
+      this.pending.set(e.turnId, e.wokeBy.slice(0, 5).map((t) => ({ kind: t.kind, description: cutSafely(t.description, 200) })));
     } else if (e.type === 'turn.completed') {
       this.pending.delete(e.turnId);
     }
@@ -415,6 +476,10 @@ export type RunnerStatsRow = {
   os?: string;
 };
 const STATS_WATCH_EVERY_MS = 20_000;
+// Rows remembered for the buttons they link, and how far back a press looks
+// for one it doesn't remember (a thread keeps its last 200 buttons).
+const BUTTON_ROWS = 500;
+const BUTTON_SCAN_EVENTS = 5000;
 
 export type Post = (kind: 'mutation' | 'query', fn: string, args: Record<string, unknown>) => Promise<unknown>;
 
@@ -450,6 +515,9 @@ type Host = {
   listProjects?: () => Project[];
   listSchedules?: () => Schedule[];
   listAccounts?: () => Account[];
+  // The thread's reply buttons (buttons.list); absent in small tests, and
+  // then no row carries any.
+  buttons?: (threadId: string) => ReplyButton[];
 };
 
 // What the phone's commands are applied through: the runner's own
@@ -460,18 +528,24 @@ type Host = {
 export type CommandHost = {
   // origin: absent for a message Mike sent from the main Mac (a command `from: "mac"`).
   send(threadId: string, text: string, images: ImageRef[], opts: { origin?: 'phone'; answers?: AskAnswer[] }): unknown;
-  respondApproval(p: { threadId: string; approvalId: string; decision: ApprovalDecision; message?: string; answers?: Record<string, string> }): unknown;
+  respondApproval(p: { threadId: string; approvalId: string; decision: ApprovalDecision; message?: string; answers?: Record<string, string>; remote?: boolean }): unknown;
   answerSecret(p: { threadId: string; approvalId: string; secret?: string; decline?: boolean }): unknown;
   update(p: { threadId: string; title?: string; snoozedUntil?: string | null; archived?: boolean; verdict?: ArchiveVerdict; starred?: boolean }): unknown;
+  // Hibernate in Mike's words (threads.hibernateWhen): a `snooze: { said }` update from the main Mac.
+  hibernateWhen?(p: { threadId: string; said: string }): unknown;
   // Seen up to the last event it has.
   markSeen(threadId: string): unknown;
-  create(p: { text: string; images?: ImageRef[]; cwd?: string; accountId?: string; model?: string; effort?: EffortLevel; permissionMode?: 'ask' | 'full' | 'auto'; origin?: 'phone' }): { thread: ThreadSummary };
+  create(p: { text: string; images?: ImageRef[]; cwd?: string; accountId?: string; model?: string; effort?: EffortLevel; permissionMode?: PermissionMode; origin?: 'phone' }): { thread: ThreadSummary };
   // Stops the thread's turn (a command from the main Mac, API 44).
   interrupt?(threadId: string): unknown;
   share(threadId: string, p: { access: 'off' | 'link'; newLink?: boolean }): unknown;
   quickAsk(p: { question: string; answer: string; sources?: { title: string; url: string }[]; askedAt?: number }): { thread: ThreadSummary };
   // The website's Pause, Resume and Run now (API 45). Absent in small tests.
   schedule?: (p: { scheduleId: string; action: 'pause' | 'resume' | 'run' }) => unknown;
+  // A reply button's press from the phone or website (API 59), buttons.press.
+  pressButton?: (threadId: string, buttonId: string) => unknown;
+  // The phone's slash command palette (API 62): threads.commands.
+  threadCommands?: (threadId: string) => unknown;
 };
 
 export type SyncDeps = {
@@ -527,7 +601,20 @@ export type SyncDeps = {
   // What takes secrets out of everything sent (src/scrub.ts). Left out, the
   // shape rules alone: there's always a scrubber on the way up.
   scrubber?: Scrubber;
+  // A thread finishing its turn on the release that handed over to this one
+  // (handover.ts, peers.owns): not here yet, but not gone either, so its row
+  // isn't taken out of the mirror for being missing; and all of those, for a
+  // full write's prune. Absent in small tests.
+  elsewhere?: (threadId: string) => boolean;
+  elsewhereIds?: () => string[];
 };
+
+// How long a row whose thread isn't here (and that wasn't deleted here) waits
+// before it's taken out of the mirror: a thread between two releases (a
+// draining one whose connection dropped is let go of before its threads are
+// taken in) isn't here for a few seconds, and removing its row takes its
+// messages with it.
+export const MISSING_GRACE_MS = 2 * 60_000;
 
 // What tb status and the app say while the backend turns this runner's
 // key down (keyRejected). Every minute's heartbeat is still tried, so it
@@ -545,13 +632,22 @@ export function keyRejected(e: unknown): boolean {
 
 // POST /api/mutation or /api/query on a Convex deployment, the plain HTTP
 // API, so a write needs no client and a fake is one function.
+//
+// Every body has the runner key in it, so: only to an https URL, or plain
+// http to this Mac (config.ts already turns sync off for any other, this
+// is for any caller that didn't go through it), and never a redirect, as
+// fetch sends a 307's or 308's body on to wherever it points. Convex's
+// /api/mutation and /api/query answer without one.
 export function convexPoster(url: string, fetchFn: typeof fetch = fetch): Post {
   const base = url.replace(/\/+$/, '');
+  const problem = credentialUrlProblem(base);
   return async (kind, fn, args) => {
+    if (problem) throw new Error(`The sync URL ${problem}.`);
     const res = await fetchFn(`${base}/api/${kind}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: fn, args, format: 'json' }),
+      redirect: 'error',
       signal: AbortSignal.timeout(POST_TIMEOUT_MS),
     });
     const body = (await res.json().catch(() => undefined)) as { status?: string; value?: unknown; errorMessage?: string; errorData?: unknown } | undefined;
@@ -603,10 +699,14 @@ export function forbiddenText(e: unknown): string | undefined {
 }
 
 // File storage's upload URL takes a plain POST of the bytes and answers
-// `{ storageId }`.
+// `{ storageId }`. The URL is the backend's, a one-use ticket with no key
+// in it, but the bytes are a thread's pictures: the same rule as the
+// poster's, https or this Mac, and no redirects.
 export function convexUploader(fetchFn: typeof fetch = fetch): Upload {
   return async (url, bytes, mediaType) => {
-    const res = await fetchFn(url, { method: 'POST', headers: { 'Content-Type': mediaType }, body: bytes, signal: AbortSignal.timeout(POST_TIMEOUT_MS) });
+    const problem = credentialUrlProblem(url);
+    if (problem) throw new Error(`The upload URL ${problem}.`);
+    const res = await fetchFn(url, { method: 'POST', headers: { 'Content-Type': mediaType }, body: bytes, redirect: 'error', signal: AbortSignal.timeout(POST_TIMEOUT_MS) });
     const body = (await res.json().catch(() => undefined)) as { storageId?: unknown } | undefined;
     // The upload route refusing (403: a used or dead ticket, or over the
     // allowance; 413: too big) won't change on a retry: said as a refusal
@@ -682,7 +782,9 @@ function threadView(t: Pick<ThreadSummary, 'archivedAt' | 'snoozedUntil' | 'star
   return t.snoozedUntil && Date.parse(t.snoozedUntil) > now ? 'hibernating' : 'inbox';
 }
 
-export function toThreadDoc(t: ThreadSummary, runnerId: string, now: number, pending?: PendingApproval, earliestSeq?: number, next?: string[]): ThreadDoc {
+// `scrub`: the sync's scrubber, for what's made here from longer text and cut
+// (the wake note), which is scrubbed whole before it's cut.
+export function toThreadDoc(t: ThreadSummary, runnerId: string, now: number, pending?: PendingApproval, earliestSeq?: number, next?: string[], scrub?: (text: string) => string): ThreadDoc {
   const doc: ThreadDoc = {
     threadId: t.id,
     runnerId,
@@ -703,7 +805,7 @@ export function toThreadDoc(t: ThreadSummary, runnerId: string, now: number, pen
   if (t.snoozedUntil) doc.snoozedUntil = t.snoozedUntil;
   if (t.snoozedUntilRestart) doc.snoozedUntilRestart = true;
   // What it waits for, when it's more than a time (wake-note.ts): the row says it.
-  const note = wakeNote(t);
+  const note = wakeNote(t, scrub);
   if (note) doc.wakeNote = note;
   if (t.woke) doc.woke = { ...t.woke };
   // Not the thread it came from: the phone's row has no tooltip to name it.
@@ -754,6 +856,8 @@ export function toPhoneAsk(a: OpenAsk): PhoneAsk {
   if (a.reply) out.reply = a.reply;
   if (a.options?.length) {
     out.options = a.options;
+    // One per option, or none: the app drops a list that doesn't line up.
+    if (a.optionNotes?.length === a.options.length && a.optionNotes.some(Boolean)) out.optionNotes = a.optionNotes;
     if (a.suggested !== undefined) out.suggested = a.suggested;
   }
   const links = a.links?.filter((l) => /^https?:\/\//i.test(l.url));
@@ -781,7 +885,7 @@ function phoneAnswers(raw: unknown): AskAnswer[] | undefined {
 export function forBackend(d: ThreadDoc, v: number, now: number): ThreadDoc {
   const asks = d.asks !== undefined || d.asksSeq !== undefined || d.next !== undefined;
   const sections = d.needs !== undefined || d.pendingReviews !== undefined || d.waitingForRoom !== undefined;
-  if ((v >= SHARE_API_VERSION || !d.share) && (v >= WOKE_API_VERSION || !d.woke) && (v >= ASKS_API_VERSION || !asks) && (v >= SECTIONS_API_VERSION || !sections) && (v >= STARTED_BY_API_VERSION || !d.startedBy) && (v >= STARS_API_VERSION || !d.starredAt) && (v >= LINKS_API_VERSION || !d.links) && (v >= ASKED_API_VERSION || !d.asked) && (v >= WAKE_NOTE_API_VERSION || !d.wakeNote) && (v >= NETWORK_WAIT_API_VERSION || !d.waitingForNetwork) && (v >= SECRETS_API_VERSION || d.pendingApproval?.kind !== 'secret') && (v >= RELAY_API_VERSION || d.pendingApproval?.seq === undefined)) return d;
+  if ((v >= SHARE_API_VERSION || !d.share) && (v >= WOKE_API_VERSION || !d.woke) && (v >= ASKS_API_VERSION || !asks) && (v >= OPTION_NOTES_API_VERSION || !d.asks?.some((a) => a.optionNotes)) && (v >= SECTIONS_API_VERSION || !sections) && (v >= STARTED_BY_API_VERSION || !d.startedBy) && (v >= STARS_API_VERSION || !d.starredAt) && (v >= LINKS_API_VERSION || !d.links) && (v >= ASKED_API_VERSION || !d.asked) && (v >= WAKE_NOTE_API_VERSION || !d.wakeNote) && (v >= NETWORK_WAIT_API_VERSION || !d.waitingForNetwork) && (v >= SECRETS_API_VERSION || d.pendingApproval?.kind !== 'secret') && (v >= RELAY_API_VERSION || d.pendingApproval?.seq === undefined)) return d;
   const out = { ...d };
   if (v < SECTIONS_API_VERSION) {
     delete out.needs;
@@ -804,6 +908,9 @@ export function forBackend(d: ThreadDoc, v: number, now: number): ThreadDoc {
     // That backend's phones have no Starred section to show it in.
     delete out.starredAt;
     out.view = threadView(out, now);
+  }
+  if (v < OPTION_NOTES_API_VERSION && out.asks?.some((a) => a.optionNotes)) {
+    out.asks = out.asks.map(({ optionNotes: _notes, ...a }) => a);
   }
   if (v < ASKS_API_VERSION) {
     delete out.asks;
@@ -875,12 +982,8 @@ export function toolLine(e: { name: string; kind: string; title: string; input: 
 // One line of a tool's input for the approval card: the command, the
 // path, or the first short string in it. Never the whole input.
 export function inputSummary(input: Record<string, unknown>, scrub: (text: string) => string = (t) => t): string | undefined {
-  for (const k of ['command', 'file_path', 'path', 'url', 'pattern', 'query']) {
-    const v = input[k];
-    if (typeof v === 'string' && v.trim()) return shortLine(scrub(v));
-  }
-  for (const v of Object.values(input)) if (typeof v === 'string' && v.trim()) return shortLine(scrub(v));
-  return undefined;
+  const v = summaryField(input);
+  return v === undefined ? undefined : shortLine(scrub(v));
 }
 
 function shortLine(s: string): string {
@@ -1037,11 +1140,32 @@ export class ConvexSync {
   // Rows on their way, by digest: a row marked meanwhile is compared with what
   // it's about to be, not what it was. Otherwise X, then back to what `sent`
   // has while X is on its way, looks like nothing to do and leaves X there.
-  private writing = new Map<string, string>();
+  // Each says which write it's for, and a write takes out only its own: a
+  // flush that failed after letting go of the row writer (rowTurn) used to
+  // clear them all, a share link writeRowNow had on its way among them, and
+  // Stop sharing straight after looked like nothing new, so the link stayed
+  // public (Daybreak, 6 Nov).
+  private writing = new Map<string, { digest: string; by: symbol }>();
   private seeded = false;
+  // The mirror's shared rows are checked against this runner's threads
+  // (reconcileShares) on every start, cached or not, and every
+  // SHARE_RECONCILE_MS: a stop or a delete it never got (written while sync
+  // was off, or lost to a crash between the write landing and it being
+  // remembered) leaves a link anyone with the slug can still read.
+  private sharesDue = true;
+  private sharesCheckedAt = -Infinity;
+  // Rows whose thread isn't here, since when (dropRow), until MISSING_GRACE_MS says it's gone.
+  private missing = new Map<string, number>();
+  private missingTimer?: TimerHandle;
   private messages: MessageDoc[] = [];
   private woke = new WokeRows();
+  // "<threadId> <buttonId>" -> the row that links it, as last sent, so a press
+  // sends that row again with the new state (onButton). Newest kept.
+  private buttonRows = new Map<string, MessageDoc>();
   private pending = new Map<string, PendingApproval>(); // threadId -> what it waits on
+  // The row has room for one card, the newest. Subagents' can be open
+  // together and for a long time, so the rest wait here for it to close.
+  private cardsBehind = new Map<string, PendingApproval[]>();
   private earliest = new Map<string, number | null>(); // threadId -> seq of its first text message (null: none yet)
   private nexts = new Map<string, { lastSeq: number; next?: string[] }>(); // threadId -> its done card's next steps, as of lastSeq
   private lists: { projects?: Project[]; schedules?: Schedule[]; accounts?: Account[] } = {};
@@ -1070,6 +1194,21 @@ export class ConvexSync {
   // ones no longer shared, whose pictures the mirror drops; pictures waiting
   // to go up; and what's up already, per thread, as "seq path".
   private sharedNow = new Map<string, boolean>();
+  // The link each thread's row had in the mirror as last written there, by
+  // slug ('?' when a write that may have landed left it unknown; none when
+  // the row isn't shared). A thread whose row is behind (shared there by a
+  // link it isn't shared by here any more) has its messages held back until
+  // the row catches up: share:view reads the mirror's row, and a message
+  // going first was readable through a link Mike had already stopped
+  // (Daybreak, 8 Nov: a Stop sharing in the 20 s settle after a start).
+  private linkSent = new Map<string, string>();
+  // Ones whose messages were held back like that: their whole history goes
+  // again once the row is up (histories()).
+  private heldForRow = new Set<string>();
+  private historiesDue = false;
+  // Their rows tried again every ROW_RETRY_MS while held: one the backend
+  // left out isn't written again till the thread next changes.
+  private rowRetryTimer?: TimerHandle;
   private imagesDue = new Set<string>();
   private imagesDrop = new Set<string>();
   private pendingImages: (ShareImage & { threadId: string })[] = [];
@@ -1116,6 +1255,7 @@ export class ConvexSync {
   private restartAsked = false;
   private picturesPausedUntil?: number;
   private ownerKeyRotating = false;
+  private pushOff = false;
   private pushFailing: PushFailing | undefined;
   private schedulesRefused = false;
   private scrubber: Scrubber;
@@ -1133,7 +1273,7 @@ export class ConvexSync {
     this.name = deps.config.name ?? defaultRunnerName();
     const { enabled, url } = deps.config;
     if (!enabled) this.off = 'sync.enabled is false';
-    else if (!url) this.off = 'no sync.url in runner.json';
+    else if (!url) this.off = deps.config.urlRefused ?? 'no sync.url in runner.json';
     else if (!deps.key) this.off = 'no secrets/convex-key';
     this.scrubber = deps.scrubber ?? new Scrubber({ env: {}, folders: false });
     // The one way up: every mutation, the sidebar table's and the scheduler's
@@ -1189,6 +1329,7 @@ export class ConvexSync {
         takesStars: () => (this.backendApiVersion ?? 0) >= STARS_API_VERSION,
         takesAsked: () => (this.backendApiVersion ?? 0) >= INDEX_ASKED_API_VERSION,
         takesSince: () => (this.backendApiVersion ?? 0) >= INDEX_SINCE_API_VERSION,
+        takesOrder: () => (this.backendApiVersion ?? 0) >= RUNNER_ORDER_API_VERSION,
         seed: () => {
           const file = deps.cachePath;
           const url = deps.config.url;
@@ -1198,6 +1339,7 @@ export class ConvexSync {
           return at && deps.clock.now() - at.at < SYNC_CACHE_MAX_AGE_MS ? at : undefined;
         },
         onSent: () => this.noteSent(),
+        ...(deps.elsewhere ? { elsewhere: deps.elsewhere } : {}),
         ...(deps.appConnected ? { appConnected: deps.appConnected } : {}),
       });
     }
@@ -1210,11 +1352,25 @@ export class ConvexSync {
     this.projectsSent = undefined;
     this.accountsSent = undefined;
     this.full = true;
+    this.sharesDue = true;
     this.seedFromCache();
     this.unsub = this.deps.runner.onNotification((n) => this.onNotification(n));
+    // A thread ever shared has its row written now, settling or not, and its
+    // messages wait for it: what the mirror has of its link isn't known
+    // until then (a crash between a write landing and the file saying so, a
+    // stop while sync was off), and the file only holds a digest.
+    this.linkSent.clear();
+    this.heldForRow.clear();
+    for (const t of this.deps.runner.list(ALL)) {
+      if (!t.share) continue;
+      this.linkSent.set(t.id, LINK_UNKNOWN);
+      this.sent.delete(t.id);
+      this.lastWrite.delete(t.id);
+    }
     if (this.seeded) {
       this.settling = true;
       this.settleTimer = this.deps.clock.setTimeout(() => this.settled(), SETTLE_MS);
+      for (const t of this.deps.runner.list(ALL)) if (t.share) this.mark(t, true);
     } else for (const t of this.deps.runner.list(ALL)) this.mark(t);
     this.lists = {
       projects: this.deps.runner.listProjects?.(),
@@ -1247,6 +1403,10 @@ export class ConvexSync {
     this.presenceTimer?.cancel();
     this.settleTimer?.cancel();
     this.settling = false;
+    this.rowRetryTimer?.cancel();
+    this.rowRetryTimer = undefined;
+    this.missingTimer?.cancel();
+    this.missingTimer = undefined;
     this.heldTimer?.cancel();
     this.projectsTimer?.cancel();
     this.accountsTimer?.cancel();
@@ -1305,6 +1465,7 @@ export class ConvexSync {
     const s: SyncStatus = {
       state: this.lastError && this.retryAt !== undefined ? 'error' : 'ok',
       url: this.deps.config.url,
+      ...(this.site() ? { site: this.site() } : {}),
       runnerId: this.runnerId,
       name: this.name,
       threads: this.written,
@@ -1317,6 +1478,7 @@ export class ConvexSync {
     if (this.retryAt !== undefined) s.retryAt = new Date(this.retryAt).toISOString();
     if (this.backendApiVersion !== undefined) s.backend = { apiVersion: this.backendApiVersion, expected: BACKEND_API_VERSION };
     if (this.ownerKeyRotating) s.ownerKeyRotating = true;
+    if (this.pushOff) s.pushOff = true;
     if (this.pushFailing) s.pushFailing = this.pushFailing;
     if (this.keyRejected) {
       s.state = 'error';
@@ -1365,11 +1527,23 @@ export class ConvexSync {
     return this.off ? undefined : this.deps.config.url;
   }
 
+  /** The website's address, while sync is on (src/convex-admin.ts, siteOf). */
+  site(): string | undefined {
+    return this.off ? undefined : siteOf(this.deps.config.url, this.deps.config.site);
+  }
+
   async issueToken(args: { kind: DeviceKind; name: string; days?: number }): Promise<{ id: string; token: string; expiresAt: string }> {
     this.mustBeOn();
     const r = (await this.backend('mutation', 'sync:issueToken', { key: this.deps.key, ...args })) as { id?: unknown; token?: unknown; expiresAt?: unknown } | null;
     if (!r || typeof r.id !== 'string' || typeof r.token !== 'string' || typeof r.expiresAt !== 'string') throw new Error('The backend gave no token back.');
     return { id: r.id, token: r.token, expiresAt: r.expiresAt };
+  }
+
+  /** runners.setOrder: Mike's runner order, the one the phone sets too (API 58). */
+  async setRunnerOrder(runnerIds: string[]): Promise<void> {
+    this.mustBeOn();
+    if ((this.backendApiVersion ?? 0) < RUNNER_ORDER_API_VERSION) throw new Error('The backend is too old for a runner order: it needs deploying.');
+    await this.backend('mutation', 'sync:setRunnerOrder', { key: this.deps.key, runnerIds });
   }
 
   async listTokens(): Promise<Device[]> {
@@ -1508,7 +1682,9 @@ export class ConvexSync {
       this.bodies = this.bodies.filter((b) => !sent.has(b));
       this.bodyQueueChars = this.bodies.reduce((n, b) => n + rawChars(b), 0);
       for (const b of batch) {
-        if (left.has(`${b.threadId}:${b.seq}`)) this.bodyStats.unsent++;
+        // Left out as its thread id is closed: goes again with the retry.
+        if (left.has(`${b.threadId}:${b.seq}`) && this.closedIds.has(b.threadId)) this.closedBodies.push(b);
+        else if (left.has(`${b.threadId}:${b.seq}`)) this.bodyStats.unsent++;
         else if (b.withheld) this.bodyStats.withheld++;
         else this.bodyStats.bodies++;
       }
@@ -1526,7 +1702,7 @@ export class ConvexSync {
       const h = this.bodyCollector.head(id);
       if (h !== undefined) heads[id] = h;
     }
-    for (const b of this.bodies) {
+    for (const b of [...this.bodies, ...this.closedBodies]) {
       const from = (b.from ?? b.seq) - 1;
       if (heads[b.threadId] !== undefined && heads[b.threadId]! > from) heads[b.threadId] = from;
     }
@@ -1616,7 +1792,8 @@ export class ConvexSync {
     const url = (await this.post('mutation', 'sync:iconUploadUrl', { key: this.deps.key })) as string;
     const storageId = await this.upload(url, read.bytes, read.mediaType);
     const { mediaType, width, height } = read;
-    await this.post('mutation', 'sync:addHeldPicture', { key: this.deps.key, threadId, seq, index, storageId, mediaType, ...(width ? { width } : {}), ...(height ? { height } : {}) });
+    const r = await this.post('mutation', 'sync:addHeldPicture', { key: this.deps.key, threadId, seq, index, storageId, mediaType, ...(width ? { width } : {}), ...(height ? { height } : {}) });
+    if ((r as { later?: unknown } | null)?.later === true) throw new Error('That thread is being moved: try again in a moment.');
   }
 
   private async writeRows<T>(fn: string, field: string, rows: T[], idOf: (row: T) => string, extra: Record<string, unknown>): Promise<Set<string>> {
@@ -1652,6 +1829,12 @@ export class ConvexSync {
   // not attach), it's left out with a log line and the rest go on: false.
   // For now ("later": an allowance), it stays queued and pictures pause
   // until PICTURES_PAUSE_MS has passed; the rest of the flush goes on.
+  // An added picture's answer, for picture() above: later means it wasn't
+  // kept, as its thread id's old rows are still going, so it stays queued.
+  private pictureKept(r: unknown): void {
+    if ((r as { later?: unknown } | null)?.later === true) throw Object.assign(new Error('its thread is still being cleared'), { data: { kind: 'retryLater' } });
+  }
+
   private async picture(fn: string, what: string, send: () => Promise<void>): Promise<'sent' | 'dropped' | 'later'> {
     try {
       await send();
@@ -1675,7 +1858,57 @@ export class ConvexSync {
     return false;
   }
 
+  // Thread ids the backend said are closed this flush: a removed or moving
+  // thread's old rows are still going (convex/sync.ts clearThread), so what
+  // it left out of them goes again shortly, whatever went after it.
+  // What waits for the retry, held out of the ordinary flushes, which come
+  // every couple of seconds while anything's waiting: rows by id (as the
+  // thread is then, if it's still here), tool output (still holding back
+  // bodyHeads), and threads whose history goes again.
+  private closedIds = new Set<string>();
+  private closedRows = new Set<string>();
+  private closedBodies: RawBody[] = [];
+  private closedHistories = new Set<string>();
+  private closedTimerSet = false;
+  private closedRetryDue = false;
+
+  private retryClosedLater(): void {
+    if (this.closedTimerSet) return;
+    this.closedTimerSet = true;
+    this.deps.clock.setTimeout(() => {
+      this.closedTimerSet = false;
+      if (!this.running) return;
+      for (const id of this.closedRows) {
+        try {
+          this.mark(this.deps.runner.get(id), true);
+        } catch {
+          // Deleted meanwhile: nothing to write, and its removal is on its way.
+        }
+      }
+      this.closedRows.clear();
+      // Only a thread that's still here: writing one that's gone would bring its tool output back.
+      const here = (b: RawBody) => {
+        try {
+          return Boolean(this.deps.runner.get(b.threadId));
+        } catch {
+          return false;
+        }
+      };
+      this.bodies.push(...this.closedBodies.filter(here));
+      this.closedBodies = [];
+      this.bodyQueueChars = this.bodies.reduce((n, b) => n + rawChars(b), 0);
+      this.closedHistories.clear();
+      this.closedRetryDue = true;
+      this.scheduleFlush();
+    }, CLOSED_RETRY_MS);
+  }
+
   private noteSkipped(fn: string, r: unknown): string[] {
+    const closed = (r as { closed?: unknown } | null)?.closed;
+    if (Array.isArray(closed)) {
+      for (const id of closed) if (typeof id === 'string') this.closedIds.add(id);
+      if (closed.length) this.retryClosedLater();
+    }
     const skipped = (r as { skipped?: unknown } | null)?.skipped;
     if (!Array.isArray(skipped) || !skipped.length) return [];
     this.deps.log.warn('the backend left rows out, over what this runner\'s key may write', { fn, rows: skipped.slice(0, 20), count: skipped.length });
@@ -1714,14 +1947,16 @@ export class ConvexSync {
         this.lastWrite.delete(id);
         this.heads.delete(id);
         this.noteSent();
-        this.pending.delete(id);
+        this.forgetCards(id);
         this.earliest.delete(id);
         this.nexts.delete(id);
+        for (const k of [...this.buttonRows.keys()]) if (k.startsWith(`${id} `)) this.buttonRows.delete(k);
         this.replyDue.delete(id);
         this.replyUp.delete(id);
         this.pendingReplyImages = this.pendingReplyImages.filter((i) => i.threadId !== id);
         this.bodyCollector.forget(id);
         this.bodies = this.bodies.filter((b) => b.threadId !== id);
+        this.closedBodies = this.closedBodies.filter((b) => b.threadId !== id);
         this.bodyQueueChars = this.bodies.reduce((n, b) => n + rawChars(b), 0);
         this.removed.add(id);
         this.scheduleFlush();
@@ -1797,6 +2032,10 @@ export class ConvexSync {
         this.scrubber.known.lookSoon(dir);
       }
     }
+    if (e.type === 'button.updated') {
+      this.onButton(threadId, e.button);
+      return;
+    }
     const m = toMessageDoc(threadId, e, this.scrubber.safeText);
     if (m) {
       this.messages.push(this.woke.take(m, e));
@@ -1807,11 +2046,25 @@ export class ConvexSync {
       // A request for a thread on another runner (cross-runner.ts) is
       // answered only on the main Mac, whose runner starts it: the phone's
       // card has no buttons and says so, as one too big for the row does.
-      this.pending.set(threadId, { approvalId: e.approvalId, kind: 'approval', seq: e.seq, name: e.name, title: `${e.title} Answer it on the Mac.`, options: [] });
+      this.addCard(threadId, { approvalId: e.approvalId, kind: 'approval', seq: e.seq, name: e.name, title: `${e.title} Answer it on the Mac.`, options: [] });
     } else if (e.type === 'approval.requested') {
-      this.pending.set(threadId, { approvalId: e.approvalId, kind: 'approval', seq: e.seq, name: e.name, title: e.title, options: e.options, ...(inputSummary(e.input, this.scrubber.safeText) ? { inputSummary: inputSummary(e.input, this.scrubber.safeText) } : {}) });
+      // One whose line can't show all it allows offers only Deny there,
+      // and says why; the runner refuses an allow from there anyway
+      // (Runner.respondApproval). An older phone draws the options it's given.
+      const summary = inputSummary(e.input, this.scrubber.safeText);
+      // Scrubbing can take out what a call does (`token="touch x"; eval
+      // "$token"`), so what the line is made from must go up as it is (Codex review).
+      const raw = summaryField(e.input);
+      const shownAsIs = raw === undefined || this.scrubber.safeText(raw) === raw;
+      const whole = shownAsIs && remoteCardShowsAll(e.name, e.input, this.threadCwd(threadId), e.title);
+      this.addCard(threadId, {
+        approvalId: e.approvalId, kind: 'approval', seq: e.seq, name: e.name,
+        title: whole ? e.title : `${e.title}. ${REMOTE_ALLOW_REFUSED}`,
+        options: whole ? e.options : e.options.filter((o) => o !== 'allow' && o !== 'allowAlways'),
+        ...(summary ? { inputSummary: summary } : {}),
+      });
     } else if (e.type === 'question.requested') {
-      this.pending.set(threadId, { approvalId: e.approvalId, kind: 'question', seq: e.seq, questions: e.questions });
+      this.addCard(threadId, { approvalId: e.approvalId, kind: 'question', seq: e.seq, questions: e.questions });
     } else if (e.type === 'secret.requested') {
       // forBackend drops it for a backend older than SECRETS_API_VERSION.
       const box = this.deps.secretBox;
@@ -1823,9 +2076,9 @@ export class ConvexSync {
         this.deps.log.warn('no key for secrets from the phone', { error: String(err) });
         return;
       }
-      this.pending.set(threadId, { approvalId: e.approvalId, kind: 'secret', seq: e.seq, label: e.label, reason: e.reason, ...(e.placeholder ? { placeholder: e.placeholder } : {}), key });
+      this.addCard(threadId, { approvalId: e.approvalId, kind: 'secret', seq: e.seq, label: e.label, reason: e.reason, ...(e.placeholder ? { placeholder: e.placeholder } : {}), key });
     } else if (e.type === 'approval.resolved') {
-      if (this.pending.get(threadId)?.approvalId === e.approvalId) this.pending.delete(threadId);
+      this.closeCard(threadId, e.approvalId);
     } else return;
     try {
       this.mark(this.deps.runner.get(threadId));
@@ -1835,8 +2088,40 @@ export class ConvexSync {
     }
   }
 
+  private addCard(threadId: string, card: PendingApproval): void {
+    const shown = this.pending.get(threadId);
+    if (shown) this.cardsBehind.set(threadId, [...(this.cardsBehind.get(threadId) ?? []), shown]);
+    this.pending.set(threadId, card);
+  }
+
+  private closeCard(threadId: string, approvalId: string): void {
+    const behind = (this.cardsBehind.get(threadId) ?? []).filter((c) => c.approvalId !== approvalId);
+    if (this.pending.get(threadId)?.approvalId === approvalId) {
+      const next = behind.pop();
+      if (next) this.pending.set(threadId, next);
+      else this.pending.delete(threadId);
+    }
+    if (behind.length) this.cardsBehind.set(threadId, behind);
+    else this.cardsBehind.delete(threadId);
+  }
+
+  private forgetCards(threadId: string): void {
+    this.pending.delete(threadId);
+    this.cardsBehind.delete(threadId);
+  }
+
   // Only a change the phone would see makes a write.
+  // The thread's folder, for whether a card's line shows all of it.
+  private threadCwd(threadId: string): string | undefined {
+    try {
+      return this.deps.runner.get(threadId).cwd;
+    } catch {
+      return undefined;
+    }
+  }
+
   private mark(t: ThreadSummary, now_ = false): void {
+    this.missing.delete(t.id);
     if (this.removedFromFile.delete(t.id)) {
       this.removed.delete(t.id);
       this.removing.delete(t.id);
@@ -1844,20 +2129,22 @@ export class ConvexSync {
     // settled() looks at every thread, as they are by then. Not a new one: its
     // row has to go up before it needs Mike, or no push ever fires for it (a
     // push is needsYou going from false to true on a row that's there).
-    if (this.settling && !now_ && this.sent.has(t.id)) return;
+    // Nor one ever shared: a stop or a new link mustn't wait behind the
+    // settle while the thread's new messages go up (linkSent).
+    if (this.settling && !now_ && this.sent.has(t.id) && !t.share && !this.linkSent.has(t.id)) return;
     // Its folder's .env files are what a thread's words are likely to quote.
     if (!t.archivedAt) this.scrubber.known.noteFolder(t.cwd);
     // A thread that isn't waiting any more lost its approval some other
     // way (the turn ended, the runner restarted); the row mustn't keep it.
-    if (t.status === 'idle' || t.status === 'error' || t.status === 'stopped') this.pending.delete(t.id);
+    if (t.status === 'idle' || t.status === 'error' || t.status === 'stopped') this.forgetCards(t.id);
     this.noteShared(t);
-    const doc = toThreadDoc(t, this.runnerId, this.deps.clock.now(), this.pending.get(t.id), this.earliestSeq(t), this.nextSteps(t));
+    const doc = toThreadDoc(t, this.runnerId, this.deps.clock.now(), this.pending.get(t.id), this.earliestSeq(t), this.nextSteps(t), this.scrubber.safeText);
     const now = this.deps.clock.now();
     // Against the row as this backend took it: `sent` holds that, without
     // the fields an older one doesn't know, which would otherwise make every
     // summary of a thread with one look new.
     const row = forBackend(doc, this.backendApiVersion ?? 0, now);
-    if ((this.writing.get(t.id) ?? this.sent.get(t.id)) === digest(JSON.stringify(row))) {
+    if ((this.writing.get(t.id)?.digest ?? this.sent.get(t.id)) === digest(JSON.stringify(row))) {
       this.dirty.delete(t.id);
       this.held.delete(t.id);
       return;
@@ -1879,11 +2166,128 @@ export class ConvexSync {
     this.settleTimer?.cancel();
     this.settleTimer = undefined;
     this.settling = false;
+    // A row the file says the mirror has, for a thread that isn't here (or
+    // finishing on the release before): deleted while this runner wasn't
+    // listening, as with sync turned off. A start from the file skips the
+    // prune a full write does, so it goes now (Daybreak, 6 Nov: a shared
+    // thread deleted with sync off stayed public).
+    const here = new Set(this.deps.runner.list(ALL).map((t) => t.id));
+    for (const id of [...this.sent.keys()]) if (!here.has(id) && !this.deps.elsewhere?.(id)) this.dropRow(id);
     for (const t of this.deps.runner.list(ALL)) this.mark(t);
     this.scheduleFlush();
   }
 
+  // Takes a row out of the mirror that no thread here has, once it has been
+  // missing for MISSING_GRACE_MS and still is: then removed with the next
+  // flush (and kept in the file till it is), unless the thread turns up after
+  // all (mark), when it's written again in full, history and all.
+  private dropRow(threadId: string): void {
+    if (!this.missing.has(threadId)) this.missing.set(threadId, this.deps.clock.now());
+    this.armMissing();
+  }
+
+  private armMissing(): void {
+    if (this.missingTimer || !this.missing.size || !this.running) return;
+    const due = Math.min(...this.missing.values()) + MISSING_GRACE_MS;
+    this.missingTimer = this.deps.clock.setTimeout(() => {
+      this.missingTimer = undefined;
+      this.confirmMissing();
+      this.armMissing();
+    }, Math.max(0, due - this.deps.clock.now()));
+  }
+
+  private confirmMissing(): void {
+    const now = this.deps.clock.now();
+    const here = new Set(this.deps.runner.list(ALL).map((t) => t.id));
+    for (const [id, since] of [...this.missing]) {
+      if (here.has(id) || this.deps.elsewhere?.(id)) {
+        this.missing.delete(id);
+        continue;
+      }
+      if (now - since < MISSING_GRACE_MS) continue;
+      this.missing.delete(id);
+      this.removed.add(id);
+      this.removedFromFile.add(id);
+      this.sent.delete(id);
+      this.heads.delete(id);
+      this.lastWrite.delete(id);
+      this.noteSent();
+    }
+    this.scheduleFlush();
+  }
+
+  // The mirror's rows shared by link, against this runner's threads: one that
+  // isn't here goes, and one here that isn't shared is written again, so
+  // anyone with its slug stops being able to read it whatever went wrong
+  // with the write that stopped it.
+  private async reconcileShares(key: string | undefined): Promise<void> {
+    const ids = await this.post('query', 'sync:sharedThreads', { key, runnerId: this.runnerId });
+    this.sharesDue = false;
+    this.sharesCheckedAt = this.deps.clock.now();
+    for (const id of Array.isArray(ids) ? ids : []) {
+      if (typeof id !== 'string' || this.deps.elsewhere?.(id)) continue;
+      let t: ThreadSummary | undefined;
+      try {
+        t = this.deps.runner.get(id);
+      } catch {
+        t = undefined;
+      }
+      if (!t) {
+        this.dropRow(id);
+        continue;
+      }
+      if (t.share?.access === 'link') continue;
+      this.sent.delete(id);
+      this.lastWrite.delete(id);
+      this.mark(t, true);
+    }
+  }
+
+  // A row carrying a link is on its way: from now the mirror may have that
+  // link (or the one it had), whatever the answer says later, so a stop
+  // straight after holds the thread's messages back even before it's
+  // answered (Codex's review, 8 Nov: a page asked for meanwhile went).
+  private linkOnItsWay(row: ThreadDoc): void {
+    if (row.share?.access !== 'link') return;
+    const was = this.linkSent.get(row.threadId);
+    if (was === undefined) this.linkSent.set(row.threadId, row.share.slug);
+    else if (was !== row.share.slug) this.linkSent.set(row.threadId, LINK_UNKNOWN);
+  }
+
+  // A write of this row may have landed: if it carried a link, or the row
+  // had one, which link the mirror has isn't known till the next write.
+  private linkUnsure(threadId: string, row?: { share?: { access: string } }): void {
+    if (row?.share?.access === 'link' || this.linkSent.has(threadId)) this.linkSent.set(threadId, LINK_UNKNOWN);
+  }
+
+  // The mirror's row shared by a link this thread isn't shared by here (or
+  // may be): its messages wait. One that isn't here any more waits too, for
+  // its row's removal.
+  private rowBehind(threadId: string): boolean {
+    const was = this.linkSent.get(threadId);
+    if (was === undefined) return false;
+    let t: ThreadSummary;
+    try {
+      t = this.deps.runner.get(threadId);
+    } catch {
+      return true;
+    }
+    return !(t.share?.access === 'link' && t.share.slug === was);
+  }
+
+  private sharesCheckDue(): boolean {
+    return this.sharesDue && !this.settling && (this.backendApiVersion ?? 0) >= SHARED_THREADS_API_VERSION;
+  }
+
   private recordSent(row: ThreadDoc): void {
+    // Written, so the mirror's row has this link (or none): replace() takes
+    // out a share the row leaves out.
+    if (row.share?.access === 'link') this.linkSent.set(row.threadId, row.share.slug);
+    else this.linkSent.delete(row.threadId);
+    if (this.heldForRow.has(row.threadId) && !this.rowBehind(row.threadId)) {
+      this.heldForRow.delete(row.threadId);
+      this.historiesDue = true;
+    }
     this.sent.set(row.threadId, digest(JSON.stringify(row)));
     this.lastWrite.set(row.threadId, { at: this.deps.clock.now(), steady: steadyDigest(row) });
     this.noteSent();
@@ -2009,26 +2413,64 @@ export class ConvexSync {
   // row still waiting for the next flush (SYNC_COALESCE_MS) reads to it as
   // a deleted thread. If this write fails, the next flush tries again.
   private async writeRowNow(threadId: string): Promise<void> {
+    const me = Symbol('writeRowNow');
+    let failed = false;
+    let row: ThreadDoc | undefined;
     const done = await this.rowTurn();
     try {
       this.mark(this.deps.runner.get(threadId), true);
       const doc = this.dirty.get(threadId);
       if (!doc) return;
-      const row = forBackend(doc, this.backendApiVersion ?? 0, this.deps.clock.now());
+      row = forBackend(doc, this.backendApiVersion ?? 0, this.deps.clock.now());
       // As a flush's batch is: a change while it's on its way is weighed
       // against this row, not the one before, or one back to that (a share
       // stopped again at once) was dropped as nothing new.
-      this.writing.set(threadId, digest(JSON.stringify(row)));
-      await this.post('mutation', 'sync:upsertThreads', { key: this.deps.key, threads: [row] });
+      this.writing.set(threadId, { digest: digest(JSON.stringify(row)), by: me });
+      this.linkOnItsWay(row);
+      const left = this.noteSkipped('sync:upsertThreads', await this.post('mutation', 'sync:upsertThreads', { key: this.deps.key, threads: [row] }));
+      // Left out (over what a runner key may write, its id's rows still
+      // going): not written, so not what the mirror has (linkSent stays as
+      // it was, and the thread's messages keep waiting if it's behind).
+      // Codex's review, 8 Nov: a Stop sharing left out let messages through.
+      if (left.includes(threadId)) {
+        this.sent.delete(threadId);
+        this.lastWrite.delete(threadId);
+        this.noteSent();
+        return;
+      }
       this.recordSent(row);
       if (this.dirty.get(threadId) === doc) this.dirty.delete(threadId);
       this.written++;
+      if (this.historiesDue) this.scheduleFlush();
     } catch (e) {
+      // It may have landed all the same (an answer lost on the way back), so
+      // what the mirror has is no longer known: the next mark writes, even a
+      // change back to what was sent before (Stop sharing after a link).
+      this.sent.delete(threadId);
+      this.lastWrite.delete(threadId);
+      this.linkUnsure(threadId, row);
+      failed = true;
       this.deps.log.debug('new thread row not written yet', { threadId, error: String(e) });
     } finally {
-      this.writing.delete(threadId);
+      this.doneWriting(threadId, me);
       done();
     }
+    // A change marked while it was on its way was weighed against it and may
+    // have been dropped as the same: the thread as it is now goes with the
+    // next flush (Codex's review, 7 Nov: Stop sharing from the phone failing
+    // while a progress update came in left the link up).
+    if (failed) {
+      try {
+        this.mark(this.deps.runner.get(threadId), true);
+      } catch {
+        // Gone meanwhile: its removal is queued.
+      }
+      this.scheduleFlush();
+    }
+  }
+
+  private doneWriting(threadId: string, by: symbol): void {
+    if (this.writing.get(threadId)?.by === by) this.writing.delete(threadId);
   }
 
   /** Waits for the threads-row writer before this one; call what it returns when done (twice is fine). */
@@ -2224,7 +2666,7 @@ export class ConvexSync {
     // Project pictures waiting (picturesDue) count too: one an upload
     // allowance held back goes once its pause is over, idle or not.
     const picturesWaiting = this.picturesDue && (this.backendApiVersion ?? 0) >= ICONS_API_VERSION && !this.picturesPaused();
-    if (!picturesWaiting && !this.bodies.length && !this.dirty.size && !this.removed.size && !this.messages.length && !this.dirtyLists.size && !this.full && !this.catchUpDue && !this.imagesDue.size && !this.imagesDrop.size && !this.pendingImages.length && !this.replyDue.size && !this.pendingReplyImages.length) return;
+    if (!picturesWaiting && !this.closedRetryDue && !this.bodies.length && !this.dirty.size && !this.removed.size && !this.messages.length && !this.dirtyLists.size && !this.full && !this.catchUpDue && !this.imagesDue.size && !this.imagesDrop.size && !this.pendingImages.length && !this.replyDue.size && !this.pendingReplyImages.length && !this.historiesDue && !this.sharesCheckDue()) return;
     const now = this.deps.clock.now();
     let delay = Math.max(0, this.lastFlushAt + SYNC_COALESCE_MS - now);
     if (this.retryAt !== undefined) delay = Math.max(delay, this.retryAt - now);
@@ -2237,9 +2679,14 @@ export class ConvexSync {
   private async flush(): Promise<void> {
     if (this.flushing || !this.running) return;
     this.flushing = true;
+    const me = Symbol('flush');
+    // The rows of a batch on its way when it failed: they may have landed.
+    let unsure: string[] = [];
     // Before taking the rows, so none is older than one writeRowNow wrote.
     const rowsDone = await this.rowTurn();
     this.lastFlushAt = this.deps.clock.now();
+    this.closedRetryDue = false;
+    this.closedIds.clear();
     const docs = [...this.dirty.values()];
     // Not while settling: a thread the file says went may yet come across.
     this.removing = new Set(this.settling ? [] : this.removed);
@@ -2249,6 +2696,7 @@ export class ConvexSync {
     if (!this.settling) this.removed.clear();
     this.dirtyLists.clear();
     const key = this.deps.key;
+    const removedNow = new Set<string>();
     try {
       // What was written is what's remembered as sent, so a row whose
       // share or woke was held back from an older backend goes again once
@@ -2256,16 +2704,23 @@ export class ConvexSync {
       const v = this.backendApiVersion ?? 0;
       for (let i = 0; i < docs.length; i += SYNC_BATCH) {
         const batch = docs.slice(i, i + SYNC_BATCH).map((d) => forBackend(d, v, this.deps.clock.now()));
-        for (const d of batch) this.writing.set(d.threadId, digest(JSON.stringify(d)));
+        for (const d of batch) {
+          this.writing.set(d.threadId, { digest: digest(JSON.stringify(d)), by: me });
+          this.linkOnItsWay(d);
+        }
+        unsure = batch.map((d) => d.threadId);
         const left = await this.writeRows('sync:upsertThreads', 'threads', batch, (d) => d.threadId, { key });
+        unsure = [];
         // A row left out isn't remembered as sent (nor in the cache kept
         // across starts), so its next change, or the next start, tries it again.
         for (const d of batch) {
-          this.writing.delete(d.threadId);
+          this.doneWriting(d.threadId, me);
           if (!left.has(d.threadId)) this.recordSent(d);
           else {
             this.sent.delete(d.threadId);
             this.lastWrite.delete(d.threadId);
+            // Its id's old rows still going: tried again shortly, not only on its next change.
+            if (this.closedIds.has(d.threadId)) this.closedRows.add(d.threadId);
             this.noteSent();
           }
         }
@@ -2276,8 +2731,13 @@ export class ConvexSync {
         const removed = [...this.removing];
         await this.post('mutation', 'sync:removeThreads', { key, threadIds: removed });
         for (const id of removed) {
+          removedNow.add(id);
           this.removing.delete(id);
           this.removedFromFile.delete(id);
+          // Its messages went with it: one that turns up again gets its whole history.
+          this.filledThreads().delete(id);
+          this.linkSent.delete(id);
+          this.heldForRow.delete(id);
         }
         this.noteSent();
       }
@@ -2309,7 +2769,8 @@ export class ConvexSync {
       }
       if (this.picturesDue && (this.backendApiVersion ?? 0) >= ICONS_API_VERSION) await this.sendPictures();
       if (this.full) {
-        const keep = this.deps.runner.list(ALL).map((t) => t.id);
+        // And those finishing on the release before: their rows aren't stale.
+        const keep = [...new Set([...this.deps.runner.list(ALL).map((t) => t.id), ...(this.deps.elsewhereIds?.() ?? [])])];
         await this.post('mutation', 'sync:prune', { key, runnerId: this.runnerId, keep });
         messages.unshift(...(await this.catchUp()));
         this.full = false;
@@ -2319,6 +2780,9 @@ export class ConvexSync {
         messages.unshift(...this.catchUpFromHeads());
         this.catchUpDue = false;
       }
+      // What it finds is written with the next flush (scheduleFlush, below).
+      if (this.sharesCheckDue()) await this.reconcileShares(key);
+      this.historiesDue = false;
       const { docs: history, threadIds: filling } = this.histories();
       // A new thread's first messages are both live and its history: once each.
       const seen = new Set<string>();
@@ -2330,6 +2794,10 @@ export class ConvexSync {
       });
       const notFilled = await this.appendMessages(messages);
       this.markFilled(filling.filter((id) => !notFilled.has(id)));
+      // A message left out of a closed id: its whole history goes again once
+      // it opens (histories()), as messages after it may have gone up, and
+      // catching up from the newest would never fill the gap.
+      this.markUnfilled([...notFilled].filter((id) => this.closedIds.has(id)));
       if (v >= SHARE_API_VERSION) await this.sendShareImages();
       if (v >= REPLY_IMAGES_API_VERSION) await this.sendReplyImages();
       await this.sendBodies(v);
@@ -2347,12 +2815,22 @@ export class ConvexSync {
       // Not written after all: what's due is the thread as it is now, which may
       // have moved on from what failed, or back to what the mirror has. A thread
       // not here any more keeps its row as it was, for the retry.
-      this.writing.clear();
+      // Only this flush's: another writer's may be on its way (above).
+      for (const d of docs) this.doneWriting(d.threadId, me);
+      // A batch whose write failed may have landed all the same, so what the
+      // mirror has of those is no longer known: each is written again as it
+      // is now, even if that's back to what was sent before.
+      for (const id of unsure) {
+        this.sent.delete(id);
+        this.lastWrite.delete(id);
+        this.linkUnsure(id, docs.find((d) => d.threadId === id));
+      }
       for (const d of docs) {
         try {
           this.mark(this.deps.runner.get(d.threadId), true);
         } catch {
-          if (!this.dirty.has(d.threadId) && this.sent.get(d.threadId) !== digest(JSON.stringify(forBackend(d, this.backendApiVersion ?? 0, this.deps.clock.now())))) this.dirty.set(d.threadId, d);
+          // Not one this flush took off the backend, or the retry would put it back.
+          if (!removedNow.has(d.threadId) && !this.dirty.has(d.threadId) && this.sent.get(d.threadId) !== digest(JSON.stringify(forBackend(d, this.backendApiVersion ?? 0, this.deps.clock.now())))) this.dirty.set(d.threadId, d);
         }
       }
       for (const id of this.removing) this.removed.add(id);
@@ -2467,7 +2945,7 @@ export class ConvexSync {
             const { threadId, seq, path: file_, src } = img;
             const width = file.width ?? img.width;
             const height = file.height ?? img.height;
-            await this.post('mutation', 'sync:addShareImage', { key, threadId, seq, path: file_, ...(src ? { src } : {}), storageId, mediaType, ...(width ? { width } : {}), ...(height ? { height } : {}) });
+            this.pictureKept(await this.post('mutation', 'sync:addShareImage', { key, threadId, seq, path: file_, ...(src ? { src } : {}), storageId, mediaType, ...(width ? { width } : {}), ...(height ? { height } : {}) }));
           });
           // Still queued (this one stays first), for after the pause.
           if (sent === 'later') return;
@@ -2538,7 +3016,7 @@ export class ConvexSync {
             const url = (await this.post('mutation', 'sync:iconUploadUrl', { key })) as string;
             const storageId = await this.upload(url, read.bytes, read.mediaType);
             const { mediaType, width, height } = read;
-            await this.post('mutation', 'sync:addReplyImage', { key, threadId, seq, path: file, ...(src ? { src } : {}), ...(pinned ? { pinned } : {}), storageId, mediaType, ...(width ? { width } : {}), ...(height ? { height } : {}) });
+            this.pictureKept(await this.post('mutation', 'sync:addReplyImage', { key, threadId, seq, path: file, ...(src ? { src } : {}), ...(pinned ? { pinned } : {}), storageId, mediaType, ...(width ? { width } : {}), ...(height ? { height } : {}) }));
           });
           if (sent === 'later') return;
         }
@@ -2580,9 +3058,93 @@ export class ConvexSync {
     return out;
   }
 
+  // An assistant row with the buttons its text links, in the order it links
+  // them. An id the thread has no button for is left off: the apps draw that
+  // link as its title.
+  private withButtons(m: MessageDoc): MessageDoc {
+    if (m.role !== 'assistant' || !this.deps.runner.buttons || !m.text.includes('](button:')) return m;
+    const ids = linkedButtonIds(m.text);
+    if (!ids.length) return m;
+    let all: ReplyButton[];
+    try {
+      all = this.deps.runner.buttons(m.threadId);
+    } catch {
+      return m;
+    }
+    const buttons = ids.map((id) => all.find((b) => b.id === id)).filter((b): b is ReplyButton => Boolean(b)).map(messageButton);
+    const { buttons: _old, wokeBy: _w, pagedAt: _p, ...plain } = m;
+    for (const b of buttons) this.rememberButtonRow(`${m.threadId} ${b.id}`, plain);
+    return buttons.length ? { ...m, buttons } : m;
+  }
+
+  private rememberButtonRow(k: string, m: MessageDoc): void {
+    this.buttonRows.delete(k);
+    this.buttonRows.set(k, m);
+    while (this.buttonRows.size > BUTTON_ROWS) this.buttonRows.delete(this.buttonRows.keys().next().value!);
+  }
+
+  // A button pressed (or failed): the row that links it goes up again with
+  // its new state. Made, it has nothing to change, as the reply that links it
+  // comes after. A row from before this start is looked for in the thread's
+  // recent events, as a daily brief's buttons are pressed hours later.
+  private onButton(threadId: string, b: ReplyButton): void {
+    if (!b.pressed && !b.failed) return;
+    if ((this.backendApiVersion ?? 0) < BUTTONS_API_VERSION) return;
+    const k = `${threadId} ${b.id}`;
+    let row = this.buttonRows.get(k);
+    if (!row) {
+      row = this.findButtonRow(threadId, b.id);
+      if (!row) return;
+    }
+    this.messages.push(row);
+    this.scheduleFlush();
+  }
+
+  private findButtonRow(threadId: string, buttonId: string): MessageDoc | undefined {
+    const link = `](button:${buttonId})`;
+    let before: number | undefined;
+    let read = 0;
+    const cuts = this.deps.runner.cuts?.(threadId) ?? [];
+    while (read < BUTTON_SCAN_EVENTS) {
+      let events: PersistedEvent[];
+      try {
+        events = this.deps.runner.events(threadId, { ...(before !== undefined ? { beforeSeq: before } : {}), limit: 500 }).events;
+      } catch {
+        return undefined;
+      }
+      if (!events.length) return undefined;
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i]!;
+        if (e.type !== 'assistant.text' || !e.text.includes(link) || cuts.some((c) => e.seq >= c.from && e.seq <= c.to)) continue;
+        return toMessageDoc(threadId, e, this.scrubber.safeText);
+      }
+      read += events.length;
+      const first = events[0]!.seq;
+      if (before !== undefined && first >= before) return undefined;
+      before = first;
+      if (first <= 1) return undefined;
+    }
+    return undefined;
+  }
+
   // The threads with a message left out, so their history isn't counted as up.
   private async appendMessages(all: MessageDoc[]): Promise<Set<string>> {
     const notFilled = new Set<string>();
+    // None for a thread whose row is still shared by a link it isn't any
+    // more (rowBehind), whichever way they came (a flush, a phone's page of
+    // earlier ones): its whole history goes once the row is up.
+    const behind = new Set<string>();
+    all = all.filter((m) => {
+      if (behind.has(m.threadId) || this.rowBehind(m.threadId)) {
+        behind.add(m.threadId);
+        return false;
+      }
+      return true;
+    });
+    if (behind.size) {
+      this.holdForRow([...behind]);
+      for (const id of behind) notFilled.add(id);
+    }
     // A backend from before API 2 can't take tool rows; it's deployed before
     // the runner, so this only matters when that deploy was skipped.
     const v = this.backendApiVersion;
@@ -2591,6 +3153,9 @@ export class ConvexSync {
     if (v === undefined || v < ASKS_API_VERSION) messages = messages.map((m) => (m.summary ? (({ summary, ...rest }) => rest)(m) : m));
     if (v === undefined || v < TURNS_API_VERSION) messages = messages.map((m) => (m.turn ? (({ turn, ...rest }) => rest)(m) : m));
     if (v === undefined || v < WOKE_BY_API_VERSION) messages = messages.map((m) => (m.wokeBy ? (({ wokeBy, ...rest }) => rest)(m) : m));
+    // The buttons' state as it is now, not when the row was made: a press
+    // while the row waited would otherwise go up stale.
+    if (v !== undefined && v >= BUTTONS_API_VERSION) messages = messages.map((m) => this.withButtons(m));
     for (let i = 0; i < messages.length; i += MESSAGE_BATCH) {
       const batch = messages.slice(i, i + MESSAGE_BATCH);
       const left = await this.writeRows('sync:appendMessages', 'messages', batch, (m) => `${m.threadId}:${m.seq}`, { key: this.deps.key });
@@ -2648,7 +3213,7 @@ export class ConvexSync {
     const docs: MessageDoc[] = [];
     const threadIds: string[] = [];
     for (const t of this.deps.runner.list(ALL)) {
-      if (filled.has(t.id)) continue;
+      if (filled.has(t.id) || this.closedHistories.has(t.id) || this.heldForRow.has(t.id)) continue;
       const got = this.messagesAfter(t, 0, true);
       if (!got) continue;
       docs.push(...got);
@@ -2714,6 +3279,55 @@ export class ConvexSync {
     if (!threadIds.length) return;
     const filled = this.filledThreads();
     for (const id of threadIds) filled.add(id);
+    this.saveFilled();
+  }
+
+  // Messages held back for a row still on its way (rowBehind): the thread's
+  // whole history goes again once it's up, rather than keeping them here.
+  private holdForRow(threadIds: string[]): void {
+    if (!threadIds.length) return;
+    const filled = this.filledThreads();
+    let had = false;
+    for (const id of threadIds) {
+      this.heldForRow.add(id);
+      if (filled.delete(id)) had = true;
+    }
+    if (had) this.saveFilled();
+    this.deps.log.info('convex sync: messages wait for their thread\'s share link to be written', { threads: threadIds.length });
+    this.armRowRetry();
+  }
+
+  private armRowRetry(): void {
+    if (this.rowRetryTimer || !this.heldForRow.size || !this.running) return;
+    this.rowRetryTimer = this.deps.clock.setTimeout(() => {
+      this.rowRetryTimer = undefined;
+      for (const id of this.heldForRow) {
+        let t: ThreadSummary;
+        try {
+          t = this.deps.runner.get(id);
+        } catch {
+          continue; // its removal is queued
+        }
+        this.sent.delete(id);
+        this.lastWrite.delete(id);
+        this.mark(t, true);
+      }
+      this.scheduleFlush();
+      this.armRowRetry();
+    }, ROW_RETRY_MS);
+  }
+
+  private markUnfilled(threadIds: string[]): void {
+    const filled = this.filledThreads();
+    const had = threadIds.filter((id) => filled.delete(id));
+    for (const id of threadIds) this.closedHistories.add(id);
+    // The timer the closed answer set may have fired already, in a long flush.
+    if (threadIds.length) this.retryClosedLater();
+    if (had.length) this.saveFilled();
+  }
+
+  private saveFilled(): void {
+    const filled = this.filledThreads();
     if (!this.deps.statePath) return;
     try {
       let state: { histories?: Record<string, string[]> } = {};
@@ -2772,8 +3386,12 @@ export class ConvexSync {
     void this.post('mutation', 'sync:heartbeat', { key: this.deps.key, runner }).then(
       (r) => {
         this.sawBackend(r);
+        // A start whose first flush went before a heartbeat said the
+        // backend can list the shared rows checks them now.
+        if (this.sharesCheckDue()) this.scheduleFlush();
         this.keyRejected = false;
         this.ownerKeyRotating = (r as { ownerKeyRotating?: unknown } | null)?.ownerKeyRotating === true;
+        this.pushOff = (r as { pushOff?: unknown } | null)?.pushOff === true;
         this.notePushFailing(asPushFailing((r as { pushFailing?: unknown } | null)?.pushFailing));
         this.lookForReplyImages();
         if ((this.backendApiVersion ?? 0) >= SCHEDULES_API_VERSION && this.running) void this.deps.schedules?.attach(this.scheduleBackend());
@@ -2802,6 +3420,10 @@ export class ConvexSync {
         if (!this.backendHeard && /validat/i.test(String(e))) this.backendApiVersion = undefined;
       },
     );
+    if (this.deps.clock.now() - this.sharesCheckedAt >= SHARE_RECONCILE_MS && !this.sharesDue) {
+      this.sharesDue = true;
+      this.scheduleFlush();
+    }
     this.heartbeatTimer = this.deps.clock.setTimeout(() => this.heartbeat(), HEARTBEAT_MS);
   }
 
@@ -2855,13 +3477,15 @@ export class ConvexSync {
    * with the owner key only (a runner key can't read other runners' threads).
    * Undefined with sync off or before the backend is at RELAY_API_VERSION.
    */
-  relaySource(): { post: Post; subscribe?: Subscribe; key: string } | undefined {
+  relaySource(): { post: Post; subscribe?: Subscribe; key: string; apiVersion: number; upload: Upload } | undefined {
     if (this.off || !this.deps.key || (this.backendApiVersion ?? 0) < RELAY_API_VERSION) return undefined;
     const subscriber = this.subscriber;
     return {
       post: (kind, fn, args) => this.post(kind, fn, args),
       ...(subscriber ? { subscribe: (fn: string, args: Record<string, unknown>, onUpdate: (v: unknown) => void, onError: (e: Error) => void) => subscriber.subscribe(fn, args, onUpdate, onError) } : {}),
       key: this.deps.key,
+      apiVersion: this.backendApiVersion ?? 0,
+      upload: (url: string, bytes: Uint8Array, mediaType: string) => this.upload(url, bytes, mediaType),
     };
   }
 
@@ -3154,8 +3778,9 @@ export class ConvexSync {
 
   // The phone saw a question as it was scrubbed, so its answer may name the
   // question, or pick an option, in scrubbed words. The CLI wants the real ones.
-  private realAnswers(threadId: string, answers: Record<string, string>): Record<string, string> {
-    const pending = this.pending.get(threadId);
+  private realAnswers(threadId: string, approvalId: unknown, answers: Record<string, string>): Record<string, string> {
+    // The card it answers, which a newer one may have pushed off the row.
+    const pending = [this.pending.get(threadId), ...(this.cardsBehind.get(threadId) ?? [])].find((c) => c?.approvalId === approvalId);
     if (pending?.kind !== 'question') return answers;
     const out = { ...answers };
     for (const q of pending.questions) {
@@ -3212,20 +3837,31 @@ export class ConvexSync {
         }
         const decision = a.decision as ApprovalDecision;
         if (!['allow', 'allowAlways', 'deny', 'answered'].includes(decision)) throw new Error(`bad decision ${String(a.decision)}`);
+        // Only what the card that went up offered, whoever sends it. A
+        // request for a thread elsewhere (START_CARD) goes up with no options
+        // and is answered by the main Mac's runner, which checks it itself.
+        const card = this.pending.get(needThread());
+        if (card?.kind === 'approval' && card.approvalId === String(a.approvalId) && card.name !== START_CARD && !card.options.includes(decision as ApprovalOption)) {
+          throw new Error(REMOTE_ALLOW_REFUSED);
+        }
         await host.respondApproval({
           threadId: needThread(),
           approvalId: String(a.approvalId),
           decision,
+          remote: true,
           ...(typeof a.message === 'string' ? { message: a.message } : {}),
-          ...(a.answers && typeof a.answers === 'object' ? { answers: this.realAnswers(needThread(), a.answers as Record<string, string>) } : {}),
+          ...(a.answers && typeof a.answers === 'object' ? { answers: this.realAnswers(needThread(), a.approvalId, a.answers as Record<string, string>) } : {}),
         });
         return undefined;
       }
       case 'update': {
         const id = needThread();
         if (a.snooze && typeof a.snooze === 'object') {
-          const s = a.snooze as { until?: string; untilRestart?: boolean };
-          await host.update({ threadId: id, snoozedUntil: s.untilRestart ? 'restart' : s.until ?? null });
+          const s = a.snooze as { until?: string; untilRestart?: boolean; said?: string };
+          if (typeof s.said === 'string') {
+            if (!host.hibernateWhen) throw new Error("This runner can't hibernate a thread in words from another Mac.");
+            await host.hibernateWhen({ threadId: id, said: s.said });
+          } else await host.update({ threadId: id, snoozedUntil: s.untilRestart ? 'restart' : s.until ?? null });
         } else if (a.wake) await host.update({ threadId: id, snoozedUntil: null });
         else if (a.archive) {
           // A verdict still rides along if sent (backend API 42), though no app sends one now.
@@ -3242,6 +3878,9 @@ export class ConvexSync {
       }
       case 'create': {
         const text = commandText(a);
+        // Before anything is made: a mode it can't read refuses the
+        // command rather than starting on full access.
+        const mode = remoteCreateModeOf(a);
         const { thread } = await this.withPhoneImages(a.images, (images) => host.create({
           text,
           ...(images.length ? { images } : {}),
@@ -3249,7 +3888,7 @@ export class ConvexSync {
           ...(typeof a.accountId === 'string' ? { accountId: a.accountId } : {}),
           ...(typeof a.model === 'string' ? { model: a.model } : {}),
           ...(isEffortLevel(a.effort) ? { effort: a.effort } : {}),
-          ...(a.permissionMode === 'ask' || a.permissionMode === 'full' || a.permissionMode === 'auto' ? { permissionMode: a.permissionMode } : {}),
+          ...(mode ? { permissionMode: mode } : {}),
           ...origin,
         }));
         return { threadId: thread.id };
@@ -3316,6 +3955,24 @@ export class ConvexSync {
           .map((m) => ({ ...m, pagedAt: now }));
         await this.appendMessages(page);
         return undefined;
+      }
+      case 'press': {
+        // A reply button (API 59). Pressing twice is harmless: a pressed
+        // button comes back as it is (buttons.ts pressButton).
+        if (!host.pressButton) throw new Error("This runner can't press a button from the phone.");
+        if (typeof a.buttonId !== 'string' || !/^[a-z0-9]{8}$/.test(a.buttonId)) throw new Error('no button');
+        const r = (await host.pressButton(needThread(), a.buttonId)) as { button?: ReplyButton } | undefined;
+        // The thread it started or messaged, so the phone can open it once
+        // the press is done (its row goes up first, as a create's does).
+        const pressed = r?.button?.pressed?.threadId;
+        return pressed ? { threadId: pressed } : undefined;
+      }
+      case 'slashCommands': {
+        // The phone's palette (API 62): the thread's list, as the Mac
+        // app's threads.commands has it, sent back as the command's result.
+        if (!host.threadCommands) throw new Error("This runner can't list a thread's commands for the phone.");
+        const r = (await host.threadCommands(needThread())) as { commands?: unknown[] } | undefined;
+        return { result: r?.commands ?? [] };
       }
       case 'schedule': {
         if (!host.schedule) throw new Error('this runner can\'t change schedules');

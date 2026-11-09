@@ -6,15 +6,15 @@ import { ConvexError, v } from 'convex/values';
 import { internalMutation, internalQuery, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Doc, Id } from './_generated/dataModel';
 import { internal } from './_generated/api';
-import { threadFields, views } from './schema';
+import { messageButton, threadFields, views } from './schema';
 import { API_VERSION } from './version';
-import { actAs, checkRunnerId, forbidden, hasLiveKey, runnerAuth, runnerStatsRows, sha256, watchRunnersFor } from './lib';
+import { actAs, checkRunnerId, forbidden, hasLiveKey, pageLimit, readRunnerOrder, runnerAuth, runnerStatsRows, saveRunnerOrder, sha256, watchRunnersFor } from './lib';
 import { scrubDoc, scrubEveryString, SCRUB_RULES_VERSION, HELD_BACK } from './redaction';
 import { dropHead, seedHeads, syncHead, syncHeads } from './projectHeads';
 import { dropNotes, putNotes, syncNotes } from './projectNotes';
-import { cutBytes, docBytes, fitUsage, impossibleUsage, LOGIN_EMAIL, LOGIN_PROVIDER, loginKey, mayClaim, NAME_CHARS, mayFinish, mayTake, mayTouch, mayUseStorage, mayWrite, nameSkeleton, normalName, ownsCard, SCHEDULE_ID, utf8Bytes, type Caller, type UsageDoc } from './runnerAccess';
+import { badRunnerStats, cutBytes, docBytes, fitUsage, impossibleUsage, isIsoTime, LOGIN_EMAIL, LOGIN_PROVIDER, loginKey, mayClaim, NAME_CHARS, mayFinish, mayTake, mayTouch, mayUseStorage, mayWrite, nameSkeleton, normalName, ownsCard, SCHEDULE_ID, utf8Bytes, wholeIn, type Caller, type UsageDoc } from './runnerAccess';
 import { dropWake, seedWakes, syncWake } from './wakes';
-import { pushFailing } from './pushHealth';
+import { pushFailing, pushOff } from './pushHealth';
 import { issueToken as makeToken, listTokens as allTokens, revokeToken as revokeOne, tokenInfo, tokenKind, MAX_DAYS } from './tokens';
 
 // The second pass on anything a runner sends (docs/convex-backend.md, "Secret
@@ -49,6 +49,7 @@ const KEEP_FINISHED_MS = 24 * 60 * 60_000;
 // Rows pruneOld touches a run, well under Convex's per-mutation limits.
 const PRUNE_BATCH = 1_000;
 const PRUNE_MESSAGES = 5;
+const PRUNE_COMMAND_BYTES = 4 * 1024 * 1024;
 const TOMBSTONE_DAYS = 30;
 
 const threadDoc = v.object({ ...threadFields, view: v.union(...views.map((x) => v.literal(x))) });
@@ -68,7 +69,9 @@ async function threadRow(ctx: QueryCtx | MutationCtx, threadId: string) {
 async function ownThread(ctx: QueryCtx | MutationCtx, caller: Caller, threadId: string): Promise<'yes' | 'none'> {
   if (caller.owner) return 'yes';
   const row = await threadRow(ctx, threadId);
-  return row && mayTouch(caller, row.runnerId) ? 'yes' : 'none';
+  if (!row || !mayTouch(caller, row.runnerId)) return 'none';
+  // On its way to the owner (threadClears): no longer its runner's to write.
+  return (await ctx.db.query('threadClears').withIndex('by_threadId', (q) => q.eq('threadId', threadId)).first()) ? 'none' : 'yes';
 }
 
 // Whether the caller may make a row under a thread id: its own row's, or one
@@ -110,25 +113,50 @@ async function retireSlug(ctx: MutationCtx, threadId: string, runnerId: string, 
 // ------------------------------------------------------------ stored files
 // Nothing in a storage id says who uploaded it, so a runner key's uploads go
 // through convex/http.ts /runner/upload, which records them (storageOwners),
-// and it attaches or deletes only files of its own. A file is deleted only
-// once nothing names it: a picture row, a project icon, or a phone command
-// still waiting to be taken or finished. Files the owner key or the phone
-// uploaded have no storageOwners row and are no runner key's.
+// and it attaches or deletes only files of its own; the phone's go through
+// /phone/upload (phoneUploads), likewise. A file is deleted only once nothing
+// names it: a picture row, a project icon, or a phone command still waiting
+// to be taken or finished. Files the owner key uploaded have no record and
+// are no runner key's.
 
-async function storageRefs(ctx: QueryCtx | MutationCtx, storageId: Id<'_storage'>): Promise<number> {
-  let n = 0;
-  for (const table of ['shareImages', 'replyImages', 'projectIcons', 'heldPictures'] as const) {
-    for await (const _ of ctx.db.query(table).withIndex('by_storageId', (q) => q.eq('storageId', storageId))) n++;
+// Whether anything still names the file. Existence, not a count: each table
+// is one indexed read that stops at the first row, so many rows naming one
+// file (or a few big ones) can't make a delete read more than a handful of
+// documents, and a command is found through commandFiles rather than by
+// reading every waiting command.
+const PICTURE_TABLES = ['shareImages', 'replyImages', 'projectIcons', 'heldPictures'] as const;
+// A commandFiles row lasts only while its command waits or is taken (it goes
+// in endCommandFiles), so one is enough, and no command is read.
+export async function storageInUse(ctx: QueryCtx | MutationCtx, storageId: Id<'_storage'>): Promise<boolean> {
+  for (const table of [...PICTURE_TABLES, 'commandFiles'] as const) {
+    if (await ctx.db.query(table).withIndex('by_storageId', (q) => q.eq('storageId', storageId)).first()) return true;
   }
-  for (const state of ['pending', 'taken'] as const) {
-    for await (const c of ctx.db.query('commands').withIndex('by_state', (q) => q.eq('state', state))) {
-      if (Array.isArray(c.args?.images) && c.args.images.some((i: { storageId?: string }) => i?.storageId === storageId)) n++;
+  // Until limitsMigration has written commandFiles for commands made before
+  // it, those are looked through the old way, up to a few MB: past that the
+  // file counts as in use (it goes once they're over, by pruneFiles).
+  // The allowance is the mutation's, however many files it checks.
+  if (!(await markSet(ctx, LIMITS_DONE))) {
+    const budget = clearBudget(ctx as MutationCtx);
+    if ((budget.oldCommands ?? 0) > OLD_COMMANDS_READ) return true;
+    for (const state of ['pending', 'taken'] as const) {
+      for await (const c of ctx.db.query('commands').withIndex('by_state', (q) => q.eq('state', state))) {
+        if (Array.isArray(c.args?.images) && c.args.images.some((i: { storageId?: string }) => i?.storageId === storageId)) return true;
+        if ((budget.oldCommands = (budget.oldCommands ?? 0) + docBytes(c)) > OLD_COMMANDS_READ) return true;
+      }
     }
   }
-  return n;
+  return false;
+}
+const OLD_COMMANDS_READ = 2 * 1024 * 1024;
+
+// A command is over (finished, failed, cancelled, expired): its photos are no
+// longer on their way. Call before deleteIfUnused on them.
+export const MAX_COMMAND_FILES = 6;
+export async function endCommandFiles(ctx: MutationCtx, commandId: Id<'commands'>): Promise<void> {
+  for (const f of await ctx.db.query('commandFiles').withIndex('by_commandId', (q) => q.eq('commandId', commandId)).take(MAX_COMMAND_FILES)) await ctx.db.delete(f._id);
 }
 
-async function uploadedBy(ctx: QueryCtx | MutationCtx, storageId: Id<'_storage'>): Promise<string | undefined> {
+export async function uploadedBy(ctx: QueryCtx | MutationCtx, storageId: Id<'_storage'>): Promise<string | undefined> {
   return (await ctx.db.query('storageOwners').withIndex('by_storageId', (q) => q.eq('storageId', storageId)).first())?.runnerId;
 }
 
@@ -141,7 +169,7 @@ async function mustMayUseStorage(ctx: MutationCtx, caller: Caller, storageId: Id
 // Deletes a file nothing names any more. Call after the row naming it has
 // gone (or was never written).
 export async function deleteIfUnused(ctx: MutationCtx, storageId: Id<'_storage'>): Promise<void> {
-  if (await storageRefs(ctx, storageId)) return;
+  if (await storageInUse(ctx, storageId)) return;
   if (await ctx.db.system.get(storageId)) await ctx.storage.delete(storageId);
   for (const row of await ctx.db.query('storageOwners').withIndex('by_storageId', (q) => q.eq('storageId', storageId)).collect()) {
     await ctx.db.delete(row._id);
@@ -157,30 +185,137 @@ async function freeStorage(ctx: MutationCtx, caller: Caller, storageId: Id<'_sto
   await deleteIfUnused(ctx, storageId);
 }
 
-// Everything stored under a thread id but its row: messages, pictures, and
-// its runner's sidebar row. A thread removed, pruned, or taken over by the
-// owner (upsertThreads): nothing one runner wrote survives under another.
-async function clearThread(ctx: MutationCtx, threadId: string, runnerId: string | undefined, share: { slug: string } | undefined): Promise<void> {
-  let gone = 0;
-  for (const m of await ctx.db.query('messages').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId)).collect()) {
-    await ctx.db.delete(m._id);
-    if (m.runnerId) gone += docBytes(m);
+// Everything stored under a thread id but its row: messages, pictures, tool
+// output, and its runner's sidebar row. A thread removed, pruned, or taken
+// over by the owner (upsertThreads): nothing one runner wrote survives
+// under another. Its rows go as far as this mutation's share of reading
+// goes (CLEAR_BYTES, across every thread it clears), as a thread can hold
+// more than one mutation may read (a runner key's 48 MB of messages). The
+// rest go in runs of their own (dropThreadRows), and until they have, the
+// id is closed (threadClears): nobody writes under it (the owner's writes
+// are skipped and sent again, a runner key's dropped), so what's left is
+// only ever the old rows, and a thread made under it, or taken over, never
+// shows them. False: a takeover has to wait for that.
+async function clearThread(ctx: MutationCtx, threadId: string, runnerId: string | undefined, share: { slug: string } | undefined, mode: 'removed' | 'moving' = 'removed'): Promise<boolean> {
+  const clearing = await clearingOf(ctx, threadId);
+  // A takeover goes on waiting for its rows. A removal while they go (a
+  // takeover's or an earlier removal's) leaves them to it, and the id opens
+  // when they've gone, as there's no takeover left to finish.
+  if (clearing && !clearing.done && mode === 'moving') return false;
+  if (clearing && !clearing.done) {
+    if (clearing.moving) await ctx.db.patch(clearing._id, { moving: undefined });
+  } else if (clearing) await ctx.db.delete(clearing._id);
+  else if (await clearRows(ctx, threadId, clearBudget(ctx))) {
+    await ctx.db.insert('threadClears', { threadId, runnerId: runnerId ?? '', ...(mode === 'moving' ? { moving: true } : {}) });
+    await ctx.scheduler.runAfter(0, internal.sync.dropThreadRows, { threadId });
+    if (mode === 'moving') return false;
   }
-  if (runnerId && gone) await countMessageBytes(ctx, runnerId, -gone);
-  // Tool output in batches of its own: a long thread's could be more than one
-  // mutation may read. The rest of the thread doesn't wait for it.
-  if (await ctx.db.query('eventBodies').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId)).first()) await ctx.scheduler.runAfter(0, internal.sync.dropBodies, { threadId, before: Date.now() });
-  for (const table of ['shareImages', 'replyImages', 'heldPictures'] as const) {
-    for await (const img of ctx.db.query(table).withIndex('by_thread_seq', (q) => q.eq('threadId', threadId))) {
-      await ctx.db.delete(img._id);
-      await deleteIfUnused(ctx, img.storageId);
-    }
-  }
-  if (!runnerId) return;
+  if (!runnerId) return true;
   const had = await ctx.db.query('threadTombstones').withIndex('by_threadId', (q) => q.eq('threadId', threadId)).collect();
   if (!had.some((t) => t.runnerId === runnerId && !t.slug)) await ctx.db.insert('threadTombstones', { threadId, runnerId, at: Date.now() });
   if (share?.slug) await retireSlug(ctx, threadId, runnerId, share.slug);
+  return true;
 }
+
+// Nothing may be written under the id: its rows are still going, or it's
+// on its way to the owner (done, waiting for the takeover itself).
+async function closedId(ctx: QueryCtx | MutationCtx, threadId: string): Promise<boolean> {
+  return (await clearingOf(ctx, threadId)) !== null;
+}
+
+// The id's rows still going (clearThread), if they are.
+export async function clearingOf(ctx: QueryCtx | MutationCtx, threadId: string) {
+  return ctx.db.query('threadClears').withIndex('by_threadId', (q) => q.eq('threadId', threadId)).first();
+}
+
+// What one mutation spends clearing threads' rows, shared by every
+// clearThread in it (removeThreads and prune clear many). A file's check
+// (storageInUse) is charged as what it may read: a row from each picture
+// table, a few KB since the caps, up to a MiB each before limitsMigration.
+const CLEAR_BYTES = 4 * 1024 * 1024;
+const CLEAR_HARD = 10 * 1024 * 1024;
+const CLEAR_CHECK_BYTES = 64 * 1024;
+const OLD_ROWS_CHECK_BYTES = 5 * 1024 * 1024;
+type Budget = { bytes: number; check?: number; oldCommands?: number };
+const clearBudgets = new WeakMap<object, Budget>();
+function clearBudget(ctx: MutationCtx): Budget {
+  let b = clearBudgets.get(ctx);
+  if (!b) clearBudgets.set(ctx, (b = { bytes: 0 }));
+  return b;
+}
+async function checkCost(ctx: MutationCtx, budget: Budget): Promise<number> {
+  budget.check ??= (await markSet(ctx, LIMITS_DONE)) ? CLEAR_CHECK_BYTES : OLD_ROWS_CHECK_BYTES;
+  return budget.check;
+}
+
+// What a row was charged as when it went in (appendMessages): without the
+// fields Convex adds, so taking it out gives back exactly that.
+function storedBytes(row: Record<string, unknown>): number {
+  const { _id, _creationTime, ...rest } = row;
+  return docBytes(rest);
+}
+
+// Deletes a thread's rows, a table at a time, until the budget is spent
+// (counting every row read, and a file's check for each picture). Nothing
+// new goes in under the id meanwhile (threadClears), so every row read is
+// deleted and each run starts again from the top. True: there's more.
+const CLEAR_TABLES = ['messages', 'shareImages', 'replyImages', 'heldPictures', 'eventBodies'] as const;
+async function clearRows(ctx: MutationCtx, threadId: string, budget: Budget): Promise<boolean> {
+  const messages = new Map<string, number>();
+  const bodies = new Map<string, number>();
+  let more = false;
+  rows: for (const table of CLEAR_TABLES) {
+    const q = ctx.db.query(table).withIndex('by_thread_seq', (x) => x.eq('threadId', threadId));
+    // Spent: whether this table has anything left is one row read (charged),
+    // up to CLEAR_HARD; past that, assume it has, for a run of its own to see.
+    if (budget.bytes >= CLEAR_BYTES) {
+      const peek = budget.bytes < CLEAR_HARD ? await q.first() : true;
+      if (peek && peek !== true) budget.bytes += docBytes(peek);
+      if (peek) {
+        more = true;
+        break;
+      }
+      continue;
+    }
+    for await (const row of q as AsyncIterable<Record<string, any>>) {
+      // Spent, with a row still here (read, so charged): the rest next run.
+      const spent = budget.bytes >= CLEAR_BYTES;
+      budget.bytes += docBytes(row);
+      if (spent || budget.bytes >= CLEAR_HARD) {
+        more = true;
+        break rows;
+      }
+      await ctx.db.delete(row._id);
+      if (table === 'messages') {
+        if (row.runnerId) messages.set(row.runnerId, (messages.get(row.runnerId) ?? 0) + storedBytes(row));
+      } else if (table === 'eventBodies') {
+        if (row.runnerId) bodies.set(row.runnerId, (bodies.get(row.runnerId) ?? 0) + docBytes(strippedBody(row as Doc<'eventBodies'>)));
+      } else {
+        budget.bytes += await checkCost(ctx, budget);
+        await deleteIfUnused(ctx, row.storageId);
+      }
+    }
+  }
+  for (const [runnerId, bytes] of messages) await countMessageBytes(ctx, runnerId, -bytes);
+  for (const [runnerId, bytes] of bodies) await countBodyBytes(ctx, runnerId, -bytes);
+  return more;
+}
+
+// The rest of a thread clearThread couldn't finish, a run at a time. Once
+// it's all gone the id opens again; for a takeover the row stays closed to
+// its old runner (done) until the owner's next write of it goes through.
+export const dropThreadRows = internalMutation({
+  args: { threadId: v.string() },
+  returns: v.null(),
+  handler: async (ctx, { threadId }) => {
+    const clearing = await clearingOf(ctx, threadId);
+    if (!clearing || clearing.done) return null;
+    if (await clearRows(ctx, threadId, { bytes: 0 })) await ctx.scheduler.runAfter(0, internal.sync.dropThreadRows, { threadId });
+    else if (clearing.moving) await ctx.db.patch(clearing._id, { done: true });
+    else await ctx.db.delete(clearing._id);
+    return null;
+  },
+});
 
 // A thread's row and everything under it, with a tombstone so a runner key
 // can't take the id or its link later (claimable, slugFree). removeThreads
@@ -271,6 +406,38 @@ function capText(caller: Caller, what: string, value: string | undefined, max: n
 function capDoc(caller: Caller, what: string, doc: unknown, max: number): void {
   if (!caller.owner && docBytes(doc) > max) throw tooBig(what, max);
 }
+// What a picture row may say when a runner key writes it (addReplyImage,
+// addShareImage, addHeldPicture): a type the runner sends (runner/src/media.ts
+// sniffImage), whole numbers in range, short paths. Refused rather than cut: a
+// row's path is how its runner knows what it sent, so a cut one would go again
+// and again. Each row is then a few KB at most.
+export const PICTURE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'video/mp4', 'video/quicktime']);
+const PICTURE_PATH = 2_048;
+const PICTURE_SIDE = 100_000;
+const PICTURE_INDEX = 100;
+function checkPicture(caller: Caller, img: { seq: number; index?: number; path?: string; src?: string; mediaType: string; width?: number; height?: number }): void {
+  if (caller.owner) return;
+  const whole = (n: number, lo: number, hi: number) => Number.isSafeInteger(n) && n >= lo && n <= hi;
+  const bad = (what: string) => new ConvexError({ kind: 'badArgs', message: `a picture's ${what} isn't one a runner key may write` });
+  if (!PICTURE_TYPES.has(img.mediaType)) throw bad('type');
+  if (!whole(img.seq, 0, Number.MAX_SAFE_INTEGER)) throw bad('seq');
+  if (img.index !== undefined && !whole(img.index, 0, PICTURE_INDEX)) throw bad('index');
+  for (const side of [img.width, img.height]) if (side !== undefined && !whole(side, 1, PICTURE_SIDE)) throw bad('size');
+  if (img.path !== undefined && utf8Bytes(img.path) > PICTURE_PATH) throw tooBig("a picture's path", PICTURE_PATH);
+  if (img.src !== undefined && utf8Bytes(img.src) > PICTURE_PATH) throw tooBig("a picture's src", PICTURE_PATH);
+}
+
+// A runner key's upload goes on one row. Ownership alone would let one small
+// file be named by any number of rows (a new seq each), which no upload cap
+// sees. A retry of the same row is caught before this, by its own key.
+async function mustBeUnnamed(ctx: MutationCtx, caller: Caller, storageId: Id<'_storage'>): Promise<void> {
+  if (!caller.owner && (await storageInUse(ctx, storageId))) throw forbidden('put one stored file on two rows');
+}
+
+// What adding a picture answers. later: not now, its thread id's old rows are
+// still going (clearThread); the runner keeps it and sends it again.
+const pictureAnswer = v.union(v.null(), v.object({ later: v.literal(true) }));
+
 function tooMany(what: string, max: number): ConvexError<{ kind: string; message: string }> {
   return new ConvexError({ kind: 'tooMany', message: `A runner key may keep at most ${max} ${what}` });
 }
@@ -289,6 +456,11 @@ function fitThread<T extends Record<string, any>>(t: T): T | undefined {
   // thread waiting, and its push goes, with shorter text.
   const card = out.pendingApproval;
   if (card) out.pendingApproval = fitApproval(card, 150);
+  // What each answer does goes before the whole card: without it the Mac
+  // draws the answers as buttons, which still work.
+  if (docBytes(out) > CAP.threadDoc && Array.isArray(out.asks) && out.asks.some((a: any) => a?.optionNotes)) {
+    out.asks = out.asks.map(({ optionNotes: _notes, ...a }: any) => a);
+  }
   for (const f of ['asks', 'next', 'links', 'projects']) {
     if (docBytes(out) <= CAP.threadDoc) break;
     delete out[f];
@@ -322,7 +494,23 @@ function fitMessage<T extends Record<string, any>>(m: T): T | undefined {
   const out: Record<string, any> = { ...m, text: cutBytes(String(m.text ?? ''), CAP.message), at: cutBytes(String(m.at ?? ''), 64) };
   for (const f of ['origin', 'toolKind', 'turn']) if (typeof out[f] === 'string') out[f] = cutBytes(out[f], 100);
   if (Array.isArray(out.wokeBy)) out.wokeBy = out.wokeBy.slice(0, 5).map((w: any) => ({ kind: cutBytes(String(w?.kind ?? ''), 40), description: cutBytes(String(w?.description ?? ''), 200) }));
+  if (Array.isArray(out.buttons)) out.buttons = out.buttons.slice(0, MESSAGE_BUTTONS).map((b: any) => fitButton(b));
   return docBytes(out) <= CAP.messageDoc ? (out as T) : undefined;
+}
+
+// A message links at most this many buttons that the mirror keeps.
+const MESSAGE_BUTTONS = 20;
+function fitButton(b: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = { id: cutBytes(String(b.id ?? ''), 16), title: cutBytes(String(b.title ?? ''), 200), kind: b.kind === 'send' ? 'send' : 'start' };
+  if (typeof b.target === 'string') out.target = cutBytes(b.target, 200);
+  if (typeof b.pressedThreadId === 'string') out.pressedThreadId = cutBytes(b.pressedThreadId, 64);
+  if (typeof b.failed === 'string') out.failed = cutBytes(b.failed, 300);
+  return out;
+}
+
+// Whether a row's buttons already say what the runner sent.
+function sameButtons(a: unknown[] | undefined, b: unknown[] | undefined): boolean {
+  return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
 }
 
 function fitIndexRow<T extends Record<string, any>>(r: T): T | undefined {
@@ -475,11 +663,13 @@ const PUSH_COOLDOWN_MS = 30_000;
 export const upsertThreads = mutation({
   args: { key: v.string(), threads: v.array(threadDoc) },
   // skipped: a runner key's rows left out for being over a cap (CAP); the
-  // runner logs them and carries on.
-  returns: v.object({ skipped: v.array(v.string()) }),
+  // runner logs them and carries on. closed: those of them whose id's old
+  // rows are still going (clearThread), for a runner to try again soon.
+  returns: v.object({ skipped: v.array(v.string()), closed: v.optional(v.array(v.string())) }),
   handler: async (ctx, { key, threads }) => {
     const caller = await runnerAuth(ctx, key, 'upsertThreads');
     threads = clean(threads);
+    const closed: string[] = [];
     const now = Date.now();
     const skipped: string[] = [];
     for (const given of threads) {
@@ -505,6 +695,15 @@ export const upsertThreads = mutation({
       // it starts clean, so nothing that runner wrote under the id (its
       // messages, pictures, link, sidebar row) shows as the new one's.
       const transfer = existing !== null && existing.runnerId !== t.runnerId;
+      // Its old rows first: with more than this mutation may read, the
+      // takeover waits (skipped, sent again) while they go in runs of their
+      // own. Likewise any write under an id whose rows are still going.
+      if (transfer ? !(await clearThread(ctx, t.threadId, existing.runnerId, existing.share, 'moving')) : await clearingOf(ctx, t.threadId)) {
+        skipped.push(t.threadId);
+        // Only the owner's: a runner key's thread on its way away isn't worth its trying again.
+        if (caller.owner) closed.push(t.threadId);
+        continue;
+      }
       // A runner key's views are capped (CAP), the most recent in them: past
       // the cap, the view's oldest row moves out of the list (view
       // "overflow", wantView where it belongs), or this one does if it's
@@ -536,7 +735,6 @@ export const upsertThreads = mutation({
       // sidebar row for it goes, a fresh insert's included.
       if (caller.owner && (transfer || !existing)) await buryIndexRows(ctx, t.threadId, t.runnerId);
       if (transfer) {
-        await clearThread(ctx, t.threadId, existing.runnerId, existing.share);
         // That runner's Pocket cards on the thread go too: its text mustn't
         // pass for the new thread's own.
         for (const c of await ctx.db.query('pocketCards').withIndex('by_runnerId', (q) => q.eq('runnerId', existing.runnerId)).collect()) {
@@ -572,7 +770,7 @@ export const upsertThreads = mutation({
       if (!existing || transfer || projectKey(existing) !== projectKey(row)) await linkThread(ctx, t.threadId, row);
       if (wantsPush && (caller.owner || (await pushAllowed(ctx, t.runnerId, now)))) await ctx.scheduler.runAfter(0, internal.push.notify, { threadId: t.threadId });
     }
-    return { skipped };
+    return { skipped, ...(closed.length ? { closed } : {}) };
   },
 });
 
@@ -633,7 +831,8 @@ export const replyImages = query({
   returns: v.array(v.object({ seq: v.number(), path: v.string() })),
   handler: async (ctx, { key, threadId }) => {
     const caller = await runnerAuth(ctx, key, 'replyImages');
-    if ((await ownThread(ctx, caller, threadId)) === 'none') return [];
+    // Its id's old rows still going: none of them count as sent, so the runner sends its own.
+    if ((await ownThread(ctx, caller, threadId)) === 'none' || (await closedId(ctx, threadId))) return [];
     const out = [];
     for await (const img of ctx.db.query('replyImages').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId))) out.push({ seq: img.seq, path: img.path });
     return out;
@@ -653,14 +852,18 @@ export const addReplyImage = mutation({
     width: v.optional(v.number()),
     height: v.optional(v.number()),
   },
-  returns: v.null(),
+  returns: pictureAnswer,
   handler: async (ctx, { key, ...sent }) => {
     const caller = await runnerAuth(ctx, key, 'addReplyImage');
+    checkPicture(caller, sent);
     const img = clean(sent);
     const mine = await ownThread(ctx, caller, img.threadId);
     await mustMayUseStorage(ctx, caller, img.storageId);
     // No row to put it on: the upload goes, unless something else has it.
     if (mine === 'none') return (await freeStorage(ctx, caller, img.storageId), null);
+    // Its id's old rows still going (only the owner gets here): so does this
+    // upload, and the runner keeps the picture to send again.
+    if (await closedId(ctx, img.threadId)) return (await freeStorage(ctx, caller, img.storageId), { later: true as const });
     // Sent twice (a retry after a lost reply): keep the first, drop the copy.
     const same = await ctx.db
       .query('replyImages')
@@ -668,7 +871,10 @@ export const addReplyImage = mutation({
       .filter((q) => q.eq(q.field('path'), img.path))
       .first();
     if (same) await freeStorage(ctx, caller, img.storageId);
-    else await ctx.db.insert('replyImages', img);
+    else {
+      await mustBeUnnamed(ctx, caller, img.storageId);
+      await ctx.db.insert('replyImages', img);
+    }
     return null;
   },
 });
@@ -695,7 +901,7 @@ export const shareImages = query({
   returns: v.array(v.object({ seq: v.number(), path: v.string() })),
   handler: async (ctx, { key, threadId }) => {
     const caller = await runnerAuth(ctx, key, 'shareImages');
-    if ((await ownThread(ctx, caller, threadId)) === 'none') return [];
+    if ((await ownThread(ctx, caller, threadId)) === 'none' || (await closedId(ctx, threadId))) return [];
     const out = [];
     for await (const img of ctx.db.query('shareImages').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId))) out.push({ seq: img.seq, path: img.path });
     return out;
@@ -714,14 +920,15 @@ export const addShareImage = mutation({
     width: v.optional(v.number()),
     height: v.optional(v.number()),
   },
-  returns: v.null(),
+  returns: pictureAnswer,
   handler: async (ctx, { key, ...sent }) => {
     const caller = await runnerAuth(ctx, key, 'addShareImage');
+    checkPicture(caller, sent);
     const img = clean(sent);
     const mine = await ownThread(ctx, caller, img.threadId);
     await mustMayUseStorage(ctx, caller, img.storageId);
-    // No row to put it on: the upload goes, unless something else has it.
     if (mine === 'none') return (await freeStorage(ctx, caller, img.storageId), null);
+    if (await closedId(ctx, img.threadId)) return (await freeStorage(ctx, caller, img.storageId), { later: true as const });
     // Sent twice (a retry after a lost reply): keep the first, drop the copy.
     const same = await ctx.db
       .query('shareImages')
@@ -729,7 +936,10 @@ export const addShareImage = mutation({
       .filter((q) => q.eq(q.field('path'), img.path))
       .first();
     if (same) await freeStorage(ctx, caller, img.storageId);
-    else await ctx.db.insert('shareImages', img);
+    else {
+      await mustBeUnnamed(ctx, caller, img.storageId);
+      await ctx.db.insert('shareImages', img);
+    }
     return null;
   },
 });
@@ -768,6 +978,23 @@ export const prune = mutation({
   },
 });
 
+// The ids of a runner's rows that are shared by link, so anyone with the slug
+// can read them (share.ts). The runner checks them against its own threads on
+// every start and every hour after (runner/src/sync.ts reconcileShares): one
+// it has deleted goes, and one it has stopped sharing is written again. Only
+// the shared rows are read, by index (API 60).
+export const sharedThreads = query({
+  args: { key: v.string(), runnerId: v.string() },
+  returns: v.array(v.string()),
+  handler: async (ctx, { key, runnerId }) => {
+    const caller = await runnerAuth(ctx, key, 'sharedThreads');
+    await actAs(ctx, caller, runnerId);
+    const out: string[] = [];
+    for await (const row of ctx.db.query('threads').withIndex('by_runner_share', (q) => q.eq('runnerId', runnerId).eq('share.access', 'link'))) out.push(row.threadId);
+    return out;
+  },
+});
+
 export const heartbeat = mutation({
   args: {
     key: v.string(),
@@ -792,10 +1019,12 @@ export const heartbeat = mutation({
   // tb status says, as it should only last while tb runner rotate-owner runs.
   // pushFailing (owner key only): pushes from this backend haven't got
   // through lately, and why (pushHealth.ts), for tb status and the app.
+  // pushOff: it can't send any (pushHealth.ts pushOff), for the same.
   returns: v.object({
     apiVersion: v.number(),
     firstSeen: v.optional(v.boolean()),
     ownerKeyRotating: v.optional(v.boolean()),
+    pushOff: v.optional(v.boolean()),
     pushFailing: v.optional(v.object({ failure: v.string(), since: v.number(), failed: v.number(), via: v.union(v.literal('apple'), v.literal('relay')) })),
   }),
   handler: async (ctx, { key, runner }) => {
@@ -807,6 +1036,11 @@ export const heartbeat = mutation({
     // A runner key's heartbeat fields are cut to fit, never refused: a
     // refused heartbeat would leave that Mac showing offline.
     if (!caller.owner) for (const field of ['version', 'release', 'startedAt', 'icon', 'rpcUrl'] as const) if (typeof runner[field] === 'string') (runner as Record<string, unknown>)[field] = cutBytes(runner[field], CAP.runnerField);
+    // The Mac app reads startedAt as a time and the count as a number, so
+    // anything else is left out rather than passed on (an offset of
+    // "+////" once crashed the app's date parser; Daybreak, 7 Nov 2026).
+    // The app checks them too, for rows written before this.
+    if (!caller.owner) runner = { ...runner, startedAt: isIsoTime(runner.startedAt) ? runner.startedAt : '', threadCount: wholeIn(runner.threadCount, 1_000_000) ? runner.threadCount : 0 };
     const name = caller.owner ? runner.name : await uniqueName(ctx, runner.runnerId, runner.name);
     const row = { ...runner, name, lastSeenAt: Date.now(), ...(caller.owner ? { byOwner: true } : {}) };
     const existing = await ctx.db
@@ -830,8 +1064,19 @@ export const heartbeat = mutation({
     }
     // API 48: every project from before projectHeads, once.
     await seedHeads(ctx);
+    // 7 Nov 2026: rows from before the backend's limits, once (limitsMigration).
+    await startLimitsMigration(ctx);
+    // 8 Nov 2026: a runner key's message bytes counted again, once
+    // (recountMessageBytes). Marked before it runs, like linkProjects.
+    if (!caller.owner) {
+      const usage = await ctx.db.query('runnerStorage').withIndex('by_runnerId', (q) => q.eq('runnerId', runner.runnerId)).unique();
+      if (usage && !usage.messagesRecounted) {
+        await ctx.db.patch(usage._id, { messagesRecounted: true });
+        await ctx.scheduler.runAfter(0, internal.sync.recountMessageBytes, { runnerId: runner.runnerId, cursor: null, sum: 0 });
+      }
+    }
     const failing = caller.owner ? pushFailing(await ctx.db.query('pushHealth').first(), Date.now()) : null;
-    return { apiVersion: API_VERSION, ...(existing ? {} : { firstSeen: true }), ...(caller.owner && process.env.RUNNER_KEY_NEXT ? { ownerKeyRotating: true } : {}), ...(failing ? { pushFailing: failing } : {}) };
+    return { apiVersion: API_VERSION, ...(existing ? {} : { firstSeen: true }), ...(caller.owner && process.env.RUNNER_KEY_NEXT ? { ownerKeyRotating: true } : {}), ...(caller.owner && pushOff(process.env) ? { pushOff: true } : {}), ...(failing ? { pushFailing: failing } : {}) };
   },
 });
 
@@ -918,6 +1163,10 @@ export const setRunnerStats = mutation({
     const caller = await runnerAuth(ctx, key, 'setRunnerStats');
     await actAs(ctx, caller, runnerId);
     const cleaned = clean(stats);
+    // Another runner's figures reach the Mac app's Swift, where Int(1e20)
+    // stopped it (Daybreak, 7 Nov 2026), so they're checked from any key.
+    const bad = badRunnerStats(cleaned);
+    if (bad) throw new ConvexError({ kind: 'badArgs', message: bad });
     const labels = caller.owner ? {} : { ...(cleaned.machine !== undefined ? { machine: cutBytes(cleaned.machine, 128) } : {}), ...(cleaned.os !== undefined ? { os: cutBytes(cleaned.os, 128) } : {}) };
     const row = { runnerId, at: Date.now(), ...cleaned, ...labels };
     const existing = await ctx.db.query('runnerStats').withIndex('by_runnerId', (q) => q.eq('runnerId', runnerId)).unique();
@@ -1046,6 +1295,7 @@ const messageDoc = v.object({
   summary: v.optional(v.boolean()), // API 14
   turn: v.optional(v.string()), // API 26
   wokeBy: v.optional(v.array(v.object({ kind: v.string(), description: v.string() }))), // API 33
+  buttons: v.optional(v.array(messageButton)), // API 59
   at: v.string(),
   pagedAt: v.optional(v.number()), // an old phone asked for it (loadEarlier): phone:thread shows it for a day
 });
@@ -1058,19 +1308,27 @@ const messageDoc = v.object({
 // which the runner doesn't count as sent and sends again.
 export const appendMessages = mutation({
   args: { key: v.string(), messages: v.array(messageDoc) },
-  returns: v.object({ skipped: v.array(v.string()) }),
+  returns: v.object({ skipped: v.array(v.string()), closed: v.optional(v.array(v.string())) }),
   handler: async (ctx, { key, messages }) => {
     const caller = await runnerAuth(ctx, key, 'appendMessages');
     messages = clean(messages);
     const checked = new Map<string, 'yes' | 'none'>();
     const skipped: string[] = [];
+    const closed = new Set<string>();
     const insertedNow = new Set<string>();
-    let evicted = 0;
+    const budget = { evicted: 0 };
     for (const given of messages) {
       // A runner key's message for a thread with no row is dropped: it
       // would show in whatever thread is made under that id later.
       if (!checked.has(given.threadId)) checked.set(given.threadId, await ownThread(ctx, caller, given.threadId));
       if (checked.get(given.threadId) === 'none') continue;
+      // Rows still going under the id (clearThread): the owner's wait, and
+      // are sent again (closed tells the runner to, whatever came after them).
+      if (caller.owner && (await closedId(ctx, given.threadId))) {
+        skipped.push(`${given.threadId}:${given.seq}`);
+        closed.add(given.threadId);
+        continue;
+      }
       // Cut to fit whole rather than refused (CAP): the runner cuts text at 8,000 characters itself.
       const m = caller.owner ? given : fitMessage(given);
       if (!m) continue;
@@ -1085,24 +1343,10 @@ export const appendMessages = mutation({
         // call; one there's still no room for waits (skipped, sent again).
         if (!caller.owner) {
           const doc = { ...m, runnerId: caller.runnerId };
-          const size = docBytes(doc);
-          let usage = await ctx.db.query('runnerStorage').withIndex('by_runnerId', (q) => q.eq('runnerId', caller.runnerId)).unique();
-          let used = usage?.messageBytes ?? 0;
-          while (used + size > CAP.messageBytes && evicted < CAP.evictPerWrite) {
-            const oldest = await ctx.db.query('messages').withIndex('by_runnerId', (q) => q.eq('runnerId', caller.runnerId)).first();
-            // Only older ones than this call's: never one it has just put in.
-            if (!oldest || insertedNow.has(String(oldest._id))) break;
-            await ctx.db.delete(oldest._id);
-            used = Math.max(0, used - docBytes(oldest));
-            evicted++;
-          }
-          if (used + size > CAP.messageBytes) {
-            if (usage) await ctx.db.patch(usage._id, { messageBytes: used });
+          if (!(await roomForMessage(ctx, caller.runnerId, docBytes(doc), insertedNow, budget))) {
             skipped.push(`${m.threadId}:${m.seq}`);
             continue;
           }
-          if (usage) await ctx.db.patch(usage._id, { messageBytes: used + size });
-          else await ctx.db.insert('runnerStorage', { runnerId: caller.runnerId, bytes: 0, messageBytes: size });
           insertedNow.add(String(await ctx.db.insert('messages', doc)));
         } else await ctx.db.insert('messages', m);
       }
@@ -1110,11 +1354,125 @@ export const appendMessages = mutation({
       // put there first (the old shared key, at a seq the thread hadn't
       // reached) is written over when the runner sends it again.
       else if (caller.owner && (existing.text !== m.text || existing.role !== m.role)) await ctx.db.replace(existing._id, { ...m, ...(m.pagedAt ?? existing.pagedAt ? { pagedAt: m.pagedAt ?? existing.pagedAt } : {}) });
-      else if (m.pagedAt && !existing.pagedAt) await ctx.db.patch(existing._id, { pagedAt: m.pagedAt });
+      else {
+        // A row sent again for its buttons (API 59: one was pressed) changes
+        // only them, so what woke the turn and an old phone's paged mark stay.
+        // From before API 59 no row carries any, and an older runner never
+        // sends one again, so nothing here clears them.
+        const patch: Partial<Doc<'messages'>> = {};
+        if (m.pagedAt && !existing.pagedAt) patch.pagedAt = m.pagedAt;
+        const buttons = keepPresses(existing.buttons, m.buttons);
+        if (!sameButtons(existing.buttons, buttons)) patch.buttons = buttons;
+        if (!Object.keys(patch).length) continue;
+        // A runner key's row growing (bigger buttons sent again) is counted
+        // against its budget like a new one, and waits when there's no room;
+        // one shrinking gives the bytes back (Daybreak, 8 Nov: rows sent
+        // small, then again with 20 buttons each, stored past the budget
+        // while the count stayed where the small ones left it).
+        if (!caller.owner) {
+          // Whole, as it would be stored, within a row's cap: its old text
+          // with new buttons can be over it though each fit as sent.
+          if (storedBytes({ ...existing, ...patch, runnerId: undefined }) > CAP.messageDoc) {
+            skipped.push(`${m.threadId}:${m.seq}`);
+            continue;
+          }
+          const grow = storedBytes({ ...existing, ...patch }) - storedBytes(existing);
+          if (grow > 0) {
+            const room = await roomForMessage(ctx, caller.runnerId, grow, insertedNow, budget, existing._id);
+            if (!room) {
+              skipped.push(`${m.threadId}:${m.seq}`);
+              continue;
+            }
+          } else if (grow < 0) await countMessageBytes(ctx, caller.runnerId, grow);
+        }
+        await ctx.db.patch(existing._id, patch);
+      }
     }
-    return { skipped };
+    return { skipped, ...(closed.size ? { closed: [...closed] } : {}) };
   },
 });
+
+// Room in a runner key's CAP.messageBytes for `size` more bytes: past it,
+// its oldest messages anywhere go first, at most CAP.evictPerWrite a call
+// (`budget` counts them), never one this call has put in (`insertedNow`,
+// the newest, so reaching one means nothing older is left) nor the row
+// being grown (`growing`, passed over). True, and the bytes counted, when
+// there's room; false, and nothing counted, when there isn't (the caller
+// skips the row, and the runner sends it again).
+async function roomForMessage(ctx: MutationCtx, runnerId: string, size: number, insertedNow: Set<string>, budget: { evicted: number }, growing?: Id<'messages'>): Promise<boolean> {
+  const usage = await ctx.db.query('runnerStorage').withIndex('by_runnerId', (q) => q.eq('runnerId', runnerId)).unique();
+  let used = usage?.messageBytes ?? 0;
+  while (used + size > CAP.messageBytes && budget.evicted < CAP.evictPerWrite) {
+    // The oldest but the row being grown, which can be the oldest: the next
+    // one along goes instead (Codex's review, 8 Nov). At most one row is
+    // passed over each time, so what's read stays as bounded as the deletes.
+    let victim: Doc<'messages'> | undefined;
+    for await (const m of ctx.db.query('messages').withIndex('by_runnerId', (q) => q.eq('runnerId', runnerId))) {
+      if (m._id === growing) continue;
+      if (!insertedNow.has(String(m._id))) victim = m;
+      break;
+    }
+    if (!victim) {
+      // Nothing older left: all there is is this call's rows and the one
+      // being grown, so a count above theirs is bytes no row holds (a sum
+      // gone stale, Codex's review, 8 Nov). It's put back to what they hold.
+      let held = 0;
+      for await (const m of ctx.db.query('messages').withIndex('by_runnerId', (q) => q.eq('runnerId', runnerId))) held += storedBytes(m);
+      used = Math.min(used, held);
+      break;
+    }
+    await ctx.db.delete(victim._id);
+    used = Math.max(0, used - storedBytes(victim));
+    budget.evicted++;
+  }
+  if (used + size > CAP.messageBytes) {
+    if (usage) await ctx.db.patch(usage._id, { messageBytes: used });
+    return false;
+  }
+  if (usage) await ctx.db.patch(usage._id, { messageBytes: used + size });
+  else await ctx.db.insert('runnerStorage', { runnerId, bytes: 0, messageBytes: size });
+  return true;
+}
+
+// A runner key's message bytes counted again from its rows, a page at a
+// time, once per runner (its heartbeat starts it, runnerStorage
+// .messagesRecounted): rows grown by their buttons before that was counted
+// (Daybreak, 8 Nov) left counts short. The count is only ever raised: a
+// write while the pages are read can make the sum stale either way, and
+// lowering a right count to a stale one would reopen the budget, while one
+// a little high only evicts a little early.
+const RECOUNT_PAGE = 200;
+export const recountMessageBytes = internalMutation({
+  args: { runnerId: v.string(), cursor: v.union(v.string(), v.null()), sum: v.number() },
+  returns: v.null(),
+  handler: async (ctx, { runnerId, cursor, sum }) => {
+    const page = await ctx.db
+      .query('messages')
+      .withIndex('by_runnerId', (q) => q.eq('runnerId', runnerId))
+      .paginate({ numItems: RECOUNT_PAGE, cursor });
+    const total = sum + page.page.reduce((n, m) => n + storedBytes(m), 0);
+    if (!page.isDone) {
+      await ctx.scheduler.runAfter(0, internal.sync.recountMessageBytes, { runnerId, cursor: page.continueCursor, sum: total });
+      return null;
+    }
+    const usage = await ctx.db.query('runnerStorage').withIndex('by_runnerId', (q) => q.eq('runnerId', runnerId)).unique();
+    if (usage && total > (usage.messageBytes ?? 0)) await ctx.db.patch(usage._id, { messageBytes: total });
+    return null;
+  },
+});
+
+// A press is final: a slower, older send of the row (one queued before the
+// press) mustn't turn a pressed button back into one that can be pressed
+// (Codex's review, 7 Nov 2026).
+function keepPresses<B extends { id: string; pressedThreadId?: string; failed?: string }>(old: B[] | undefined, next: B[] | undefined): B[] | undefined {
+  if (!old?.length || !next) return next;
+  return next.map((b) => {
+    const was = old.find((o) => o.id === b.id);
+    if (!was?.pressedThreadId || b.pressedThreadId) return b;
+    const { failed: _failed, ...rest } = b;
+    return { ...rest, pressedThreadId: was.pressedThreadId } as B;
+  });
+}
 
 // The newest message seq per thread of a runner, so a runner starting up
 // only sends what the mirror doesn't have.
@@ -1354,6 +1712,7 @@ async function liveTicket(ctx: QueryCtx | MutationCtx, ticket: string) {
 export const MAX_RUNNER_UPLOAD_BYTES = 10 * 1024 * 1024;
 const UPLOAD_BYTES_PER_HOUR = 200 * 1024 * 1024;
 const STORED_BYTES_PER_RUNNER = 150 * 1024 * 1024;
+const MIN_UPLOAD_CHARGE = 64 * 1024;
 
 // For /runner/upload, before it stores anything.
 export const uploadTicketOk = internalQuery({
@@ -1374,9 +1733,16 @@ export const redeemUpload = internalMutation({
     const row = await liveTicket(ctx, ticket);
     if (!row) return false;
     const now = Date.now();
+    if (!(bytes >= 0) || bytes > MAX_RUNNER_UPLOAD_BYTES) {
+      await ctx.db.patch(row._id, { usedAt: now, bytes: MAX_RUNNER_UPLOAD_BYTES });
+      return false;
+    }
+    // Each file counts as at least MIN_UPLOAD_CHARGE, so how many a runner key
+    // keeps is bounded too (150 MB / 64 KB = 2,400), and with one row per file
+    // so are its picture rows, however small the files.
+    bytes = Math.max(bytes, MIN_UPLOAD_CHARGE);
     // Spent whatever happens: a refused ticket can't be tried again.
     await ctx.db.patch(row._id, { usedAt: now, bytes });
-    if (!(bytes >= 0) || bytes > MAX_RUNNER_UPLOAD_BYTES) return false;
     // The hour's bytes come from the tickets, which outlive the files
     // (deleting an upload doesn't give its bytes back), and all a runner
     // keeps stored is capped too.
@@ -1411,6 +1777,8 @@ export const setProjectIcon = mutation({
       .query('projectIcons')
       .withIndex('by_runner_project', (q) => q.eq('runnerId', runnerId).eq('projectId', projectId))
       .unique();
+    // One row per upload, as for pictures: the same icon again is this row's.
+    if (existing?.storageId !== storageId) await mustBeUnnamed(ctx, caller, storageId);
     if (existing) {
       await ctx.db.patch(existing._id, { picture, storageId, mediaType, updatedAt: now });
       if (existing.storageId !== storageId) await freeStorage(ctx, caller, existing.storageId);
@@ -1437,7 +1805,7 @@ export const setSchedules = mutation({
       if (row.owned) owned.add(row.id);
       else if (row.runnerId === runnerId) {
         await ctx.db.delete(row._id);
-        await dropWake(ctx, row.id);
+        await mirrorGone(ctx, row.id);
       }
     }
     for (const row of schedules) {
@@ -1489,6 +1857,16 @@ async function ownedCount(ctx: { db: MutationCtx['db'] }, runnerId: string): Pro
   return n;
 }
 
+// A mirrored row (from before API 9) has gone. An owned schedule can share
+// its id, from another runner, and the wake is that one's then: dropping it
+// would take the thread out of Hibernating on the website and the phone
+// while phone:schedules still has it.
+async function mirrorGone(ctx: { db: MutationCtx['db'] }, scheduleId: string): Promise<void> {
+  const left = await scheduleRow(ctx, scheduleId);
+  if (left) await syncWake(ctx, left);
+  else await dropWake(ctx, scheduleId);
+}
+
 function visibleTo<T extends { runnerId: string }>(caller: Caller, row: T | undefined): T | undefined {
   return row && mayTouch(caller, row.runnerId) ? row : undefined;
 }
@@ -1496,9 +1874,20 @@ function visibleTo<T extends { runnerId: string }>(caller: Caller, row: T | unde
 // Whether any row with this schedule id, owned or an old mirrored one (from
 // before API 9), is another runner's: a runner key may not take that id,
 // or the other runner's adoption would find it taken and drop its own.
+// And one with no row now that went from another runner lately (scheduleGone,
+// a day): that runner may still have a run of it claimed or its check going,
+// and the main Mac reads every runner's rows, so a row of this runner's under
+// the gone id must not turn up there as the one it claimed (Daybreak, 6 Nov;
+// the runner checks that too, Scheduler.stillClaimed).
 async function scheduleIdTaken(ctx: { db: MutationCtx['db'] }, caller: Caller, scheduleId: string): Promise<boolean> {
   if (caller.owner) return false;
-  for await (const row of ctx.db.query('schedules').withIndex('by_scheduleId', (q) => q.eq('id', scheduleId))) if (row.runnerId !== caller.runnerId) return true;
+  let live = false;
+  for await (const row of ctx.db.query('schedules').withIndex('by_scheduleId', (q) => q.eq('id', scheduleId))) {
+    if (row.runnerId !== caller.runnerId) return true;
+    live = true;
+  }
+  if (live) return false;
+  for await (const gone of ctx.db.query('scheduleGone').withIndex('by_scheduleId', (q) => q.eq('id', scheduleId))) if (gone.runnerId !== caller.runnerId) return true;
   return false;
 }
 
@@ -1655,7 +2044,7 @@ export const adoptSchedules = mutation({
     for await (const row of ctx.db.query('schedules').withIndex('by_runnerId', (q) => q.eq('runnerId', runnerId))) {
       if (!row.owned) {
         await ctx.db.delete(row._id);
-        await dropWake(ctx, row.id);
+        await mirrorGone(ctx, row.id);
       }
     }
     for (const s of fresh) {
@@ -2087,6 +2476,8 @@ export const takeCommand = mutation({
       const t = await ctx.db.query('threads').withIndex('by_threadId', (q) => q.eq('threadId', c.threadId!)).unique();
       if (!t || t.runnerId !== c.runnerId) {
         await ctx.db.patch(commandId, { state: 'failed', doneAt: Date.now(), args: finishedArgs(c.args), note: t ? 'That thread is on another runner now.' : 'That thread has gone.' });
+        await endCommandFiles(ctx, commandId);
+        for (const image of Array.isArray(c.args?.images) ? c.args.images : []) await deleteIfUnused(ctx, image.storageId);
         return false;
       }
     }
@@ -2097,6 +2488,7 @@ export const takeCommand = mutation({
 
 // A call's answer is a folder list at most; a day of them stays small.
 const RESULT_MAX_BYTES = 256 * 1024;
+const NOTE_MAX = 4_000;
 
 export const finishCommand = mutation({
   // result (API 44): a `call`'s answer as JSON text, kept only for one
@@ -2108,16 +2500,20 @@ export const finishCommand = mutation({
     const c = await ctx.db.get(commandId);
     if (!c) return null;
     if (!mayFinish(caller, c)) throw forbidden("finish that command: it isn't for its runner");
-    const kept = ok && c.kind === 'call' && result !== undefined && utf8Bytes(result) <= RESULT_MAX_BYTES ? cleanResult(result) : undefined;
+    // A call's answer, or a slashCommands list (API 62).
+    const kept = ok && (c.kind === 'call' || c.kind === 'slashCommands') && result !== undefined && utf8Bytes(result) <= RESULT_MAX_BYTES ? cleanResult(result) : undefined;
     // The thread a create made is the command's runner's (it writes the row
     // before finishing): never another runner's id, which the main Mac would
     // then open as this runner's new thread.
     let made: string | undefined;
-    if (resultThreadId && (c.kind === 'create' || c.kind === 'quickAsk')) {
+    // A press (API 59) names the thread its button started or messaged, also the runner's own.
+    if (resultThreadId && (c.kind === 'create' || c.kind === 'quickAsk' || c.kind === 'press')) {
       const t = await ctx.db.query('threads').withIndex('by_threadId', (q) => q.eq('threadId', resultThreadId)).unique();
       if (t && (c.runnerId === 'any' ? caller.owner || t.runnerId === (caller as { runnerId?: string }).runnerId : t.runnerId === c.runnerId)) made = resultThreadId;
     }
-    await ctx.db.patch(commandId, { state: ok ? 'done' : 'failed', doneAt: Date.now(), ...(note ? { note: clean(note) } : {}), ...(made ? { resultThreadId: made } : {}), ...(kept !== undefined ? { result: kept } : {}) });
+    // A note is a line for the phone: cut, so a finished command stays small (pruneOld reads them).
+    const said = note ? clean(cutBytes(note, caller.owner ? NOTE_MAX : CAP.note)) : undefined;
+    await ctx.db.patch(commandId, { state: ok ? 'done' : 'failed', doneAt: Date.now(), ...(said ? { note: said } : {}), ...(made ? { resultThreadId: made } : {}), ...(kept !== undefined ? { result: kept } : {}) });
     // Its words, and a secret's sealed answer (docs/protocol.md, "Secrets"), have
     // done their job: see finishedArgs.
     await ctx.db.patch(commandId, { args: finishedArgs(c.args) });
@@ -2126,6 +2522,7 @@ export const finishCommand = mutation({
     // which uploads them again.
     // Only once nothing else names it: the same photo can be in another
     // runner's command, or in a picture row (deleteIfUnused).
+    await endCommandFiles(ctx, commandId);
     for (const image of Array.isArray(c.args?.images) ? c.args.images : []) await deleteIfUnused(ctx, image.storageId);
     return null;
   },
@@ -2193,16 +2590,22 @@ function strippedBody(row: Doc<'eventBodies'>) {
 // big. The runner doesn't send them again: the tool shows as kept on that runner.
 export const appendBodies = mutation({
   args: { key: v.string(), bodies: v.array(bodyDoc) },
-  returns: v.object({ skipped: v.array(v.string()) }),
+  returns: v.object({ skipped: v.array(v.string()), closed: v.optional(v.array(v.string())) }),
   handler: async (ctx, { key, bodies }) => {
     const caller = await runnerAuth(ctx, key, 'appendBodies');
     const skipped: string[] = [];
+    const closed = new Set<string>();
     const checked = new Map<string, 'yes' | 'none'>();
     let evicted = 0;
     const now = Date.now();
     for (const given of bodies) {
       if (!checked.has(given.threadId)) checked.set(given.threadId, await ownThread(ctx, caller, given.threadId));
       if (checked.get(given.threadId) === 'none') continue;
+      if (caller.owner && (await closedId(ctx, given.threadId))) {
+        skipped.push(`${given.threadId}:${given.seq}`);
+        closed.add(given.threadId);
+        continue;
+      }
       if (!Number.isSafeInteger(given.seq)) continue;
       const b = cleanBody(given);
       const existing = await ctx.db
@@ -2243,7 +2646,7 @@ export const appendBodies = mutation({
       if (usage) await ctx.db.patch(usage._id, { bodyBytes: used + size });
       else await ctx.db.insert('runnerStorage', { runnerId: caller.runnerId, bytes: 0, bodyBytes: used + size });
     }
-    return { skipped };
+    return { skipped, ...(closed.size ? { closed: [...closed] } : {}) };
   },
 });
 
@@ -2348,6 +2751,10 @@ export const pruneBodies = internalMutation({
 });
 
 // One tool picture a person tapped (a `picture` command), there for a day.
+// From a runner key only in answer to that command, which it has taken and
+// not finished (runner/src/sync.ts sendHeldPicture records it before it
+// finishes the command), so how many there are is how many were asked for.
+const PICTURE_COMMANDS_READ = 50;
 export const addHeldPicture = mutation({
   args: {
     key: v.string(),
@@ -2359,24 +2766,35 @@ export const addHeldPicture = mutation({
     width: v.optional(v.number()),
     height: v.optional(v.number()),
   },
-  returns: v.null(),
+  returns: pictureAnswer,
   handler: async (ctx, { key, mediaType, ...sent }) => {
     const caller = await runnerAuth(ctx, key, 'addHeldPicture');
+    checkPicture(caller, { ...sent, mediaType });
     const mine = await ownThread(ctx, caller, sent.threadId);
     await mustMayUseStorage(ctx, caller, sent.storageId);
     if (mine === 'none') return (await freeStorage(ctx, caller, sent.storageId), null);
+    if (await closedId(ctx, sent.threadId)) return (await freeStorage(ctx, caller, sent.storageId), { later: true as const });
+    if (!caller.owner) {
+      const asked = await ctx.db.query('commands').withIndex('by_thread_state', (q) => q.eq('threadId', sent.threadId).eq('state', 'taken')).take(PICTURE_COMMANDS_READ);
+      // Refused whole (nothing here is kept): its upload, never attached, goes after a day (pruneFiles).
+      if (!asked.some((c) => c.kind === 'picture' && c.runnerId === caller.runnerId && c.args?.seq === sent.seq && c.args?.index === sent.index)) throw forbidden('hold a picture nobody asked for');
+    }
     const same = await ctx.db
       .query('heldPictures')
       .withIndex('by_thread_seq', (q) => q.eq('threadId', sent.threadId).eq('seq', sent.seq).eq('index', sent.index))
       .first();
     if (same) await freeStorage(ctx, caller, sent.storageId);
-    else await ctx.db.insert('heldPictures', { ...sent, mediaType: clean(mediaType), at: Date.now() });
+    else {
+      await mustBeUnnamed(ctx, caller, sent.storageId);
+      await ctx.db.insert('heldPictures', { ...sent, mediaType: clean(mediaType), at: Date.now() });
+    }
     return null;
   },
 });
 
 // Finished commands older than a day go, and paged marks older than a day
-// come off (crons.ts).
+// come off (crons.ts). What deletes stored files is pruneFiles, on its own:
+// a bad row there can't hold up the rest, nor this it.
 export const pruneOld = internalMutation({
   args: {},
   returns: v.null(),
@@ -2386,10 +2804,20 @@ export const pruneOld = internalMutation({
     // runs again straight away. One mutation that tried to clear a flood in
     // one go would go past Convex's limits, roll back, and do so every run.
     let left = PRUNE_BATCH;
+    // By when they finished. A finished command is small (its words dropped, a
+    // note cut, a call's answer at most RESULT_MAX_BYTES), and what's read is
+    // counted too, so a run of big ones ends the batch rather than the mutation.
+    let read = 0;
     for (const state of ['done', 'failed'] as const) {
-      // By when they finished (commands are small).
-      for (const c of await ctx.db.query('commands').withIndex('by_state_done', (q) => q.eq('state', state).lt('doneAt', cutoff)).take(Math.max(0, left))) {
+      for await (const c of ctx.db.query('commands').withIndex('by_state_done', (q) => q.eq('state', state).lt('doneAt', cutoff))) {
+        if (left <= 0 || read >= PRUNE_COMMAND_BYTES) {
+          left = 0;
+          break;
+        }
+        read += docBytes(c);
         await ctx.db.delete(c._id);
+        // Any record of its photos left from before endCommandFiles.
+        if (Array.isArray(c.args?.images) && c.args.images.length) await endCommandFiles(ctx, c._id);
         left--;
       }
     }
@@ -2400,12 +2828,6 @@ export const pruneOld = internalMutation({
     for (const m of await ctx.db.query('messages').withIndex('by_pagedAt', (q) => q.gt('pagedAt', 0).lt('pagedAt', cutoff)).take(Math.max(0, Math.min(left, PRUNE_MESSAGES)))) {
       await ctx.db.patch(m._id, { pagedAt: undefined });
       left -= Math.ceil(PRUNE_BATCH / PRUNE_MESSAGES);
-    }
-    // Tool pictures tapped more than a day ago.
-    for (const img of await ctx.db.query('heldPictures').withIndex('by_at', (q) => q.lt('at', cutoff)).take(Math.max(0, left))) {
-      await ctx.db.delete(img._id);
-      await deleteIfUnused(ctx, img.storageId);
-      left--;
     }
     // What sync:schedulesSince told runners went, likewise.
     for (const t of await ctx.db.query('scheduleGone').withIndex('by_at', (q) => q.lt('at', cutoff)).take(Math.max(0, left))) {
@@ -2430,11 +2852,6 @@ export const pruneOld = internalMutation({
       await ctx.db.delete(t._id);
       left--;
     }
-    for (const o of await ctx.db.query('storageOwners').withIndex('by_unattached', (q) => q.eq('attachedAt', undefined).lt('at', cutoff)).take(Math.max(0, Math.min(left, 100)))) {
-      if (await storageRefs(ctx, o.storageId)) await ctx.db.patch(o._id, { attachedAt: Date.now() });
-      else await deleteIfUnused(ctx, o.storageId);
-      left -= 10; // each looks through rows of its own
-    }
     // Thread index tombstones (API 29), once watchers have had a day to see them.
     for (const t of await ctx.db.query('threadIndex').withIndex('by_deleted_updated', (q) => q.eq('deleted', true).lt('updatedMs', cutoff)).take(Math.max(0, left))) {
       await ctx.db.delete(t._id);
@@ -2442,6 +2859,146 @@ export const pruneOld = internalMutation({
     }
     // Only when it did a full batch's work: there may be more.
     if (left <= 0) await ctx.scheduler.runAfter(0, internal.sync.pruneOld, {});
+    return null;
+  },
+});
+
+// Stored files' rows that run out (crons.ts), each kind a mutation's share at a
+// time, counted by what it read rather than how many: tool pictures tapped
+// over a day ago, runner keys' and phones' uploads never attached in a day,
+// and commands no runner took or finished in COMMAND_KEEP_MS. Each
+// deleteIfUnused reads a few rows of its own (storageInUse), charged as a
+// share of the row it's for, so rows from before picture rows were capped
+// (up to 1 MiB each) still go, a few a run, rather than stopping it for good.
+// With more left it runs again straight away.
+export const COMMAND_KEEP_MS = 14 * 24 * 60 * 60_000;
+const FILE_PRUNE_ROWS = 200;
+const FILE_PRUNE_BYTES = 6 * 1024 * 1024;
+// What storageInUse reads for one file: a row from each picture table, a few
+// KB each since the caps (and limitsMigration cut the ones from before).
+const FILE_CHECK_BYTES = 64 * 1024;
+export const pruneFiles = internalMutation({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    // Not until rows from before the caps are cut down, or a check could read
+    // far more than it's charged. Starts that if no heartbeat has (every Mac
+    // asleep when this backend went up).
+    if (!(await markSet(ctx, LIMITS_DONE))) {
+      await startLimitsMigration(ctx);
+      return null;
+    }
+    const now = Date.now();
+    const cutoff = now - KEEP_FINISHED_MS;
+    let rows = 0;
+    let bytes = 0;
+    const full = () => rows >= FILE_PRUNE_ROWS || bytes >= FILE_PRUNE_BYTES;
+    const charge = (doc: unknown, checks: number) => {
+      rows++;
+      bytes += docBytes(doc) + checks * FILE_CHECK_BYTES;
+    };
+    for await (const img of ctx.db.query('heldPictures').withIndex('by_at', (q) => q.lt('at', cutoff))) {
+      if (full()) break;
+      charge(img, 1);
+      await ctx.db.delete(img._id);
+      await deleteIfUnused(ctx, img.storageId);
+    }
+    for await (const o of ctx.db.query('storageOwners').withIndex('by_unattached', (q) => q.eq('attachedAt', undefined).lt('at', cutoff))) {
+      if (full()) break;
+      charge(o, 1);
+      if (await storageInUse(ctx, o.storageId)) await ctx.db.patch(o._id, { attachedAt: now });
+      else await deleteIfUnused(ctx, o.storageId);
+    }
+    // The phone's: a photo picked and never sent, or a ticket never used. One
+    // still in a waiting command stays (deleteIfUnused) until that's over.
+    for await (const u of ctx.db.query('phoneUploads').withIndex('by_issued', (q) => q.lt('issuedAt', cutoff))) {
+      if (full()) break;
+      charge(u, u.storageId ? 1 : 0);
+      await ctx.db.delete(u._id);
+      if (u.storageId) await deleteIfUnused(ctx, u.storageId);
+    }
+    // The main Mac's pictures for another runner (relay.ts): one that never
+    // went out, or a ticket never used. One in a waiting command stays
+    // (deleteIfUnused) until that's over.
+    for await (const u of ctx.db.query('relayUploads').withIndex('by_issued', (q) => q.lt('issuedAt', cutoff))) {
+      if (full()) break;
+      charge(u, u.storageId ? 1 : 0);
+      await ctx.db.delete(u._id);
+      if (u.storageId) await deleteIfUnused(ctx, u.storageId);
+    }
+    // Waiting or taken for weeks: its runner is gone, or never came back.
+    for (const state of ['pending', 'taken'] as const) {
+      for await (const c of ctx.db.query('commands').withIndex('by_state_created', (q) => q.eq('state', state).lt('createdAt', now - COMMAND_KEEP_MS))) {
+        if (full()) break;
+        const images = Array.isArray(c.args?.images) ? c.args.images : [];
+        charge(c, images.length);
+        await ctx.db.patch(c._id, { state: 'failed', doneAt: now, args: finishedArgs(c.args), note: state === 'pending' ? 'No runner took it in time.' : 'Its runner never finished it.' });
+        await endCommandFiles(ctx, c._id);
+        for (const image of images) await deleteIfUnused(ctx, image.storageId);
+      }
+    }
+    if (full()) await ctx.scheduler.runAfter(0, internal.sync.pruneFiles, {});
+    return null;
+  },
+});
+
+// Rows written before the backend's limits (7 Nov 2026), once, a page at a
+// time: picture rows cut to their caps (a mediaType, path or src of up to a
+// MiB each would make every later check read that much), registrations with
+// no real APNs token deleted (they never reached a phone), and commandFiles
+// rows for commands already on their way, so a delete elsewhere still sees
+// them. pruneFiles waits for it. Started by the first heartbeat (any key).
+const LIMITS_STARTED = 'limits-2026-11-07';
+const LIMITS_DONE = 'limits-2026-11-07-done';
+const MIGRATE_PAGE = 8;
+const APNS_TOKEN = /^[0-9a-fA-F]{16,200}$/;
+const MAX_DEVICES_PER_TOKEN = 5;
+async function markSet(ctx: QueryCtx | MutationCtx, name: string): Promise<boolean> {
+  return (await ctx.db.query('backendMarks').withIndex('by_name', (q) => q.eq('name', name)).first()) !== null;
+}
+async function startLimitsMigration(ctx: MutationCtx): Promise<void> {
+  if (await markSet(ctx, LIMITS_STARTED)) return;
+  await ctx.db.insert('backendMarks', { name: LIMITS_STARTED });
+  await ctx.scheduler.runAfter(0, internal.sync.limitsMigration, { step: 0, cursor: null });
+}
+const MIGRATE_STEPS = ['heldPictures', 'shareImages', 'replyImages', 'projectIcons', 'devices', 'deviceCap', 'pending', 'taken'] as const;
+export const limitsMigration = internalMutation({
+  args: { step: v.number(), cursor: v.union(v.string(), v.null()) },
+  returns: v.null(),
+  handler: async (ctx, { step, cursor }) => {
+    const what = MIGRATE_STEPS[step];
+    if (!what) {
+      if (!(await markSet(ctx, LIMITS_DONE))) await ctx.db.insert('backendMarks', { name: LIMITS_DONE });
+      return null;
+    }
+    const q =
+      what === 'pending' || what === 'taken'
+        ? ctx.db.query('commands').withIndex('by_state', (x) => x.eq('state', what))
+        : ctx.db.query(what === 'deviceCap' ? 'devices' : what);
+    const page = await (q as any).paginate({ numItems: MIGRATE_PAGE, cursor });
+    for (const row of page.page as Record<string, any>[]) {
+      if (what === 'devices') {
+        // Junk, or from before tokenId (they get no pushes: pushTargets.ts; devices:dropUnlinked).
+        if (!row.tokenId || !APNS_TOKEN.test(row.apnsToken) || (row.pushKey !== undefined && row.pushKey.length > 100) || utf8Bytes(row.tokenName) > 200) await ctx.db.delete(row._id);
+      } else if (what === 'deviceCap') {
+        // Past a token's newest MAX_DEVICES_PER_TOKEN (phone.ts registerDevice); small rows by now.
+        const newest = row.tokenId ? await ctx.db.query('devices').withIndex('by_tokenId', (x) => x.eq('tokenId', row.tokenId)).order('desc').take(MAX_DEVICES_PER_TOKEN) : [];
+        if (row.tokenId && !newest.some((d) => d._id === row._id)) await ctx.db.delete(row._id);
+      } else if (what === 'pending' || what === 'taken') {
+        for (const image of Array.isArray(row.args?.images) ? row.args.images.slice(0, MAX_COMMAND_FILES) : []) {
+          if (!image?.storageId) continue;
+          const had = await ctx.db.query('commandFiles').withIndex('by_commandId', (x) => x.eq('commandId', row._id)).take(MAX_COMMAND_FILES);
+          if (!had.some((f) => f.storageId === image.storageId)) await ctx.db.insert('commandFiles', { storageId: image.storageId, commandId: row._id });
+        }
+      } else if (docBytes(row) > 8 * 1024) {
+        const cut: Record<string, string> = {};
+        for (const [field, max] of [['mediaType', 100], ['path', PICTURE_PATH], ['src', PICTURE_PATH], ['picture', 200]] as const) {
+          if (typeof row[field] === 'string' && utf8Bytes(row[field]) > max) cut[field] = cutBytes(row[field], max);
+        }
+        if (Object.keys(cut).length) await ctx.db.patch(row._id, cut);
+      }
+    }
+    await ctx.scheduler.runAfter(0, internal.sync.limitsMigration, page.isDone ? { step: step + 1, cursor: null } : { step, cursor: page.continueCursor });
     return null;
   },
 });
@@ -2571,6 +3128,29 @@ export const otherRunnersList = query({
   handler: async (ctx, { key, runnerId }) => {
     await runnerAuth(ctx, key, 'otherRunnersList');
     return otherRunners(ctx, runnerId);
+  },
+});
+
+// API 58: Mike's runner order (lib.ts readRunnerOrder), the same one the
+// phone sets, for the Mac's Settings > Runners. The main Mac's key only: a
+// runner key can neither see nor move it, so no Mac with one can put
+// itself first for his new threads.
+export const runnerOrder = query({
+  args: { key: v.string() },
+  returns: v.array(v.string()),
+  handler: async (ctx, { key }) => {
+    await runnerAuth(ctx, key, 'runnerOrder');
+    return readRunnerOrder(ctx);
+  },
+});
+
+export const setRunnerOrder = mutation({
+  args: { key: v.string(), runnerIds: v.array(v.string()) },
+  returns: v.null(),
+  handler: async (ctx, { key, runnerIds }) => {
+    await runnerAuth(ctx, key, 'setRunnerOrder');
+    await saveRunnerOrder(ctx, runnerIds);
+    return null;
   },
 });
 
@@ -3007,7 +3587,7 @@ export const scrubStoredBatch = mutation({
     await runnerAuth(ctx, key, 'scrubStoredBatch');
     // Fewer of these at a time, as a row can be hundreds of KB.
     const most = table === 'eventBodies' ? BODY_SCRUB_ROWS : 500;
-    const page = await (ctx.db.query(table) as any).paginate({ numItems: Math.min(Math.max(limit ?? 200, 1), most), cursor });
+    const page = await (ctx.db.query(table) as any).paginate({ numItems: pageLimit(limit, Math.min(200, most), most), cursor });
     const changed: string[] = [];
     for (const row of page.page as Record<string, any>[]) {
       // A command still on its way has to reach the runner as it was typed.

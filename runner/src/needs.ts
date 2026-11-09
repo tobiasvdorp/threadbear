@@ -5,6 +5,7 @@
 
 import type { Ask, AskLink, NeedsWho, PersistedEvent } from './protocol.ts';
 import { hasLineBreak, replaceLinks } from './linear-text.ts';
+import { cutSafely, safeEnd } from './safe-cut.ts';
 
 export type Needs = { needs: NeedsWho; asks?: Ask[]; next?: string[] };
 
@@ -117,7 +118,7 @@ export function summaryFromTool(input: unknown): string[] | undefined {
   for (const b of v) {
     // The app draws them as a list, so a bullet of its own would be doubled.
     const t = typeof b === 'string' ? b.trim().replace(/^[-*•]\s+/, '').trim() : '';
-    if (t) out.push(t.slice(0, MAX_BULLET));
+    if (t) out.push(cutSafely(t, MAX_BULLET));
     if (out.length === MAX_SUMMARY) break;
   }
   return out.length ? out : undefined;
@@ -166,7 +167,7 @@ export function waitForFromTool(input: unknown): WaitFor[] | undefined {
   for (const x of w) {
     const o = x && typeof x === 'object' ? (x as Record<string, unknown>) : undefined;
     const id = (typeof x === 'string' ? x : typeof o?.thread === 'string' ? o.thread : '').trim();
-    const until = typeof o?.until === 'string' ? o.until.replace(/\s+/g, ' ').trim().slice(0, MAX_UNTIL) : '';
+    const until = typeof o?.until === 'string' ? cutSafely(o.until.replace(/\s+/g, ' ').trim(), MAX_UNTIL) : '';
     if (!id || out.some((y) => y.id === id)) continue;
     out.push(until ? { id, until } : { id });
     if (out.length === MAX_WAIT_FOR) break;
@@ -180,7 +181,7 @@ export function bylineFromTool(input: unknown): string | undefined {
   if (!input || typeof input !== 'object') return undefined;
   const v = (input as Record<string, unknown>).byline;
   if (typeof v !== 'string') return undefined;
-  return v.replace(/\s+/g, ' ').trim().slice(0, MAX_BYLINE) || undefined;
+  return cutSafely(v.replace(/\s+/g, ' ').trim(), MAX_BYLINE) || undefined;
 }
 
 function linksFrom(v: unknown): AskLink[] {
@@ -200,7 +201,7 @@ function linksFrom(v: unknown): AskLink[] {
 function str(v: unknown, max: number): string | undefined {
   if (typeof v !== 'string') return undefined;
   const t = v.trim();
-  return t ? t.slice(0, max) : undefined;
+  return t ? cutSafely(t, max) : undefined;
 }
 
 // Words Mike reads on the card, kept to max but cut at a word with an
@@ -209,9 +210,13 @@ function str(v: unknown, max: number): string | undefined {
 function clipText(v: unknown, max: number): string | undefined {
   const t = str(v, Number.MAX_SAFE_INTEGER);
   if (!t || t.length <= max) return t;
-  const cut = t.slice(0, max - 1);
-  const space = cut.lastIndexOf(' ');
-  return `${(space > max * 0.6 ? cut.slice(0, space) : cut).replace(/[\s,;:.-]+$/, '')}…`;
+  const end = safeEnd(t, max - 1);
+  const space = t.lastIndexOf(' ', end - 1);
+  // Back to a word's end is a cut too, and may be inside a value with a space in it.
+  const at = space > max * 0.6 ? safeEnd(t, space) : end;
+  // Taking punctuation off is a cut too (a known value can end in a full stop).
+  const tidy = t.slice(0, at).replace(/[\s,;:.-]+$/, '').length;
+  return `${t.slice(0, safeEnd(t, tidy))}…`;
 }
 
 // These read a model's reply, which content it read can steer, so none of
@@ -334,10 +339,15 @@ function nextFrom(item: string): string {
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/\s+/g, ' ')
     .trim();
-  const first = (/^.+?[.!?](?=\s|$)/.exec(t)?.[0] ?? t).replace(/\.$/, '');
+  // Each cut (the first sentence, the length, back to a word) is placed in
+  // the whole text, so none is inside a secret (safe-cut.ts).
+  const sentence = safeEnd(t, /^.+?[.!?](?=\s|$)/.exec(t)?.[0].length ?? t.length);
+  const first = t.slice(0, safeEnd(t, t.slice(0, sentence).replace(/\.$/, '').length));
   if (first.length <= MAX_NEXT_CHARS) return first;
-  const cut = first.slice(0, MAX_NEXT_CHARS);
-  return cut.slice(0, Math.max(cut.lastIndexOf(' '), 1)).replace(/[,;:]$/, '');
+  const end = safeEnd(t, MAX_NEXT_CHARS);
+  const space = t.lastIndexOf(' ', end - 1);
+  const cut = space > 0 ? safeEnd(t, space) : Math.max(end, 1);
+  return t.slice(0, safeEnd(t, t.slice(0, cut).replace(/[,;:]$/, '').length));
 }
 
 // "Open X, add Y, then reply 'done'" names the words to send back.
@@ -347,11 +357,13 @@ const REPLY = /\b(?:reply|send(?: back)?|say|answer|respond)(?: with)?\s+["'“�
 const MORE = /^\s*(?:,\s*(?:or\s+)?|or\s+|\/\s*)["'“‘`]([^"'”’`\n]{1,40})["'”’`]/i;
 
 function askFrom(item: string): Ask {
-  const action = item
-    .replace(/\*\*(.+?)\*\*/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, MAX_ACTION);
+  const action = cutSafely(
+    item
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim(),
+    MAX_ACTION,
+  );
   const ask: Ask = { action };
   const reply = REPLY.exec(action);
   if (!reply) return ask;
@@ -820,6 +832,14 @@ export function endTurnAccepted(result: { ok: boolean; text: string }): boolean 
   return result.ok && result.text.startsWith(ENDED);
 }
 
+// Added to an accepted end_turn's result while subagents wait on Mike's cards.
+export function openCardsNote(titles: string[]): string {
+  if (!titles.length) return '';
+  const shown = titles.slice(0, 3).map((t) => `"${t.slice(0, 120)}"`).join(', ');
+  const more = titles.length > 3 ? ` and ${titles.length - 3} more` : '';
+  return ` ${titles.length === 1 ? 'A sub-agent of yours is' : `${titles.length} of your sub-agents are`} parked until the user answers an approval card in this thread, not working: ${shown}${more}. Say so in your reply, rather than calling them running.`;
+}
+
 // An end_turn the handler took, Claude's (ENDED) or Codex's ("Noted. Now
 // write your final answer"), as opposed to one it refused.
 export function endTurnTaken(result: { ok: boolean; text: string }): boolean {
@@ -834,6 +854,10 @@ export function endTurnTaken(result: { ok: boolean; text: string }): boolean {
 // cdfccbc3). The message goes in the events before the CLI gets it, so the
 // agent can't have seen one that isn't there yet. One that came while the call
 // ran counts too, as the agent called it without having read that message.
+// A background task finishing mid-turn (a system.note with wake) opens it too,
+// from when the agent has read it (wakeRead). On 7 Nov 2026 a backgrounded
+// `tb land` finished just before the agent's "landing now" end_turn, and the
+// real report's end_turn was refused (thread 46de9389).
 export function takenEndTurn(events: PersistedEvent[], serverName = 'threadbear'): Record<string, unknown> | undefined {
   const endTurn = `mcp__${serverName}__${END_TURN_TOOL}`;
   let start = 0;
@@ -845,15 +869,58 @@ export function takenEndTurn(events: PersistedEvent[], serverName = 'threadbear'
   }
   const calls = new Map<string, Record<string, unknown>>();
   let taken: Record<string, unknown> | undefined;
+  const wake = new WakeRead();
   for (const e of events.slice(start)) {
-    if (e.type === 'user.message') {
+    if (e.type === 'user.message' || wake.see(e)) {
       calls.clear();
       taken = undefined;
     }
     if (e.type === 'tool.call' && e.name === endTurn) calls.set(e.itemId, e.input);
     if (e.type === 'tool.result' && !taken && endTurnTaken(e)) taken = calls.get(e.itemId);
   }
+  // Handed over with no step of the agent's since: the SDK can run this call
+  // before its own frames reach the events, so it is that step (from Codex's
+  // review).
+  if (wake.handed) return undefined;
   return taken;
+}
+
+// When the agent has read a background task's notification that came into
+// its turn (a system.note with wake), fed the turn's events in order. The CLI
+// hands it over with the next request to the model, after the next tool
+// results: the text and calls of the response that was being written when it
+// came weren't written with it, nor were tool results in the same batch, so
+// it counts from the agent's first step after a result (see() is true then).
+// Shared by takenEndTurn, the runner's turn and the Claude adapter's Stop
+// hook, so all three open the turn at the same event.
+export class WakeRead {
+  private state: 'none' | 'unread' | 'handed' = 'none';
+  // One that came while another was handed over: the request may have gone
+  // to the model before it, so it waits for results of its own (from Codex's
+  // review). At worst that opens the turn once more than needed.
+  private next = false;
+  get handed(): boolean {
+    return this.state === 'handed';
+  }
+  see(e: { type: string; itemId?: string; wake?: true }): boolean {
+    if (e.type === 'system.note' && e.wake) {
+      if (this.state === 'handed') this.next = true;
+      else this.state = 'unread';
+      return false;
+    }
+    if (e.type === 'tool.result' && this.state === 'unread') this.state = 'handed';
+    // A Codex child's items (<child>/<id>) aren't the agent's own steps.
+    else if (this.state === 'handed' && (e.type === 'assistant.text' || e.type === 'reasoning' || e.type === 'tool.call') && !e.itemId?.includes('/')) {
+      this.state = this.next ? 'unread' : 'none';
+      this.next = false;
+      return true;
+    }
+    return false;
+  }
+  reset(): void {
+    this.state = 'none';
+    this.next = false;
+  }
 }
 
 export function endedThisTurn(events: PersistedEvent[], serverName = 'threadbear'): boolean {

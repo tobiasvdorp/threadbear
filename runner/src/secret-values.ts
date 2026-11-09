@@ -205,9 +205,13 @@ export class KnownValues {
   private owner = '';
   private unreadFolders = new Set<string>();
   private lookInFolders: boolean;
+  private folderMs: number;
 
-  constructor(opts: { secretsDir?: string; env?: NodeJS.ProcessEnv; home?: string; now?: () => number; onError?: (what: string) => void; folders?: boolean } = {}) {
+  constructor(opts: { secretsDir?: string; env?: NodeJS.ProcessEnv; home?: string; now?: () => number; onError?: (what: string) => void; folders?: boolean; folderMs?: number } = {}) {
     this.secretsDir = opts.secretsDir;
+    // Tests that check what's read, not how fast, give it longer: a busy
+    // check host took over 5 s on 600 small files (7 Nov).
+    this.folderMs = opts.folderMs ?? FOLDER_MS;
     this.lookInFolders = opts.folders !== false;
     this.env = opts.env ?? process.env;
     this.home = opts.home ?? os.homedir();
@@ -318,7 +322,7 @@ export class KnownValues {
       let timer: NodeJS.Timeout | undefined;
       const answered = await Promise.race([
         this.lookInFolder(dir).then(() => true),
-        new Promise<boolean>((r) => (timer = setTimeout(() => r(false), FOLDER_MS))),
+        new Promise<boolean>((r) => (timer = setTimeout(() => r(false), this.folderMs))),
       ]);
       clearTimeout(timer);
       // Not counted as looked through: what's known from it stays.

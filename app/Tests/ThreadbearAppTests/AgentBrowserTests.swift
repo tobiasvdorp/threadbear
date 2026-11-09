@@ -2,22 +2,9 @@ import Foundation
 import Testing
 @testable import Threadbear
 
-/// The Browser panel's plain logic. The real checks need Chrome: they're in
-/// BrowserBear's agent/agent-host.mjs comments and were run by hand, 5 Nov 2026.
+/// The Browser panel's plain logic. The real checks need a browser: they're in
+/// BrowserBear's tests and agent/agent-host.mjs comments (5 and 8 Nov 2026).
 struct AgentBrowserTests {
-    @Test func handoffSelectsItsTabButReopeningKeepsTheUsersLaterChoice() {
-        var older = AgentTab(tabId: 1, url: "https://example.com/one", title: "One", state: "yours", handoffs: 1, handoffAt: 10)
-        let newer = AgentTab(tabId: 2, url: "https://example.com/two", title: "Two", state: "working", handoffs: 0, openedAt: 20)
-        var choice = AgentBrowserChoice()
-        choice.updateHandoff([older, newer])
-        #expect(choice.id == older.id)
-        choice.id = newer.id // the user picks another tab after seeing the handoff
-        choice.updateHandoff([older, newer]) // switch threads and back
-        #expect(choice.id == newer.id)
-        older.handoffs = 2; older.handoffAt = 30
-        choice.updateHandoff([older, newer])
-        #expect(choice.id == older.id, "a later handoff can pick the older tab again")
-    }
     @Test func aThreadsTabsDecodeFromTheHostsFile() throws {
         let json = """
         {"tabId":1004,"targetId":"AB","url":"https://example.com/","title":"Example","thread":"t1",
@@ -34,28 +21,18 @@ struct AgentBrowserTests {
         #expect(tab.thread == nil && tab.handoffs == nil)
     }
 
-    /// Chrome's passkey sheet over a page, from BrowserBear's agent host.
-    @Test func aSheetOverThePageDecodes() throws {
-        let json = #"{"tabId":1026,"targetId":"A","url":"https://x.com/","title":"X","sheet":{"moved":true,"since":1,"later":"ignored"}}"#
-        let tab = try JSONDecoder().decode(AgentTab.self, from: Data(json.utf8))
-        #expect(tab.sheet?.moved == true)
-        let none = try JSONDecoder().decode(AgentTab.self, from: Data(#"{"tabId":1,"url":"","title":"","sheet":null}"#.utf8))
-        #expect(none.sheet == nil)
-    }
-
-    @Test func keysGetTheNamesChromeWants() {
-        #expect(KeyNames.lookup(0).0 == "KeyA" && KeyNames.lookup(0).1 == 65)
-        #expect(KeyNames.lookup(51).0 == "Backspace")
-        #expect(KeyNames.lookup(29).0 == "Digit0")
-        #expect(KeyNames.code(forCharacter: "a") == 0)
-        #expect(KeyNames.code(forCharacter: " ") == 49)
-    }
-
     @Test func existingChromeTabsKeepTheirProfileAndThreadWithoutADebuggingPort() throws {
         let json = #"{"tabId":24,"url":"https://github.com/","title":"GitHub","thread":"t1","bridge":true,"profile":"personal-id","profileName":"Personal","profileEmail":"me@example.com"}"#
         let tab = try JSONDecoder().decode(AgentTab.self, from: Data(json.utf8))
         #expect(tab.bridge == true && tab.targetId == nil)
         #expect(tab.profile == "personal-id" && tab.profileTitle == "Personal · me@example.com")
+        #expect(tab.id == "personal-id/24")
+    }
+
+    /// The same tab number in the agents' browser is another page.
+    @Test func aTabInTheAgentsBrowserIsKeptApartFromOneInChrome() throws {
+        let tab = try JSONDecoder().decode(AgentTab.self, from: Data(#"{"tabId":24,"url":"https://github.com/","title":"GitHub"}"#.utf8))
+        #expect(tab.profileId == AgentBrowser.agentsBrowser && tab.id == "agent-chrome/24")
     }
 
     /// Frames come in many reads, several lines can share one, and a reply

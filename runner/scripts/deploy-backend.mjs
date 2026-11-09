@@ -10,13 +10,17 @@
 // the checkout, whose .env.local points at the dev deployment. The deploy key
 // is `CONVEX_DEPLOY_KEY=...` in <home>/secrets/convex-deploy.env (made with
 // `npx convex deployment token create threadbear-runner --prod --save-env <file>`);
-// with no key file it does nothing and says so. What it last deployed is in
-// <home>/backend.json. Node built-ins only, like deploy.mjs.
+// with no key file it does nothing and says so. A self-hosted backend
+// (docs/self-hosting.md) has its admin URL and key in
+// <home>/secrets/convex-self-hosted.env instead (src/convex-admin.ts). What
+// it last deployed is in <home>/backend.json. Node built-ins only, like
+// deploy.mjs (convex-admin.ts is too).
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { ConvexAdminError, convexEnv, prodArgs, readConvexAdmin } from '../src/convex-admin.ts';
 
 const HELP = `deploy-backend.mjs: deploy convex/ and web/ at a commit to the runner's Convex deployment, if they changed.
 
@@ -66,21 +70,17 @@ function writeJson(file, value) {
   fs.renameSync(tmp, file);
 }
 
-// The key is read, never printed. Its "prod:<name>|..." prefix names the
-// deployment, which has to be the one the runner mirrors to (runner.json
-// sync.url), or this would deploy one backend and the runner use another.
-function readKey(home) {
-  const file = path.join(home, 'secrets', 'convex-deploy.env');
-  let text;
+// The key is read, never printed. A deploy key's "prod:<name>|..." prefix
+// names the deployment, which has to be the one the runner mirrors to
+// (runner.json sync.url), or this would deploy one backend and the runner
+// use another.
+function readAdmin(home) {
   try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch {
-    return { file };
+    return readConvexAdmin(home);
+  } catch (e) {
+    if (e instanceof ConvexAdminError) throw new Fail(e.message);
+    throw e;
   }
-  const key = text.match(/^CONVEX_DEPLOY_KEY=["']?([^"'\n]+)["']?\s*$/m)?.[1];
-  if (!key) throw new Fail(`${file} has no CONVEX_DEPLOY_KEY= line.`);
-  const deployment = key.match(/^[a-z]+:([a-z0-9-]+)\|/)?.[1];
-  return { file, key, deployment };
 }
 
 function hasRunnerKey(home) {
@@ -233,9 +233,14 @@ function main(argv) {
   const commit = git(repo, ['rev-parse', v.commit ?? 'HEAD']);
   const short = commit.slice(0, 7);
   const want = { functions: treeOf(repo, commit, FUNCTION_PATHS), site: treeOf(repo, commit, SITE_PATHS) };
+  // The website has the backend's address built into it (VITE_CONVEX_URL),
+  // so it's built again when that changes too: a self-hosted backend whose
+  // Mac was renamed has a new one (docs/self-hosting.md). Deploys from before
+  // this was recorded have no url, and aren't redone for that alone.
+  const siteUrl = readJson(path.join(home, 'runner.json')).sync?.url;
   const todo = {
     functions: v.force || state.functions?.tree !== want.functions,
-    site: v.force || state.site?.tree !== want.site,
+    site: v.force || state.site?.tree !== want.site || (state.site?.url !== undefined && state.site.url !== siteUrl),
   };
   if (!todo.functions && !todo.site) {
     say(`Backend up to date at ${short}.`);
@@ -249,18 +254,23 @@ function main(argv) {
     say('This Mac has a runner key of its own, so it leaves deploying the backend to the main Mac.');
     return 0;
   }
-  const { file: keyFile, key, deployment } = readKey(home);
-  if (!key) {
-    say(`No deploy key in ${keyFile}, so the backend isn't deployed automatically. Make one with:\n  npx convex deployment token create threadbear-runner --prod --save-env "${keyFile}"`);
+  const admin = readAdmin(home);
+  if (admin.kind === 'none') {
+    say(`No deploy key in ${admin.file}, so the backend isn't deployed automatically. Make one with:\n  npx convex deployment token create threadbear-runner --prod --save-env "${admin.file}"`);
     return 0;
   }
+  const deployment = admin.kind === 'cloud' ? admin.deployment : undefined;
   const sync = syncDeployment(home);
   if (sync?.name && deployment && sync.name !== deployment) {
     throw new Fail(`The deploy key is for ${deployment}, but the runner mirrors to ${sync.url}. Make a key for that deployment.`);
   }
+  // A self-hosted backend has no deployment name to compare, and its admin
+  // URL is this Mac's loopback port while sync.url is its tailnet name, so
+  // there's nothing to check here: setup writes both from the same backend.
+  const target = admin.kind === 'selfHosted' ? `the self-hosted backend at ${admin.url}` : (deployment ?? "the key's deployment");
   const what = [todo.functions && 'functions', todo.site && 'website'].filter(Boolean).join(' and ');
   if (v['dry-run']) {
-    say(`Would deploy the ${what} at ${short} to ${deployment ?? 'the key\'s deployment'}.`);
+    say(`Would deploy the ${what} at ${short} to ${target}.`);
     return 0;
   }
 
@@ -274,8 +284,7 @@ function main(argv) {
 
   // Only the key picks the deployment: anything left over from a checkout's
   // .env.local or a thread's environment could point somewhere else.
-  const env = { ...process.env, CONVEX_DEPLOY_KEY: key, PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ''}` };
-  for (const k of ['CONVEX_DEPLOYMENT', 'CONVEX_URL', 'CONVEX_SELF_HOSTED_URL', 'CONVEX_SELF_HOSTED_ADMIN_KEY']) delete env[k];
+  const env = convexEnv(admin, { ...process.env, PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ''}` });
   const npm = path.join(path.dirname(process.execPath), 'npm');
   const npx = path.join(path.dirname(process.execPath), 'npx');
   const opts = { cwd: tmp, env };
@@ -299,11 +308,11 @@ function main(argv) {
   }
   if (todo.site) {
     try {
-      step(`Uploading the website at ${short}`, npx, ['static-hosting', 'upload', '--build', '--build-command', 'npm run web:build', '--dist', 'web/dist', '--prod'], opts);
+      step(`Uploading the website at ${short}`, npx, ['static-hosting', 'upload', '--build', '--build-command', 'npm run web:build', '--dist', 'web/dist', ...prodArgs(admin)], opts);
     } catch (e) {
       failed('website', e);
     }
-    writeJson(stateFile, { ...readJson(stateFile), site: { tree: want.site, commit, at: new Date().toISOString() }, failed: undefined });
+    writeJson(stateFile, { ...readJson(stateFile), site: { tree: want.site, commit, at: new Date().toISOString(), ...(siteUrl ? { url: siteUrl } : {}) }, failed: undefined });
   }
   say(`Backend deployed at ${short} (${what}).`);
   return 0;

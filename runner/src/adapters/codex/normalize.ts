@@ -16,6 +16,7 @@ import { truncateResultText, type NormalizerContext } from '../context.ts';
 import { displayPath, toolTitle, truncateInput } from '../../tools.ts';
 import type { Logger } from '../../log.ts';
 import { isSpace } from '../../linear-text.ts';
+import { cutSafely, firstLineSafely } from '../../safe-cut.ts';
 
 type AnyMsg = Record<string, any>;
 
@@ -1043,7 +1044,7 @@ function mcpStartError(name: string, error: unknown): string {
   let s = error.replace(new RegExp(`^MCP client for \`${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\` failed to start:\\s*`), '');
   const clauses = s.split(/:\s+/).filter((c) => c && !/^(Send message error|Transport \[|\[)/.test(c));
   s = clauses.slice(0, 2).join(': ');
-  return s.length > 160 ? s.slice(0, 159).trimEnd() + '…' : s;
+  return cutSafely(s, 160, '…');
 }
 
 function usageWindow(kind: UsageWindow['kind'], title: string, w: AnyMsg): UsageWindow {
@@ -1095,9 +1096,7 @@ function diffTotals(a: Totals, b: Totals): Totals {
 }
 
 function firstLine(s: string, max = 100): string {
-  const line = s.split('\n').find((l) => l.trim() !== '') ?? '';
-  const t = line.trim();
-  return t.length > max ? t.slice(0, max - 1) + '…' : t;
+  return firstLineSafely(s, max, '…');
 }
 
 function ev(event: EventBody): AdapterOutput {

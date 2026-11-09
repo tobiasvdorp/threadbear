@@ -24,6 +24,7 @@ import type { ThreadRecord } from '../store.ts';
 import { experimentOn } from '../experiments.ts';
 import { pickInPool, poolAccounts, poolForFolder } from '../pools.ts';
 import { providerName } from '../runner.ts';
+import { cutSafely, safeEnd } from '../safe-cut.ts';
 
 export const LAB_REVIEW_ROUNDS = 2;
 // Fewer changed lines of code than this (docs and plain text don't count)
@@ -91,7 +92,7 @@ export const labReviewPart = {
         // Full, as before; an Ask or Auto one asks or checks the same way.
         // Anything else (a record from before modes) gets Ask.
         permissionMode: reviewMode(rec.permissionMode),
-        title: `Review: ${rec.title}`.slice(0, 120),
+        title: cutSafely(`Review: ${rec.title}`, 120),
         // The same checkout, as it is now, not a worktree of its own.
         worktree: false,
         startedBy: { kind: 'thread', label: 'Review', threadId: rec.id, threadTitle: rec.title, why: 'checks a change before it is called done' },
@@ -253,7 +254,7 @@ export function reviewMode(mode: PermissionMode | undefined): PermissionMode {
 
 function clip(text: string, max: number): string {
   const t = text.trim();
-  return t.length > max ? t.slice(0, max) + '…' : t;
+  return t.length > max ? t.slice(0, safeEnd(t, max)) + '…' : t;
 }
 
 // One line, quoted, for a title or path an agent chose: no line breaks

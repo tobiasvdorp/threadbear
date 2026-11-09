@@ -33,7 +33,14 @@ export const highlightsPart = {
 
   // The `pin` tool: a file (relative to the thread's folder is fine) or a
   // URL, for Mike to look at. Returns the highlight's id.
-  pin(this: Runner, threadId: string, target: { path?: string; url?: string; title?: string; note?: string; show?: boolean }): { id: string; scriptsOff?: true } {
+  // With `show`, it also asks the app to open it in the pane, as a
+  // show_panel request naming the highlight (docs/protocol.md, "Showing
+  // panels"), and resolves once the app has (shown) or the wait is up.
+  // A one-shot request, not a flag on the item: a flag only changed the
+  // first time, so pinning the same page again after an edit showed
+  // nothing, and nor did a pin made while Mike was on another thread
+  // (8 Nov 2026).
+  async pin(this: Runner, threadId: string, target: { path?: string; url?: string; title?: string; note?: string; show?: boolean }, waitMs = PANEL_ACK_WAIT_MS): Promise<{ id: string; scriptsOff?: true; shown?: boolean }> {
     const st = this.mustGet(threadId);
     if (Boolean(target.path) === Boolean(target.url)) throw new RpcError(ErrorCode.badParams, 'Pin a path or a url, one of the two.');
     let file: string | undefined;
@@ -52,7 +59,12 @@ export const highlightsPart = {
     state.removed = state.removed?.filter((id) => id !== item.id);
     upsertHighlight(state, item);
     this.highlightsChanged(st);
-    return file && pageHasScripts(file) ? { id: item.id, scriptsOff: true } : { id: item.id };
+    const out: { id: string; scriptsOff?: true; shown?: boolean } = file && pageHasScripts(file) ? { id: item.id, scriptsOff: true } : { id: item.id };
+    if (target.show) {
+      const title = state.items.find((h) => h.id === item.id)?.title ?? item.title;
+      out.shown = await this.requestPanel(st, { id: crypto.randomUUID(), panel: 'highlights', title, highlight: item.id, at: this.isoNow() }, waitMs);
+    }
+    return out;
   },
 
   unpin(this: Runner, threadId: string, highlightId: string): { removed: boolean } {
@@ -82,14 +94,19 @@ export const highlightsPart = {
     }
     const request: PanelRequest = { id: crypto.randomUUID(), panel: panel.id, title: panel.title, at: this.isoNow() };
     if (ask.where) request.where = ask.where;
+    return { request, shown: await this.requestPanel(st, request, waitMs) };
+  },
+
+  // Puts the request on the thread, replacing an older one, and waits for
+  // the app to show it. The request is there before the promise returns.
+  requestPanel(this: Runner, st: ThreadState, request: PanelRequest, waitMs: number): Promise<boolean> {
     this.endPanelWait(st, false);
     st.rec.panelRequest = request;
     this.markDirty(st);
-    const shown = await new Promise<boolean>((resolve) => {
+    return new Promise<boolean>((resolve) => {
       const timer = this.clock.setTimeout(() => this.endPanelWait(st, false), waitMs);
       st.rt.panelWaiter = { id: request.id, resolve, timer };
     });
-    return { request, shown };
   },
 
   // The app has shown the thread's panel request: it's done.

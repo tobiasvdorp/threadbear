@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { execFileSync } from 'node:child_process';
 import { makeHarness, tick, tmpDir } from '../helpers/fakes.ts';
 import { Projects, projectMethods } from '../../src/projects.ts';
 import { Librarian, ICON_SOON_MS, ICON_SWEEP_MS } from '../../src/librarian.ts';
-import { findIcon, imageSize, phonePicture, SYMBOLS } from '../../src/project-icons.ts';
+import { findIcon, imageSize, phonePicture, storeIcon, SYMBOLS } from '../../src/project-icons.ts';
+import { magickCommand, pictureKind, svgToPng } from '../../src/images.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
 import { FakeClock } from '../../src/clock.ts';
 import { nullLogger } from '../../src/log.ts';
@@ -216,4 +218,70 @@ test('the phone gets a PNG as it is and an SVG drawn to a 256 px PNG', async () 
   assert.deepEqual(await imageSize(drawnPath, '.png'), { width: 256, height: 256 });
   await assert.rejects(phonePicture(path.join(dir, 'missing.png'), 'image/png'));
   await assert.rejects(phonePicture(pngPath, 'image/x-icon'), /can't show/);
+});
+
+// Daybreak, 8 Nov ("Linux icon conversion can execute repository-supplied
+// MSL"): a repo's manifest.json named icon.msl, the librarian picked it, and
+// on Linux it went to ImageMagick, which chose its MSL decoder for it: a
+// script that writes files.
+const MSL = '<?xml version="1.0" encoding="UTF-8"?>\n<image><read filename="/etc/hosts"/><write filename="/tmp/tb-pwned.txt"/></image>\n';
+
+test("a manifest's icon has to be a picture of the repo's own: not a script, not a link out of it", async () => {
+  const root = tmpDir();
+  const msl = folder(root, 'evil-ext', { 'manifest.json': JSON.stringify({ manifest_version: 3, icons: { '128': 'icon.msl' } }), 'icon.msl': MSL });
+  assert.equal(await findIcon([msl]), undefined);
+  const mvg = folder(root, 'evil-expo', { 'app.json': JSON.stringify({ expo: { icon: './icon.mvg' } }), 'icon.mvg': 'push graphic-context' });
+  assert.equal(await findIcon([mvg]), undefined);
+  // A link to a file outside, named like a picture.
+  const secret = path.join(root, 'secret.png');
+  fs.writeFileSync(secret, png(128, 128));
+  const linked = folder(root, 'linked-ext', { 'manifest.json': JSON.stringify({ manifest_version: 3, icons: { '128': 'icon.png' } }) });
+  fs.symlinkSync(secret, path.join(linked, 'icon.png'));
+  assert.equal(await findIcon([linked]), undefined);
+  // Through a linked folder.
+  const viaDir = folder(root, 'via-dir', { 'manifest.json': JSON.stringify({ manifest_version: 3, icons: { '128': 'art/secret.png' } }) });
+  fs.symlinkSync(root, path.join(viaDir, 'art'));
+  assert.equal(await findIcon([viaDir]), undefined);
+});
+
+test('ImageMagick is only ever handed a picture, with its decoder named', () => {
+  const dir = tmpDir();
+  const out = path.join(dir, 'out.png');
+  const write = (name: string, body: string | Buffer) => (fs.writeFileSync(path.join(dir, name), body), path.join(dir, name));
+  // A script, whatever it's called.
+  for (const name of ['icon.msl', 'icon.png', 'icon.svg', 'icon.mvg']) assert.equal(magickCommand('/usr/bin/magick', write(name, MSL), out, { format: 'png' }), undefined, name);
+  assert.equal(magickCommand('/usr/bin/magick', write('text.png', 'push graphic-context\nviewbox 0 0 1 1'), out, { format: 'png' }), undefined);
+  // A real PNG, even one named otherwise, goes to the PNG decoder by name.
+  const real = write('real.msl', png(8, 8));
+  const cmd = magickCommand('/usr/bin/magick', real, out, { format: 'png', maxPx: 256 });
+  assert.equal(cmd?.[1][0], `png:${real}[0]`);
+  assert.equal(cmd?.[1].at(-1), `png:${out}`);
+  assert.equal(pictureKind(Buffer.from([0xff, 0xd8, 0xff, 0xe0])), 'jpeg');
+  assert.equal(pictureKind(Buffer.from('\0\0\0\x18ftypheic', 'latin1')), 'heic');
+  assert.equal(pictureKind(Buffer.from('RIFF\0\0\0\0WEBPVP8 ', 'latin1')), 'webp');
+  assert.equal(pictureKind(Buffer.from('<?xml', 'latin1')), undefined);
+});
+
+test("storing an icon that isn't a picture by its bytes is refused, not copied or converted", async () => {
+  const dir = tmpDir();
+  const src = path.join(dir, 'icon.png');
+  fs.writeFileSync(src, MSL);
+  await assert.rejects(storeIcon(src, path.join(dir, 'icons'), 'p1', 'h'), /Not a picture/);
+  assert.ok(!fs.existsSync(path.join(dir, 'icons', 'p1-h.png')));
+});
+
+test('an SVG is never drawn by ImageMagick on Linux', { skip: process.platform === 'darwin' }, async () => {
+  // In a process of its own: images.ts remembers what it found on PATH, and
+  // this one's PATH has only a magick that notes it ran.
+  const dir = tmpDir();
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'magick'), `#!/bin/sh\ntouch ${JSON.stringify(path.join(dir, 'ran'))}\n`, { mode: 0o755 });
+  const svg = path.join(dir, 'a.svg');
+  fs.writeFileSync(svg, '<svg viewBox="0 0 1 1"><image href="msl:/tmp/x.msl"/></svg>');
+  const images = new URL('../../src/images.ts', import.meta.url).href;
+  const script = `const { svgToPng } = await import(${JSON.stringify(images)}); console.log(await svgToPng(${JSON.stringify(svg)}, ${JSON.stringify(path.join(dir, 'a.png'))}, 64));`;
+  const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, PATH: bin }, encoding: 'utf8' });
+  assert.equal(out.trim(), 'false');
+  assert.ok(!fs.existsSync(path.join(dir, 'ran')), 'ImageMagick was not run');
 });

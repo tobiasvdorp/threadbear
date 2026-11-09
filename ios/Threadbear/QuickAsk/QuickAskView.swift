@@ -306,7 +306,6 @@ private struct ThinkingDots: View {
 /// Settings › Ask: where questions go, and how answers sound.
 struct QuickAskSettingsSection: View {
     @Environment(QuickAskModel.self) private var quick
-    @Environment(\.openURL) private var openURL
     @State private var tokenDraft = ""
     @State private var showingAbout = false
 
@@ -351,7 +350,7 @@ struct QuickAskSettingsSection: View {
         .alert("Ask", isPresented: $showingAbout) {
             // There's no public server yet (Mike's is Agent Archive), so this is how anyone else gets one.
             Button("How to set one up") {
-                openURL(URL(string: "https://github.com/mikecann/threadbear/blob/main/docs/ask-server.md")!)
+                LinkGate.shared.openOwn(URL(string: "https://github.com/mikecann/threadbear/blob/main/docs/ask-server.md")!)
             }
             Button("OK", role: .cancel) {}
         } message: {

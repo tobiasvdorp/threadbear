@@ -150,3 +150,68 @@ export function seeker(text: string, stop: (c: string) => boolean): (from: numbe
     return at;
   };
 }
+
+// The captures of `/url\(\s*["']?([^"')]+)["']?\s*\)/gi`, in order, as
+// matchAll gave them (a review page's stylesheet references, review-media.ts).
+// As a regex, `url(` and a long run of spaces with no `)` made it try every
+// split of the run between its `\s*` and the capture, at every `url(`
+// (Daybreak, 7 Nov 2026). Here each `url(` is settled by a few forward-only
+// searches (seeker), the cases the regex's backtracking reaches:
+// - after the spaces, a quote: the value runs from after it to the next
+//   quote or `)`; then `)`, or a quote, spaces and `)`;
+// - failing that (or a `)` straight after the spaces), the last space alone
+//   is the value, if a quote, spaces and `)` or a `)` follow it;
+// - after the spaces, anything else: the value runs from there to the next
+//   quote or `)`, closed the same way.
+// A match goes on after its `)`, a miss at the next `url(`.
+export function cssUrlCaptures(text: string): string[] {
+  const n = text.length;
+  const isStop = (c: string) => c === '"' || c === "'" || c === ')';
+  const isQuote = (c: string | undefined) => c === '"' || c === "'";
+  // One seeker per place a search starts, so each one's `from` only moves forward.
+  const notSpaceAfterOpen = seeker(text, (c) => !isSpace(c));
+  const stopAfterQuote = seeker(text, isStop);
+  const stopAfterSpaces = seeker(text, isStop);
+  const closeAfterQuoted = seeker(text, (c) => !isSpace(c));
+  const closeAfterBare = seeker(text, (c) => !isSpace(c));
+  const closeAfterSpace = seeker(text, (c) => !isSpace(c));
+  // Where the `)` is when the value ends at `e` (the next quote or `)`), or -1.
+  const close = (e: number, after: (from: number) => number): number => {
+    if (e < 0) return -1;
+    if (text[e] === ')') return e;
+    const r = after(e + 1);
+    return r >= 0 && text[r] === ')' ? r : -1;
+  };
+  const out: string[] = [];
+  const open = /url\(/gi;
+  let resume = 0;
+  for (let m = open.exec(text); m; m = open.exec(text)) {
+    if (m.index < resume) continue;
+    const s = m.index + 4;
+    const w = notSpaceAfterOpen(s);
+    if (w < 0) continue;
+    let found: [number, number, number] | undefined; // value start, end, the `)`
+    if (isQuote(text[w])) {
+      const b = w + 1;
+      if (b < n && !isStop(text[b]!)) {
+        const e = stopAfterQuote(b);
+        const r = close(e, closeAfterQuoted);
+        if (r >= 0) found = [b, e, r];
+      }
+    } else if (text[w] !== ')') {
+      const e = stopAfterSpaces(w);
+      const r = close(e, closeAfterBare);
+      if (r >= 0) found = [w, e, r];
+    }
+    // The last space as the value, then the quote or `)` at w.
+    if (!found && w > s && (isQuote(text[w]) || text[w] === ')')) {
+      const r = close(w, closeAfterSpace);
+      if (r >= 0) found = [w - 1, w, r];
+    }
+    if (!found) continue;
+    out.push(text.slice(found[0], found[1]));
+    resume = found[2] + 1;
+    open.lastIndex = resume;
+  }
+  return out;
+}

@@ -29,12 +29,17 @@ enum FileLinkAction: String, CaseIterable {
     /// A project file with an app here to open it. Asking for the app means
     /// a missing file, or a Mac without that app, still gets the pane and
     /// its "isn't there any more" rather than a click that does nothing.
+    /// The file itself counts, not the name a symlink gives it: a
+    /// `project.tandem` linked to a `.command` isn't a project (Daybreak,
+    /// 7 Nov). OpenGate looks again before anything opens.
     static func opensInItsApp(_ path: String, appFor: (URL) -> URL? = defaultApp) -> Bool {
-        PreviewRules.isAppProject(path) && appFor(URL(fileURLWithPath: path)) != nil
+        guard PreviewRules.isAppProject(path) else { return false }
+        let real = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        return PreviewRules.isAppProject(real.path) && appFor(real) != nil
     }
 
     static func defaultApp(_ url: URL) -> URL? {
-        FileManager.default.fileExists(atPath: url.path) ? NSWorkspace.shared.urlForApplication(toOpen: url) : nil
+        FileManager.default.fileExists(atPath: url.path) ? OpenGate.appFor(url) : nil
     }
 
     /// The app macOS opens `path` in, for "Open in Xcode".
@@ -205,7 +210,7 @@ final class WebLinkMenu: NSObject {
         url: URL,
         open: @escaping (URL, WebLinkAction) -> Void,
         profiles: [ChromeProfile] = ChromeProfiles.open(),
-        openInProfile: @escaping (URL, ChromeProfile) -> Void = ChromeProfiles.open
+        openInProfile: @escaping (URL, ChromeProfile) -> Void = { url, profile in MainActor.assumeIsolated { ChromeProfiles.open(url, in: profile) } }
     ) {
         self.url = url
         self.open = open

@@ -270,7 +270,7 @@ struct HighlightsView: View {
                        trailing: how.flatMap { $0.isEmpty ? nil : $0 }, note: item.note, detail: detail,
                        titleTruncation: item.path == nil ? .tail : .middle,
                        action: isCommit ? nil : { app.open(item, in: thread, external: false) })
-            .fileDrag(item.path.map(URL.init(fileURLWithPath:)) ?? item.link)
+            .fileDrag(item.path.map(URL.init(fileURLWithPath:)) ?? item.link, in: thread)
             .iconContextMenu {
                 if let path = item.path {
                     FileMenu(path: path, thread: thread, title: item.title)
@@ -313,7 +313,7 @@ struct HighlightsView: View {
                     }
                 }
                 .tip("Open in its app")
-                .fileDrag(URL(fileURLWithPath: path))
+                .fileDrag(URL(fileURLWithPath: path), in: thread)
                 .iconContextMenu { FileMenu(path: path, thread: thread, title: (path as NSString).lastPathComponent) }
             }
         }
@@ -384,12 +384,15 @@ private struct ProjectWhyButton: View {
 
 extension View {
     /// Drags a row's file or link out of the app (FileDrag): a file as the
-    /// file itself, for X or the Finder. Nothing for a file that's gone.
+    /// file itself, for X or the Finder. Nothing for a file that's gone,
+    /// and for another Mac's thread only this Mac's whole copy of it,
+    /// never the file here that has the same path (Daybreak, 7 Nov).
     @ViewBuilder
-    func fileDrag(_ url: URL?) -> some View {
+    func fileDrag(_ url: URL?, in thread: ThreadSummary) -> some View {
         if let url {
             onDrag {
-                guard FileDrag.writer(for: url) != nil else { return NSItemProvider() }
+                guard let url = MainActor.assumeIsolated({ AppModel.shared.localCopy(of: url, in: thread) }),
+                      FileDrag.writer(for: url) != nil else { return NSItemProvider() }
                 // A page's ?query isn't part of its file.
                 return NSItemProvider(object: (url.isFileURL ? URL(fileURLWithPath: url.path) : url) as NSURL)
             }
@@ -665,8 +668,11 @@ struct PreviewBody: View {
             LocalPagePreview(url: URL(fileURLWithPath: path), opened: preview.opened)
                 .id(path)
         } else if TextFileView.shows(path) {
-            TextFileView(url: URL(fileURLWithPath: path), opened: preview.opened, editing: preview.editing)
-                .id(path)
+            TextFileView(url: URL(fileURLWithPath: path), opened: preview.opened, editing: preview.editing, threadId: thread.id,
+                         stayedEditing: { [thread] in app.setPreviewEditing(true, in: thread.id) })
+                // The thread too: its links are followed in that thread, and
+                // two threads on one runner can show the same copy.
+                .id("\(thread.id) \(path)")
         } else {
             QuickLookView(url: URL(fileURLWithPath: path), opened: preview.opened)
         }
@@ -754,7 +760,8 @@ struct PreviewButtons: View {
         }
         if let url = preview.externalURL {
             PaneHeaderButton(symbol: "arrow.up.right", help: preview.folderPath != nil ? "Open in Finder" : preview.fileURL == nil ? "Open in browser" : "Open in its app") {
-                app.openExternally(url)
+                // Another Mac's copy is never opened as a program.
+                app.openExternally(url, from: preview.away == nil ? .thisMac : app.copyOrigin(of: thread))
             }
         }
     }

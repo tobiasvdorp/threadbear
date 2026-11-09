@@ -19,7 +19,9 @@ import { linkItem, linksIn, pushedBranches } from '../../src/highlights.ts';
 import { mainCheckout } from '../../src/librarian.ts';
 import { markdownImages } from '../../src/share-images.ts';
 import { cleanTitle as notionTitle, findSource, pickView, readSchema } from '../../src/notion-tasks.ts';
-import { pageHasScripts } from '../../src/runner/highlights.ts';
+import { hasScriptMarks, pageHasScripts } from '../../src/runner/highlights.ts';
+import { namedFiles } from '../../src/review-media.ts';
+import { cssUrlCaptures, cutQueryAndHash } from '../../src/linear-text.ts';
 import { cleanTitle } from '../../src/runner.ts';
 
 // Characters the Write tool and editors like to turn into the real thing.
@@ -158,7 +160,7 @@ test('F25: long runs in .env files parse in linear time', () => {
   assert.equal(fast('unclosed', () => parseEnvFile('A="x\n'.repeat(8000))).length, 8000);
 });
 
-test('F25: a folder with hundreds of .env files is read in full, as before', async (t) => {
+test('F25: a folder with hundreds of .env files is read in full, as before', async () => {
   // No count limit: one that stopped at 500 let a repo's junk push your own
   // .env.qa.local out of the mask (Codex's review of this fix).
   const home = tmpDir();
@@ -167,11 +169,10 @@ test('F25: a folder with hundreds of .env files is read in full, as before', asy
   for (let i = 0; i < 600; i++) fs.writeFileSync(path.join(repo, `.env.aaa${String(i).padStart(3, '0')}`), 'PLAIN=1\n');
   const own = `${crypto.randomBytes(24).toString('base64url')}7`;
   fs.writeFileSync(path.join(repo, '.env.qa.local'), `QA_PASSWORD=${own}\n`);
-  // Check the file count independently of the scan's real-time deadline.
-  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
-  const known = new KnownValues({ env: {}, home });
+  // What's read, not how fast: a busy machine took over the usual 5 s.
+  const known = new KnownValues({ env: {}, home, folderMs: 120_000 });
   known.noteFolder(repo);
-  assert.equal(await known.settled(), true);
+  assert.equal(await known.settled(150_000), true);
   assert.equal(known.unread, 0);
   assert.ok(!known.mask(`it is ${own}`).includes(own));
 });
@@ -481,4 +482,133 @@ test('linear-text helpers give what the regexes they replaced gave', async () =>
   const LINK = ['[', ']', '(', ')', '](', 'a', ' ', '\n'];
   same('replaceLinks', LINK, (s) => s.replace(/\[([^\]]+)\]\([^)]*\)/g, '<$1>'), (s) => L.replaceLinks(s, { titleStopsAtNewline: false, titleMin: 1, titleMax: Infinity, targetStopsAtSpace: false, targetMin: 0 }, (t) => `<${t}>`));
   same('replaceLinks', LINK, (s) => s.replace(/\[([^\]\n]{0,3})\]\(([^)\s]+)\)/g, '<$1|$2>'), (s) => L.replaceLinks(s, { titleStopsAtNewline: true, titleMin: 0, titleMax: 3, targetStopsAtSpace: true, targetMin: 1 }, (t, u) => `<${t}|${u}>`));
+});
+
+// ------------------------------------- review pages (Daybreak, 7 Nov 2026)
+
+// CPU time, not the clock, so a loaded machine's waits don't count; the
+// best of up to five, as in `fast`.
+function cheap<T>(what: string, fn: () => T): T {
+  let best = Infinity;
+  let out!: T;
+  for (let i = 0; i < 5 && best >= 100; i++) {
+    const cpu = process.cpuUsage();
+    out = fn();
+    const { user, system } = process.cpuUsage(cpu);
+    best = Math.min(best, (user + system) / 1000);
+  }
+  assert.ok(best < 100, `${what} took ${Math.round(best)} ms of CPU`);
+  return out;
+}
+
+// namedFiles as it was before, to hold the new one to.
+function oldNamedFiles(text: string, base: string, root: string): string[] {
+  const refs: string[] = [];
+  for (const m of text.matchAll(/\b(?:src|href|poster|data)\s*=\s*["']([^"']+)["']/gi)) refs.push(m[1]!);
+  for (const m of text.matchAll(/\bsrcset\s*=\s*["']([^"']+)["']/gi)) refs.push(...m[1]!.split(',').map((s) => s.trim().split(/\s+/)[0]!));
+  for (const m of text.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)) refs.push(m[1]!);
+  for (const m of text.matchAll(/@import\s+["']([^"']+)["']/gi)) refs.push(m[1]!);
+  const files: string[] = [];
+  for (const raw of refs) {
+    const ref = raw.trim().replace(/[?#].*$/, '');
+    if (!ref || /^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith('/') || /\.html?$/i.test(ref)) continue;
+    let name: string;
+    try {
+      name = decodeURIComponent(ref);
+    } catch {
+      name = ref;
+    }
+    const file = path.resolve(base, name);
+    const rel = path.relative(root, file);
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) files.push(file);
+  }
+  return files;
+}
+
+test("a review page's files are found as before", () => {
+  const root = '/r';
+  const page = `<!doctype html><link rel="stylesheet" href="style.css?v=2"><img src='img/a.png#top' srcset="img/a.png 1x, img/a@2x.png 2x">
+<video poster="poster.jpg" src="clip.mp4"></video><object data="chart.svg"></object><a href="next.html">next</a>
+<div style="background: url( 'bg/one.png' ) , URL(bg/two.png), url(&quot;x&quot;), url(&quot; spaced name.png &quot;)"></div>
+<style>@import "theme.css"; @font-face { src: url("fonts/f.woff2?x=1") format("woff2") } .x { background: url(data:image/png;base64,AA) }</style>
+<img src="https://example.com/x.png"><img src="/abs.png"><img src="../out.png"><img src="caf%C3%A9.png"><img src="bad%E0.png">`;
+  const want = ['style.css', 'img/a.png', 'poster.jpg', 'clip.mp4', 'chart.svg', 'img/a.png', 'img/a@2x.png', 'bg/one.png', 'bg/two.png', '&quot;x&quot;', '&quot; spaced name.png &quot;',
+    'fonts/f.woff2', 'theme.css', 'café.png', 'bad%E0.png'].map((f) => path.join(root, f));
+  assert.deepEqual(namedFiles(page, root, root).sort(), want.sort());
+  assert.deepEqual(namedFiles(page, root, root), oldNamedFiles(page, root, root));
+  const css = `body{background:url("img/bg.png")} a{b:url( "x y.png" )} c{d:url(z.png) url('w.png')} e{f:url(bad"quote)} @import 'more.css';`;
+  assert.deepEqual(namedFiles(css, '/r/css', root), oldNamedFiles(css, '/r/css', root));
+  assert.deepEqual(namedFiles(css, '/r/css', root), ['/r/css/img/bg.png', '/r/css/x y.png', '/r/css/z.png', '/r/css/w.png', '/r/css/more.css']);
+});
+
+test('url() captures and namedFiles give what the regexes they replaced gave', () => {
+  // Math.imul and the high bits: a plain multiply loses its low bits past
+  // 2^53, and an LCG's low bits repeat quickly (Codex's review).
+  let seed = 11;
+  const rnd = (n: number) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 16) % n;
+  const pieces = ['url(', 'URL(', 'uRl(', ' ', '\t', '\n', IDEO_SPACE, LS, '\ufeff', '\ud800', '\udc00', '"', "'", ')', '(', 'a', 'b.png', '?', '#', '/', '..', 'src=', 'href="', 'srcset=\'', '@import ', ',', '%41', '%'];
+  // Cases the regex reaches only by backtracking into its \s*, by hand.
+  const edges = ['url( ")', 'url(  \')', 'url( )', 'url(\t"x" )', 'url( "x"y)', 'url("" )', 'url( "")', 'url(\' x \' )', 'url(  "a\'b")', 'url(url(x))', 'url( url( ")',
+    `url(${LS}"x"${LS})`, 'url(\ud800)', 'url(" \udc00 ")', 'URL( \ufeff)', 'url(x"', 'url(x\')y)', 'url( x )'];
+  for (const s of edges) {
+    const old = [...s.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)].map((m) => m[1]);
+    assert.deepEqual(cssUrlCaptures(s), old, JSON.stringify(s));
+  }
+  const differ: string[] = [];
+  let nonEmpty = 0;
+  for (let i = 0; i < 30_000; i++) {
+    const s = Array.from({ length: rnd(16) }, () => pieces[rnd(pieces.length)]).join('');
+    if ([...s.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)].length) nonEmpty++;
+    const old = [...s.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)].map((m) => m[1]);
+    if (JSON.stringify(cssUrlCaptures(s)) !== JSON.stringify(old)) differ.push(`url: ${JSON.stringify(s)}`);
+    if (JSON.stringify(namedFiles(s, '/r/d', '/r')) !== JSON.stringify(oldNamedFiles(s, '/r/d', '/r'))) differ.push(`namedFiles: ${JSON.stringify(s)}`);
+  }
+  assert.deepEqual(differ.slice(0, 10), []);
+  assert.ok(nonEmpty > 1000, `only ${nonEmpty} inputs had a url() match`);
+});
+
+test("a review page's long runs are read in linear time", () => {
+  // Each took seconds or more as the old regexes (url( and 5,000 spaces
+  // took 24 s on tinker-desk's M2), and the page or stylesheet can be as
+  // big as the agent made it.
+  const size = 1024 * 1024;
+  const texts = [
+    `url(${' '.repeat(size)}`,
+    `url(${'\t'.repeat(size / 2)}x${' '.repeat(size / 2)}`,
+    'url('.repeat(size / 8) + ' '.repeat(size / 2),
+    `url("${' '.repeat(size)}"`,
+    `url(x${' '.repeat(size)}"`,
+    'url(\''.repeat(size / 5),
+    `src="${'?'.repeat(size)}${'\n'}"`,
+    `src="${'#?'.repeat(size / 2)} x"`,
+    'src= '.repeat(size / 5),
+    // Linear before too, but each piece is a name: a quarter of the size.
+    `srcset="${' ,'.repeat(size / 8)}"`,
+    `@import ${' '.repeat(size)}`,
+  ];
+  for (const text of texts) cheap(`namedFiles on ${JSON.stringify(text.slice(0, 10))}...`, () => namedFiles(text, '/r', '/r'));
+  assert.deepEqual(cheap('url() of spaces', () => cssUrlCaptures(`url(${' '.repeat(size)})`)), [' ']);
+  assert.equal(cheap('a name of ?', () => cutQueryAndHash(`${'?'.repeat(size)}\n`)), `${'?'.repeat(size)}\n`);
+});
+
+// ------------------------------------------- the runner's pinned-page check
+
+test("a pinned page near the 4 MiB it reads is checked in linear time", () => {
+  // hasScriptMarks (ced7de1e): every input here is at the cap the runner
+  // reads a page to, and none may take a tenth of a second.
+  const size = 4 * 1024 * 1024;
+  const pages: [string, boolean][] = [
+    ['<'.repeat(size), false],
+    [`<!--${'<'.repeat(size - 8)}-->`, false],
+    ['< on'.repeat(size / 4), false],
+    ['<a onx '.repeat(Math.floor(size / 7)), false],
+    [` on${'x'.repeat(size - 4)}`, false],
+    [` onx${' '.repeat(size - 5)}`, false],
+    ['<a\t'.repeat(size / 3), false],
+    [`${'<'.repeat(size - 16)} onclick=go()`, true],
+    [`${' onx>'.repeat(size / 5 - 1)}<b onx=1`, true],
+    ['javascript'.repeat(size / 10), false],
+    ['<scrip'.repeat(size / 6), false],
+  ];
+  for (const [html, want] of pages) assert.equal(cheap(`hasScriptMarks on ${JSON.stringify(html.slice(0, 8))}...`, () => hasScriptMarks(html)), want);
 });

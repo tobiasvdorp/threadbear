@@ -9,8 +9,13 @@ import ThreadbearKit
 struct AsksCard: View {
     let asks: [PhoneAsk]
     @Binding var picks: [Int: Int]
+    /// Its answer is on its way: spinning, and nothing more to press.
     var busy: Bool
     var send: () -> Void
+    /// Goes up with each pick, for its tick. Not the picks themselves, which a
+    /// new card clears.
+    @State private var pickTaps = 0
+    @State private var sendTaps = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -18,16 +23,21 @@ struct AsksCard: View {
                 askView(ask, index: index)
             }
             if asks.count > 1, !picks.isEmpty {
-                Button(action: send) {
-                    Text("Send").frame(maxWidth: .infinity)
+                Button {
+                    sendTaps += 1
+                    send()
+                } label: {
+                    Text("Send").frame(maxWidth: .infinity).spinning(busy, tint: .white)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(busy)
+                .allowsHitTesting(!busy)
             }
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .sensoryFeedback(.selection, trigger: pickTaps)
+        .sensoryFeedback(.impact(weight: .light), trigger: sendTaps)
     }
 
     private func askView(_ ask: PhoneAsk, index: Int) -> some View {
@@ -59,7 +69,6 @@ struct AsksCard: View {
                     }
                 }
                 .controlSize(.small)
-                .disabled(busy)
             }
         }
     }
@@ -67,21 +76,28 @@ struct AsksCard: View {
     private func choiceButton(_ label: String, index: Int, choice: Int, suggested: Bool) -> some View {
         let picked = picks[index] == choice
         return Button {
+            guard !busy else { return }
             if asks.count == 1 {
+                // The only one, so the tap sends it: it goes prominent and spins.
+                sendTaps += 1
                 picks = [index: choice]
                 send()
             } else {
+                pickTaps += 1
                 picks[index] = picked ? nil : choice
             }
         } label: {
             HStack(spacing: 4) {
                 // The agent's own pick, as the Mac marks it.
                 if suggested && !picked { Image(systemName: "star.fill").imageScale(.small).foregroundStyle(.secondary) }
-                Text(label)
+                Text(label).spinning(picked && busy && asks.count == 1, tint: .white)
             }
         }
         .buttonStyle(picked ? AnyButtonStyle(.borderedProminent) : AnyButtonStyle(.bordered))
         .tint(picked ? .accentColor : .primary)
+        // A picked one keeps its colour, so it's clear which is on its way.
+        .disabled(busy && !picked)
+        .allowsHitTesting(!busy)
     }
 }
 
@@ -94,9 +110,12 @@ struct AsksCard: View {
 struct DoneCard: View {
     let next: [String]
     @Binding var picked: Set<Int>
+    /// The ticked ones are on their way: Send spins, and nothing more to press.
     var busy: Bool
     var send: () -> Void
     var archive: () -> Void
+    @State private var tickTaps = 0
+    @State private var sendTaps = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -118,11 +137,13 @@ struct DoneCard: View {
                 ForEach(Array(next.enumerated()), id: \.offset) { index, step in
                     let ticked = picked.contains(index)
                     Button {
+                        tickTaps += 1
                         if ticked { picked.remove(index) } else { picked.insert(index) }
                     } label: {
                         HStack(alignment: .firstTextBaseline, spacing: 10) {
                             Image(systemName: ticked ? "checkmark.circle.fill" : "circle")
                                 .foregroundStyle(ticked ? Color.accentColor : .secondary)
+                                .contentTransition(.symbolEffect(.replace))
                             Text(step).multilineTextAlignment(.leading)
                             Spacer(minLength: 0)
                         }
@@ -133,16 +154,21 @@ struct DoneCard: View {
                     .accessibilityAddTraits(ticked ? .isSelected : [])
                 }
                 if !picked.isEmpty {
-                    Button(action: send) {
-                        Text("Send").frame(maxWidth: .infinity)
+                    Button {
+                        sendTaps += 1
+                        send()
+                    } label: {
+                        Text("Send").frame(maxWidth: .infinity).spinning(busy, tint: .white)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(busy)
+                    .allowsHitTesting(!busy)
                 }
             }
         }
         .padding(12)
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .sensoryFeedback(.selection, trigger: tickTaps)
+        .sensoryFeedback(.impact(weight: .light), trigger: sendTaps)
     }
 }
 

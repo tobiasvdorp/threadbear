@@ -14,6 +14,7 @@ import type { WaitFor } from '../needs.ts';
 import path from 'node:path';
 import { providerName } from '../runner.ts';
 import { LAB_REVIEW_REPLY_CHARS } from './lab-review.ts';
+import { cutSafely, safeEnd } from '../safe-cut.ts';
 
 // How long a thread waiting on others sleeps at most when end_turn gave no
 // snooze, so one that never hears still comes back.
@@ -177,7 +178,7 @@ export const hibernationPart = {
         reply = '';
       }
     }
-    if (reply.length > max) reply = reply.slice(0, max) + '…';
+    if (reply.length > max) reply = reply.slice(0, safeEnd(reply, max)) + '…';
     st.rec.finished = { at: this.isoNow(), ...(reply ? { reply } : {}) };
     this.markDirty(st);
     this.reconcileWaits();
@@ -290,7 +291,7 @@ export const hibernationPart = {
     } catch {
       reply = '';
     }
-    w.done = { at: this.isoNow(), how: 'met', ...(reply ? { reply } : {}), ...(why ? { why: why.slice(0, 200) } : {}) };
+    w.done = { at: this.isoNow(), how: 'met', ...(reply ? { reply } : {}), ...(why ? { why: cutSafely(why, 200) } : {}) };
     this.markDirty(st);
     this.log.info('a wait was met', { waiterId, targetId, why });
     this.reconcileWaits();
@@ -340,6 +341,7 @@ export const hibernationPart = {
       : cause === 'restart'
         ? `Woke up${away}, as the runner restarted.`
         : away ? `Woke up after hibernating for ${awayFor(ms)}.` : 'Woke up from hibernating.';
+    // Starting "Woke up" is what gives it the bear in the app (RowContent.isWakeNote).
     this.emit(st, { type: 'system.note', text });
     rec.woke = { at: new Date(now).toISOString(), ...(since ? { since } : {}) };
     delete rec.snoozedAt;

@@ -170,7 +170,7 @@ export function checkSummary(t: Obj): string[] {
   const problems: string[] = [];
   for (const k of ['id', 'title', 'cwd', 'accountId', 'preview']) if (!isStr(t[k])) problems.push(k);
   if (!PROVIDERS.includes(t.provider)) problems.push('provider');
-  if (t.permissionMode !== 'full' && t.permissionMode !== 'ask') problems.push('permissionMode');
+  if (!['full', 'ask', 'auto', 'plan'].includes(t.permissionMode)) problems.push('permissionMode');
   if (!STATUSES.includes(t.status)) problems.push('status');
   for (const k of ['live', 'needsYou']) if (typeof t[k] !== 'boolean') problems.push(k);
   for (const k of ['createdAt', 'updatedAt', 'lastActivityAt']) if (!isIso(t[k])) problems.push(k);
@@ -294,7 +294,8 @@ export function checkSummary(t: Obj): string[] {
     const r = t.panelRequest;
     const ok = r && isStr(r.id) && isStr(r.panel) && isStr(r.title) && isIso(r.at) &&
       (r.where === undefined || ['tab', 'left', 'right', 'top', 'bottom', 'window'].includes(r.where)) &&
-      Object.keys(r).every((k) => ['id', 'panel', 'title', 'where', 'at'].includes(k));
+      (r.highlight === undefined || (isStr(r.highlight) && r.panel === 'highlights')) &&
+      Object.keys(r).every((k) => ['id', 'panel', 'title', 'where', 'highlight', 'at'].includes(k));
     if (!ok) problems.push('panelRequest');
   }
   if (t.share !== undefined) {
@@ -303,12 +304,21 @@ export function checkSummary(t: Obj): string[] {
       Object.keys(s).every((k) => ['access', 'slug', 'updatedAt'].includes(k));
     if (!ok) problems.push('share');
   }
+  if (t.looseEnds !== undefined) {
+    const l = t.looseEnds;
+    const ok = l && Number.isInteger(l.seq) && isIso(l.at) && Array.isArray(l.ends) &&
+      l.ends.every((e: any) => ['unlanded', 'uncommitted', 'thread', 'scheduled'].includes(e.kind) && isStr(e.text) &&
+        (e.threadId === undefined || isStr(e.threadId)) && (e.at === undefined || isIso(e.at)) &&
+        Object.keys(e).every((k) => ['kind', 'text', 'threadId', 'at'].includes(k))) &&
+      Object.keys(l).every((k) => ['seq', 'ends', 'at'].includes(k));
+    if (!ok) problems.push('looseEnds');
+  }
   const allowed = new Set([
     'id', 'title', 'cwd', 'accountId', 'provider', 'model', 'permissionMode', 'status', 'live', 'needsYou', 'createdAt', 'updatedAt',
     'lastActivityAt', 'snoozedUntil', 'snoozedUntilRestart', 'snoozedUntilRelease', 'archivedAt', 'archivedBy', 'archiveVerdict', 'starredAt', 'preview', 'lastSeq', 'lastSeenSeq', 'nativeSessionId', 'contextTokens', 'costUsd',
     'poolId', 'waitingForRoom', 'waitingForNetwork', 'wakeWhen', 'waitingOn',
     'effort', 'modelInUse', 'effortInUse', 'contextWindow', 'panels', 'actions', 'hooks', 'patches', 'background', 'subagents', 'projects', 'worktree',
-    'needs', 'asks', 'asksSeq', 'highlightsAt', 'panelRequest', 'share', 'startedBy', 'asked',
+    'needs', 'asks', 'asksSeq', 'highlightsAt', 'panelRequest', 'share', 'startedBy', 'asked', 'looseEnds',
   ]);
   for (const k of Object.keys(t)) if (!allowed.has(k)) problems.push(`unexpected field ${k}`);
   return problems;

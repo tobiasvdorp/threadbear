@@ -387,11 +387,18 @@ for (const file of pages) {
 const appDocSlugs = JSON.parse(readFileSync(join(root, "app-doc-slugs.json"), "utf8"));
 const guide = readGuide(join(root, ".."), appDocSlugs);
 const docSlugs = new Set(guide.sections.map((s) => s.slug));
+// Each docs page's icon (docs-icons.json, a slug to a Phosphor icon in src/icons): beside its name
+// in the list and on its title. A section added to the guide without one stops the build.
+const docIcons = JSON.parse(readFileSync(join(root, "docs-icons.json"), "utf8"));
+const docIcon = (slug) => {
+  if (!docIcons[slug]) throw new Error(`docs/guide.md's section ${slug} has no icon in site/docs-icons.json`);
+  return icon(docIcons[slug]);
+};
 function docsNav(current) {
   const items = guide.sections.map(({ slug, title }) =>
-    `          <li><a href="/docs/${slug}"${slug === current ? ' aria-current="page"' : ""}>${escape(title)}</a></li>`);
+    `          <li><a href="/docs/${slug}"${slug === current ? ' aria-current="page"' : ""}>${docIcon(slug)}<span>${escape(title)}</span></a></li>`);
   return `      <nav class="docs-nav" aria-label="Docs">
-        <a class="docs-home" href="/docs"${current ? "" : ' aria-current="page"'}>${escape(guide.title)}</a>
+        <a class="docs-home" href="/docs"${current ? "" : ' aria-current="page"'}>${icon("book-open")}<span>${escape(guide.title)}</span></a>
         <ol>
 ${items.join("\n")}
         </ol>
@@ -409,7 +416,7 @@ ${docsNav(null)}
 ${markdown(guide.intro, docSlugs)}
         </div>
         <ol class="doc-index">
-${guide.sections.map(({ slug, title }) => `          <li><a href="/docs/${slug}">${escape(title)}</a></li>`).join("\n")}
+${guide.sections.map(({ slug, title }) => `          <li><a href="/docs/${slug}">${docIcon(slug)}<span>${escape(title)}</span></a></li>`).join("\n")}
         </ol>
       </article>
     </div>`);
@@ -418,7 +425,7 @@ guide.sections.forEach(({ slug, title, body }, index) => {
   writePage(`docs/${slug}`, { title: `${title} · Threadbear docs`, description: summary(body) || `${title}, from the Threadbear guide.`, path: `/docs/${slug}` }, `    <div class="docs">
 ${docsNav(slug)}
       <article class="legal doc">
-        <h1>${escape(title)}</h1>
+        <h1 class="doc-title"><span class="doc-title-icon">${docIcon(slug)}</span>${escape(title)}</h1>
 ${markdown(body, docSlugs)}
         ${next ? `<p class="doc-next"><a href="/docs/${next.slug}">Next: ${escape(next.title)}</a></p>` : `<p class="doc-next"><a href="/docs">All the docs</a></p>`}
       </article>

@@ -5,7 +5,7 @@
 // arrives: 80 rows (about 40 KB) to start, and up to 2000 after scrolling back.
 // Pictures have a live query of their own (phone:images), as one can finish
 // uploading well after its row has left the tail.
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useConvex } from 'convex/react';
 import type { FunctionReturnType } from 'convex/server';
 import { api } from '../../convex/_generated/api';
@@ -83,7 +83,10 @@ export function useTranscript(token: string, threadId: string): Transcript | und
   // The rows' pictures from the last answer while a wider range comes in.
   const shown = useRef<Picture[]>([]);
   if (images) shown.current = images;
+  // The same array until the rows change: work links' lookups are remembered
+  // per array, with a budget per array (thread-links.ts, findStep), and a new
+  // one each render started both again.
+  const messages = useMemo(() => (held ? [...held.rows.values()].sort((a, b) => a.seq - b.seq) : []), [held]);
   if (!held) return undefined;
-  const messages = [...held.rows.values()].sort((a, b) => a.seq - b.seq);
   return { messages, images: shown.current, hasMore: held.hasMore, loadingMore, loadMore };
 }

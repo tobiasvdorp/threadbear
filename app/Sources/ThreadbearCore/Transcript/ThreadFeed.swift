@@ -190,6 +190,11 @@ public struct ThreadFeed: Sendable {
         model.setNextPicks(seq, picks, explain: explain)
     }
 
+    /// The done card's loose ends changed (see `TranscriptModel.setLooseEnds`).
+    public mutating func setLooseEnds(_ check: LooseEnds?) -> TranscriptChange {
+        model.setLooseEnds(check)
+    }
+
     /// The thread's background work changed (see
     /// `TranscriptModel.setBackground`). Queued events stay queued.
     public mutating func setBackground(_ tasks: [BackgroundTask]) -> TranscriptChange {

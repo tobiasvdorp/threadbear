@@ -96,23 +96,43 @@ final class RichRenderer: NSObject, WKNavigationDelegate, WKUIDelegate {
         return await job.value
     }
 
-    /// Open beside: the block's page in the side pane, drawn first if
-    /// it hasn't been (a diagram's page is written as it's drawn).
-    func openBeside(_ block: RichBlock) {
+    /// Open: the block's page in a window of its own, most of the screen,
+    /// drawn first if it hasn't been (a diagram's page is written as it's
+    /// drawn).
+    func openWindow(_ block: RichBlock) {
         let file = RichDiskCache.panePage(block)
-        let title = block.kind == .mermaid ? "Diagram" : "Page"
         if FileManager.default.fileExists(atPath: file.path) {
-            AppModel.shared.previewRichBlock(file, title: title)
+            showWindow(block, page: file)
             return
         }
         if block.kind == .html {
-            if (try? writePanePage(RichPages.htmlPage(block.source), for: block)) != nil { AppModel.shared.previewRichBlock(file, title: title) }
+            if (try? writePanePage(RichPages.htmlPage(block.source), for: block)) != nil { showWindow(block, page: file) }
             return
         }
         Task { @MainActor in
             _ = await render(block, zoom: TypeScale.percent)
-            if FileManager.default.fileExists(atPath: file.path) { AppModel.shared.previewRichBlock(file, title: title) }
+            if FileManager.default.fileExists(atPath: file.path) { showWindow(block, page: file) }
         }
+    }
+
+    /// The pane page centres a diagram at the size it was drawn, which in
+    /// a big window is a small picture in the middle. The window's copy
+    /// scales it to fill the window instead, bigger or smaller (an SVG's
+    /// viewBox keeps its shape), overriding mermaid's own max-width.
+    static let fitToWindow = """
+        <style>html,body{height:100%}body{align-items:center}        .look{width:100%;height:100%}        .look svg{width:100%!important;height:100%!important;max-width:none!important;max-height:none!important}</style>
+        """
+
+    private func showWindow(_ block: RichBlock, page: URL) {
+        var url = page
+        if block.kind == .mermaid, let html = try? String(contentsOf: page, encoding: .utf8), let head = html.range(of: "</head>") {
+            let fitted = page.deletingLastPathComponent().appendingPathComponent("window.html")
+            var page = html
+            page.insert(contentsOf: Self.fitToWindow, at: head.lowerBound)
+            if (try? page.write(to: fitted, atomically: true, encoding: .utf8)) != nil { url = fitted }
+        }
+        let thread = AppModel.shared.selectedThread?.title
+        RichBlockWindowController.show(url, id: block.id, title: block.kind == .mermaid ? "Diagram" : "Page", subtitle: thread)
     }
 
     /// Gives up on a drawing after `timeout` without waiting for it: a

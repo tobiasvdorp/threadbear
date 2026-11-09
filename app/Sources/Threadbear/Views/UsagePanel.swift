@@ -115,8 +115,8 @@ private struct SpendSection: View {
                          detail: usual.map { "usually " + UsageStatsMath.tokens($0) },
                          tip: (usual.map { "Usually " + UsageStatsMath.tokens($0) + " by this time of day. " } ?? "") + UsageStatsMath.breakdown(today))
                 StatTile(title: "Last hour", value: UsageStatsMath.tokens(lastHour),
-                         detail: UsageStatsMath.tokens(Int(Double(today.total) / hoursToday)) + "/h today",
-                         tip: "Tokens in the last 60 minutes, across every login. Today has averaged " + UsageStatsMath.tokens(Int(Double(today.total) / hoursToday)) + " an hour.")
+                         detail: UsageStatsMath.tokens(Int(saturating: Double(today.total) / hoursToday)) + "/h today",
+                         tip: "Tokens in the last 60 minutes, across every login. Today has averaged " + UsageStatsMath.tokens(Int(saturating: Double(today.total) / hoursToday)) + " an hour.")
                 StatTile(title: "7 days", value: UsageStatsMath.tokens(week.total),
                          detail: UsageStatsMath.tokens(week.total / 7) + " a day",
                          tip: UsageStatsMath.breakdown(week))
@@ -344,7 +344,7 @@ private struct HoverNote: View {
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        let total = bars.reduce(0) { $0 + $1.tokens }
+        let total = bars.reduce(0) { $0.adding(saturating: $1.tokens) }
         VStack(alignment: .leading, spacing: zoomed(3)) {
             Text((byDay ? TokensChart.dayLabel(start, now: now) : AccountUsageText.clock(start)) + "  " + UsageStatsMath.tokens(total))
                 .font(.system(size: zoomed(11), weight: .semibold))

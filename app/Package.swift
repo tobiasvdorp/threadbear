@@ -51,11 +51,17 @@ let package = Package(
             dependencies: ["ThreadbearCore"],
             path: "Tests/ThreadbearCoreTests"
         ),
+        // Ends a test run that reaches a real modal (ModalGuard.m says why).
+        // Linked only into the tests below, never the app.
+        .target(
+            name: "ModalGuard",
+            path: "Tests/ModalGuard"
+        ),
         // AppKit-side checks (the composer, transcript text, renders,
         // AppModel's drafts) against the app target itself.
         .testTarget(
             name: "ThreadbearAppTests",
-            dependencies: ["Threadbear", "ThreadbearCore"],
+            dependencies: ["Threadbear", "ThreadbearCore", "ModalGuard"],
             path: "Tests/ThreadbearAppTests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

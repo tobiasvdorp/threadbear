@@ -63,6 +63,11 @@ test("the open card is the last turn's end, and an approval sits at its own seq"
   const end = ev.find((e) => e.seq === 119)!;
   assert.equal(end.needs, 'you');
   assert.deepEqual(end.asks, [{ action: 'Pick one', options: ['A', 'B'], ticked: true }]);
+  // What each answer does comes through, so the Mac draws rows as it does
+  // for its own runner's threads, not plain buttons (8 Nov).
+  const noted = relayEvents(T, rows, { ...asksRow, asks: [{ action: 'Pick one', options: ['A', 'B'], optionNotes: ['Does A', 'Does B'] }] }, [], false, 'bruce');
+  const notedEnd = noted.filter((e) => e.type === 'turn.completed').at(-1) as { asks?: unknown };
+  assert.deepEqual(notedEnd.asks, [{ action: 'Pick one', options: ['A', 'B'], optionNotes: ['Does A', 'Does B'] }]);
   const ap = ev.find((e) => e.type === 'approval.requested')!;
   assert.equal(ap.seq, 13 * SCALE + 1);
   assert.equal(ap.turnId, 'bbbb2222');
@@ -78,7 +83,8 @@ test('a tail past what is held asks for the gap; one that overlaps just merges',
 });
 
 type Call = { kind: string; fn: string; args: Record<string, unknown> };
-function harness(opts: { online?: boolean; row?: () => RelayThreadRow & { share?: unknown } } = {}) {
+type HarnessOpts = { online?: boolean; row?: () => RelayThreadRow & { share?: unknown }; apiVersion?: number; queueFails?: boolean; uploadMs?: number };
+function harness(opts: HarnessOpts = {}) {
   const calls: Call[] = [];
   const subs = new Map<string, { args: Record<string, unknown>; onUpdate: (v: unknown) => void; closed: boolean }[]>();
   const published: unknown[] = [];
@@ -89,14 +95,27 @@ function harness(opts: { online?: boolean; row?: () => RelayThreadRow & { share?
     threads: [{ runnerId: 'bruce', threadId: T, title: 'A thread', cwd: '/Users/b/x', accountId: 'claude-main', provider: 'claude', status: 'idle', needsYou: false, unread: true, preview: '', createdAt: at(0), lastActivityAt: at(0) }],
   };
   let commandN = 0;
+  let uploadN = 0;
+  // What was uploaded to Convex, as [upload URL, bytes, type].
+  const uploads: [string, string, string][] = [];
   const relay = new Relay({
     source: () => ({
       key: 'owner',
+      apiVersion: opts.apiVersion ?? 63,
+      upload: async (url, bytes, mediaType) => {
+        if (opts.uploadMs) clock.advance(opts.uploadMs);
+        uploads.push([url, Buffer.from(bytes).toString(), mediaType]);
+        return `st${uploads.length}`;
+      },
       post: async (kind, fn, args) => {
         calls.push({ kind, fn, args });
         if (fn === 'relay:remoteThread') return opts.row?.() ?? idle;
         if (fn === 'relay:remoteMessages') return { messages: rows, hasMore: false };
-        if (fn === 'relay:queueCommand') return `cmd${++commandN}`;
+        if (fn === 'relay:queueCommand') {
+          if (opts.queueFails) throw new Error('Convex is away');
+          return `cmd${++commandN}`;
+        }
+        if (fn === 'relay:pictureUploadUrl') return `https://upload.example/${++uploadN}`;
         if (fn === 'relay:remoteAccounts') return [{ runnerId: 'bruce', id: 'claude-main', provider: 'claude', title: 'Claude' }];
         return null;
       },
@@ -111,12 +130,14 @@ function harness(opts: { online?: boolean; row?: () => RelayThreadRow & { share?
       },
     }),
     remote: () => remote,
+    // This runner's inbox: what the app's media.import made.
+    readPicture: (file) => (file.startsWith('/inbox/') ? { bytes: Buffer.from(`bytes of ${file}`), mediaType: 'image/png' } : { skip: "it isn't in this runner's inbox" }),
     subscribed: (id) => subscribed.has(id),
     publish: (n) => published.push(n),
     clock,
     log: nullLogger,
   });
-  return { relay, calls, subs, published, subscribed, clock, remote };
+  return { relay, calls, subs, published, subscribed, clock, remote, uploads };
 }
 
 test('it answers only for threads other runners have, and pages in relay seqs', async () => {
@@ -213,7 +234,116 @@ test('sends, stops and changes go to the thread runner; settings that only work 
   await stop;
   assert.equal(h.calls.at(-1)!.args.kind, 'interrupt');
   await assert.rejects(h.relay.call(T, 'threads.update', { threadId: T, model: 'opus' }), /isn't possible through Convex yet/);
-  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ path: '/a.png' }] }), /pictures/);
+});
+
+// 8 Nov: a picture pasted for a thread on Hetzner Cloud was refused with
+// "Pictures can't go to Hetzner Cloud from this Mac yet." Each is uploaded
+// from this runner's inbox and named in the command, in order.
+test('pictures in a send to another runner are uploaded and go with the command, in order', async () => {
+  const h = harness();
+  const send = h.relay.call(T, 'threads.send', { threadId: T, text: 'this [Picture 1] like [Picture 2]', images: [{ path: '/inbox/a.png', mediaType: 'image/png' }, { path: '/inbox/b.png', mediaType: 'image/png' }] });
+  await new Promise((r) => setTimeout(r, 5));
+  h.subs.get('relay:commandState')![0]!.onUpdate({ state: 'taken' });
+  h.subs.get('relay:commandState')![0]!.onUpdate({ state: 'done' });
+  assert.deepEqual(await send, { turnId: '' });
+  assert.deepEqual(h.uploads, [
+    ['https://upload.example/1', 'bytes of /inbox/a.png', 'image/png'],
+    ['https://upload.example/2', 'bytes of /inbox/b.png', 'image/png'],
+  ]);
+  assert.deepEqual(h.calls.find((c) => c.fn === 'relay:queueCommand')!.args.args, { text: 'this [Picture 1] like [Picture 2]', images: ['st1', 'st2'] });
+});
+
+test('a new thread there takes pictures, words or not', async () => {
+  const h = harness();
+  const made = h.relay.create('bruce', { text: '', cwd: '/Users/b/x', runnerId: 'bruce', images: [{ path: '/inbox/a.png', mediaType: 'image/png' }] });
+  await new Promise((r) => setTimeout(r, 5));
+  h.subs.get('relay:commandState')![0]!.onUpdate({ state: 'done', threadId: 'new1' });
+  assert.equal(((await made) as { thread: { id: string } }).thread.id, 'new1');
+  assert.deepEqual(h.calls.find((c) => c.fn === 'relay:queueCommand')!.args.args, { text: '', cwd: '/Users/b/x', images: ['st1'] });
+});
+
+test("pictures that can't go say why, and nothing is queued or uploaded", async () => {
+  // An older backend would drop them and send the words alone.
+  const old = harness({ apiVersion: 62 });
+  await assert.rejects(old.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ path: '/inbox/a.png' }] }), /backend is updated/);
+  assert.equal(old.calls.length, 0);
+  // Only this runner's own imports: a client naming any other file on this Mac doesn't get it posted to Convex.
+  const h = harness();
+  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ path: '/Users/m/.ssh/id_ed25519' }] }), /isn't in this runner's inbox/);
+  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ nope: 1 }] }), /picture/);
+  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: Array.from({ length: 7 }, (_, i) => ({ path: `/inbox/${i}.png` })) }), /At most 6/);
+  assert.equal(h.uploads.length, 0);
+  assert.equal(h.calls.filter((c) => c.fn === 'relay:queueCommand').length, 0);
+  // Offline: said at once, before uploading anything.
+  const off = harness({ online: false });
+  await assert.rejects(off.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ path: '/inbox/a.png' }] }), /bruce is offline/);
+  assert.equal(off.uploads.length, 0);
+});
+
+// Codex's review: that runner marks a send taken before it fetches the
+// pictures, so a fetch failing afterwards was a send the app thought went.
+test("a send with pictures waits past taken for done, so a fetch that fails there says so", async () => {
+  const h = harness();
+  const pic = [{ path: '/inbox/a.png' }];
+  const failing = h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: pic });
+  await new Promise((r) => setTimeout(r, 5));
+  const sub = h.subs.get('relay:commandState')![0]!;
+  sub.onUpdate({ state: 'taken' });
+  sub.onUpdate({ state: 'failed', note: 'HTTP 404' });
+  await assert.rejects(failing, /HTTP 404/);
+  // Taken and never finished: a yes at 100 s, before the app gives up at
+  // 120 s and puts back a draft that may still go.
+  const slow = h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: pic });
+  await new Promise((r) => setTimeout(r, 5));
+  h.subs.get('relay:commandState')![1]!.onUpdate({ state: 'taken' });
+  let settled = false;
+  void slow.then(() => (settled = true));
+  for (const ms of [20_000, 40_000, 39_000]) {
+    h.clock.advance(ms);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(settled, false, 'still waiting for the pictures');
+  }
+  h.clock.advance(1_000);
+  assert.deepEqual(await slow, { turnId: '' });
+  // Not taken in 20 seconds: queued, as any send.
+  const away = h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: pic });
+  await new Promise((r) => setTimeout(r, 5));
+  h.clock.advance(20_000);
+  assert.deepEqual(await away, { turnId: '', queued: true });
+});
+
+test('uploads that take past a minute send nothing, so the answer still beats the app giving up', async () => {
+  const h = harness({ uploadMs: 25_000 });
+  const pics = [1, 2, 3, 4].map((i) => ({ path: `/inbox/${i}.png` }));
+  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: pics }), /took too long/);
+  assert.equal(h.uploads.length, 3);
+  assert.equal(h.calls.filter((c) => c.fn === 'relay:queueCommand').length, 0, 'nothing queued');
+  assert.deepEqual(h.calls.find((c) => c.fn === 'relay:discardPictures')!.args.storageIds, ['st1', 'st2', 'st3']);
+});
+
+test('a last upload that ends past 75 s sends nothing, and a slow queue still answers by 100 s', async () => {
+  // Three uploads of 26 s: the third starts at 52 s, inside the minute, and ends at 78 s.
+  const late = harness({ uploadMs: 26_000 });
+  await assert.rejects(late.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [1, 2, 3].map((i) => ({ path: `/inbox/${i}.png` })) }), /took too long/);
+  assert.equal(late.calls.filter((c) => c.fn === 'relay:queueCommand').length, 0);
+  // Uploaded by 72 s and queued: a new thread there waits only what's left of the 100 s.
+  const h = harness({ uploadMs: 24_000 });
+  const made = h.relay.create('bruce', { text: '', runnerId: 'bruce', images: [1, 2, 3].map((i) => ({ path: `/inbox/${i}.png` })) });
+  await new Promise((r) => setTimeout(r, 5));
+  h.subs.get('relay:commandState')![0]!.onUpdate({ state: 'taken' });
+  let over = false;
+  void made.catch(() => (over = true));
+  h.clock.advance(27_000);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(over, false);
+  h.clock.advance(1_000);
+  await assert.rejects(made, /hasn't answered yet/);
+});
+
+test("pictures uploaded for a command that couldn't be queued are discarded", async () => {
+  const h = harness({ queueFails: true });
+  await assert.rejects(h.relay.call(T, 'threads.send', { threadId: T, text: 'x', images: [{ path: '/inbox/a.png' }, { path: '/inbox/b.png' }] }), /Convex is away/);
+  assert.deepEqual(h.calls.find((c) => c.fn === 'relay:discardPictures')!.args, { key: 'owner', storageIds: ['st1', 'st2'] });
 });
 
 test("a change answers with the thread, as the app decodes any runner's threads.update", async () => {
@@ -442,4 +572,71 @@ test("an agent's archive goes to that runner with by: agent", async () => {
   await done;
   const q = h.calls.find((c) => c.fn === 'relay:queueCommand')!;
   assert.deepEqual(q.args.args, { archive: true, by: 'agent' });
+});
+
+// Daybreak, 7 Nov 2026 ("Remote Plan first threads silently start with full
+// access"): Relay.create forwarded only ask, full and auto, so a Plan first
+// thread started on another Mac went with no mode and got full access.
+test('a new thread there keeps every mode; Plan first goes as Ask plus a flag, and an unknown mode is refused', async () => {
+  const sent = async (permissionMode: unknown) => {
+    const h = harness();
+    const made = h.relay.create('bruce', { text: 'Start', permissionMode });
+    await new Promise((r) => setImmediate(r));
+    h.subs.get('relay:commandState')![0]!.onUpdate({ state: 'done', threadId: 'new1' });
+    await made;
+    return h.calls.filter((c) => c.fn === 'relay:queueCommand').at(-1)!.args.args as Record<string, unknown>;
+  };
+  for (const mode of ['full', 'ask', 'auto'] as const) assert.deepEqual(await sent(mode), { text: 'Start', permissionMode: mode });
+  const plan = await sent('plan');
+  assert.deepEqual(plan, { text: 'Start', permissionMode: 'ask', plan: true });
+  // What a runner from before Plan first reads of it: Ask, never the full-access default.
+  const oldReceiver = (a: Record<string, unknown>) => (a.permissionMode === 'ask' || a.permissionMode === 'full' || a.permissionMode === 'auto' ? a.permissionMode : 'full');
+  assert.equal(oldReceiver(plan), 'ask');
+  assert.deepEqual(await sent(undefined), { text: 'Start' });
+  const h = harness();
+  await assert.rejects(h.relay.create('bruce', { text: 'Start', permissionMode: 'yolo' }), /permissionMode must be one of/);
+  assert.equal(h.calls.filter((c) => c.fn === 'relay:queueCommand').length, 0, 'nothing queued');
+});
+
+test("hibernating in words goes as an update with the words, and answers the row once that runner has worked out when", async () => {
+  // 7 Nov: "Hibernate until…" on another Mac's thread showed "Hibernating
+  // until something happens isn't possible through Convex yet".
+  const h = harness();
+  const p = h.relay.call(T, 'threads.hibernateWhen', { threadId: T, said: 'at the weekend' });
+  await new Promise((r) => setImmediate(r));
+  const queued = h.calls.find((c) => c.fn === 'relay:queueCommand')!;
+  assert.equal(queued.args.kind, 'update');
+  // untilRestart: what an older runner, which doesn't read the words, does instead of waking it.
+  assert.deepEqual(queued.args.args, { snooze: { said: 'at the weekend', untilRestart: true } });
+  // That runner put it away at once, and its row says so before the model answers.
+  h.remote.threads[0]!.snoozedUntil = at(3600);
+  h.subs.get('relay:commandState')![0]!.onUpdate({ state: 'done' });
+  const { thread } = (await p) as { thread: Record<string, unknown> };
+  assert.equal(thread.id, T);
+  assert.equal(thread.snoozedUntil, at(3600));
+  // The model couldn't say: the note comes back as the error.
+  const bad = h.relay.call(T, 'threads.hibernateWhen', { threadId: T, said: 'whenever' });
+  await new Promise((r) => setImmediate(r));
+  h.subs.get('relay:commandState')![1]!.onUpdate({ state: 'failed', note: "Couldn't work out when to wake it: no time in that" });
+  await assert.rejects(bad, /Couldn't work out when/);
+  await assert.rejects(h.relay.call(T, 'threads.hibernateWhen', { threadId: T, said: '  ' }), /Say when/);
+});
+
+test('hibernating in words: done before the row has its time still answers it as put away', async () => {
+  // Codex's review: done can beat the row, and the app then put an awake row over its guess.
+  const h = harness();
+  const p = h.relay.call(T, 'threads.hibernateWhen', { threadId: T, said: 'tomorrow morning' });
+  await new Promise((r) => setImmediate(r));
+  h.subs.get('relay:commandState')![0]!.onUpdate({ state: 'done' });
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setImmediate(r));
+    h.clock.advance(1000);
+  }
+  const { thread } = (await p) as { thread: Record<string, unknown> };
+  assert.equal(thread.snoozedUntilRestart, true);
+  assert.ok(thread.snoozedUntil);
+  // Later replies keep it put away until a snoozed row comes, then show the row's time.
+  assert.equal((h.relay as any).summary(T).snoozedUntilRestart, true);
+  h.remote.threads[0]!.snoozedUntil = at(7200);
+  assert.equal((h.relay as any).summary(T).snoozedUntil, at(7200));
 });

@@ -113,6 +113,16 @@ deleted. Otherwise both stay, with a `system.note` saying so and how to
 land or drop them. Unarchiving a thread whose worktree was removed starts
 its next turn in the main checkout, with a note.
 
+An archive's cleanup waits for the thread's turn-end hooks, which run in that
+folder: on 7 Nov a typecheck lost its files partway through, "failed", and
+woke the thread just archived. A restart waits for those hooks and a handover
+keeps the thread while they run, for the same reason. A hook failure told to
+the agent brings the thread back in its worktree, so nothing gets removed; one
+that isn't told (`tell: "never"`, or past the limit) leaves it archived and the
+cleanup goes ahead. If the runner stops or crashes first, the next one does the
+cleanup (`cleanupOwed` in the worktree's record). Deleting a thread doesn't
+wait: nothing is left to report a hook's result to.
+
 The folder is only removed while it's still a checkout of the thread's own
 branch: slot folders are reused, and a record can miss hearing its worktree
 went (THREADBEAR-16, 6 Nov: a handover saved it while the cleanup ran; a
@@ -145,20 +155,29 @@ With `keep`:
 - Cleaning up a landed one detaches it, deletes its branch and locks it
   (`git worktree lock --reason "threadbear spare"`): a spare. Past six
   spares (`MAX_SPARES`), it's removed as before.
-- A new thread takes a spare if there is one: unlocking is the claim, so
-  two threads (or a thread and `borrow-worktree.sh`) never get the same
-  one. Then `git reset --hard`, `git clean -ffdx` with the kept folders
+- A new thread takes a spare if there is one: renaming git's `locked`
+  file away is the claim, so two threads (or a thread and
+  `borrow-worktree.sh`) never get the same one. (`git worktree unlock`
+  isn't: two at once both succeed.) Then `git reset --hard`, `git clean -ffdx` with the kept folders
   left out (an old thread's `node_modules` goes, its build cache stays),
   and `git checkout -b thread/<id8> main`. Setup runs as for a new one.
 - The record keeps `keep`, and `spare: true` once it's set aside. A
   spare's thread, unarchived, moves to the main checkout even though the
-  folder is still there: it's another thread's now.
+  folder is still there: it's another thread's now. So does any thread
+  whose worktree was removed, whatever is at that path now: on 8 Nov a
+  removed slot-10 was made again by `borrow-worktree.sh`, and the thread
+  brought back carried on in it beside the borrower's work.
 
 A thread started outside the repo borrows one by hand with
-`./borrow-worktree.sh` and gives it back with `--give-back <dir>`.
+`./borrow-worktree.sh` and gives it back with `--give-back <dir>`. The
+borrowed one is on a branch of its own, `thread/borrow-<slot>-<time>`,
+so `tb land` in it lands it like any thread's (it only lands a `thread/`
+branch); giving it back deletes that branch. Run in a thread, `tb land`
+refuses another thread's `thread/<id8>` branch: someone else is working
+in that folder (`THREADBEAR_THREAD_ID= tb land` lands it anyway).
 
-A hand-merge from a borrowed worktree holds the same landing lock. From
-that worktree, on a Mac:
+A hand-merge, landing without `tb land`, holds the same landing lock.
+From the worktree, on a Mac:
 
 ```sh
 /usr/bin/lockf -k "$(git rev-parse --git-common-dir)/threadbear-land.lock" /bin/sh /path/to/landing-script

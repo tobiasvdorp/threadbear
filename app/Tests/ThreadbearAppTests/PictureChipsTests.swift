@@ -147,6 +147,60 @@ final class PictureChipsTests: XCTestCase {
         XCTAssertEqual(to.draftNow, Draft(text: "> x \(m) y", images: [red]))
     }
 
+    /// A screenshot copied with ⌘⌃⇧4 is only HEIC and TIFF on the
+    /// clipboard: Paste is offered for it and puts a chip in, from the HEIC
+    /// as it is, in the composer and an answer box alike (Behrooz, 7 Nov).
+    func testAScreenshotOnTheClipboardPastesAsAChip() async throws {
+        let board = NSPasteboard(name: NSPasteboard.Name("threadbear-test-\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        let paste = NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        func screenshot() {
+            board.clearContents()
+            let image = NSImage(size: NSSize(width: 4, height: 4))
+            image.lockFocus()
+            NSColor.red.setFill()
+            NSRect(x: 0, y: 0, width: 4, height: 4).fill()
+            image.unlockFocus()
+            let item = NSPasteboardItem()
+            item.setData(Data("heic bytes".utf8), forType: NSPasteboard.PasteboardType("public.heic"))
+            item.setData(image.tiffRepresentation!, forType: .tiff)
+            board.writeObjects([item])
+        }
+
+        var imported: [URL] = []
+        let pictures = ComposerTextView.Pictures(allowed: { true }, importOne: { url in
+            imported.append(url)
+            return ImageRef(path: "/inbox/" + url.lastPathComponent, mediaType: "image/heic")
+        })
+        let (_, textView) = composer()
+        textView.pasteSource = board
+        textView.pictures = pictures
+        screenshot()
+        XCTAssertNotNil(ComposerTextView.imageType(board))
+        XCTAssertTrue(textView.validateUserInterfaceItem(paste))
+        textView.paste(nil)
+        try await until { textView.draftNow.images.count == 1 }
+        XCTAssertEqual(textView.draftNow.images.count, 1)
+        XCTAssertEqual(imported.last?.pathExtension, "heic")
+        XCTAssertEqual(imported.last.flatMap { try? Data(contentsOf: $0) }, Data("heic bytes".utf8))
+
+        let box = AskAnswerBox(frame: NSRect(x: 0, y: 0, width: 400, height: 80))
+        let window = NSWindow(contentRect: box.frame, styleMask: [.titled], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.contentView = box
+        windows.append(window)
+        var notes: [AskNote] = []
+        box.onChange = { notes.append($0) }
+        box.pictures = pictures
+        box.textView.pasteSource = board
+        screenshot()
+        XCTAssertTrue(box.textView.validateUserInterfaceItem(paste))
+        box.textView.paste(nil)
+        try await until { notes.last?.images.count == 1 }
+        XCTAssertEqual(notes.last?.images.count, 1)
+        for url in imported { try? FileManager.default.removeItem(at: url) }
+    }
+
     /// His bubble draws the markers that place a picture as chips; others stay words.
     func testTheBubbleDrawsMarkersAsChips() {
         let text = RowRenderer.userText(UserMessage(text: "see [Picture 1] and [Picture 2], not [Picture 3]", images: [red, blue]))

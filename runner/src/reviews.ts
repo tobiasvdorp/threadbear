@@ -17,7 +17,7 @@ import { ErrorCode, RpcError } from './protocol.ts';
 // made sense moving (6 Nov 2026).
 export type ReviewShotKind = 'image' | 'video' | 'page';
 export type ReviewShotInput = { path: string; title?: string; kind?: ReviewShotKind };
-export type ReviewInput = { title: string; note?: string; options: { id: string; title: string; path?: string; shots?: ReviewShotInput[]; url?: string; note?: string; reference?: boolean }[] };
+export type ReviewInput = { title: string; note?: string; recommended?: string; options: { id: string; title: string; path?: string; shots?: ReviewShotInput[]; url?: string; note?: string; reference?: boolean }[] };
 // What createReview copies: every source file, first shot first.
 export type ReviewOptionSource = { id: string; title: string; note?: string; reference?: boolean; url?: string; shots: ReviewShotInput[] };
 export const maxReviewShots = 8;
@@ -65,7 +65,7 @@ function shotFile(raw: unknown, cwd: string): { path: string; kind: ReviewShotKi
   return bad(`Not a picture (PNG, JPEG, GIF, WebP), video (MP4, MOV) or HTML page: ${file}`);
 }
 
-export function reviewInput(raw: unknown, cwd: string): { title: string; note?: string; options: ReviewOptionSource[] } {
+export function reviewInput(raw: unknown, cwd: string): { title: string; note?: string; recommended?: string; options: ReviewOptionSource[] } {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bad('A review needs a title and options.');
   const p = raw as Record<string, unknown>;
   const title = text(p.title, 'title', 200, true)!;
@@ -105,7 +105,16 @@ export function reviewInput(raw: unknown, cwd: string): { title: string; note?: 
   });
   if (images > maxReviewImages) bad(`A review can have at most ${maxReviewImages} images in all; this has ${images}.`);
   if (mediaBytes > maxReviewMediaBytes) bad(`A review's videos and pages can be at most 500 MB in all; these are ${Math.ceil(mediaBytes / 1024 / 1024)} MB.`);
-  return { title, ...(note ? { note } : {}), options };
+  // The agent's own pick, which the window marks "my pick" as an asks card
+  // does (Mike, 7 Nov: agents wrote "I'd pick C" in the middle of the note,
+  // where it was hard to find).
+  const recommended = text(p.recommended, 'recommended', 200) || undefined;
+  if (recommended) {
+    const option = options.find(o => o.id === recommended);
+    if (!option) bad(`recommended must be one of the option ids: ${recommended}`);
+    if (option.reference) bad('recommended cannot be a reference option.');
+  }
+  return { title, ...(note ? { note } : {}), ...(recommended ? { recommended } : {}), options };
 }
 
 export function reviewDraft(review: DesignReview, raw: unknown, answer = false): ReviewDraft {

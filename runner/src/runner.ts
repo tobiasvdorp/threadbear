@@ -2,6 +2,8 @@
 // release and snoozes. Providers plug in through AgentAdapter; the WebSocket
 // server in rpc.ts is a thin layer over the public methods here.
 import { RELEASE } from './release.ts';
+import type { UserInput } from './adapters/types.ts';
+import { INSTRUCTIONS_CLEARED, INSTRUCTIONS_REWOUND } from './instructions.ts';
 import { reachable, type Reachable } from './net-probe.ts';
 import type { UpstreamStatus } from './upstream.ts';
 import fs from 'node:fs';
@@ -24,6 +26,7 @@ import type {
   DeltaBody,
   DeltaType,
   DesignReview,
+  ReplyButton,
   ReviewDraft,
   EffortLevel,
   EventBody,
@@ -93,7 +96,7 @@ import { parseWhen } from './when.ts';
 import { emptyHighlights, observe as observeHighlights, pinItem, remove as removeHighlight, unpin as unpinHighlight, upsert as upsertHighlight, view as highlightsView, absolute, type ThreadHighlights } from './highlights.ts';
 import { SERVER_NAME, approvalTitle } from './threadbear-mcp.ts';
 import { PANEL_ACK_WAIT_MS, PANEL_PLACES, resolvePanel } from './panel-requests.ts';
-import { archiveFromTool, bylineFromTool, END_TURN_TOOL, endTurnAccepted, endTurnAddedArchive, endTurnAddedSnooze, snoozeFromTool, waitForFromTool, endTurnAsksForMessage, endTurnIsOneReply, endTurnOwesReply, endTurnRefusedRepeat, endTurnTaken, endTurnWantsReply, needsFromText, needsFromTool, replyWithoutRepeat, splitReplySection, summaryFromTool, summaryMarkdown } from './needs.ts';
+import { archiveFromTool, bylineFromTool, END_TURN_TOOL, endTurnAccepted, endTurnAddedArchive, endTurnAddedSnooze, snoozeFromTool, waitForFromTool, endTurnAsksForMessage, endTurnIsOneReply, endTurnOwesReply, endTurnRefusedRepeat, endTurnTaken, endTurnWantsReply, needsFromText, needsFromTool, replyWithoutRepeat, splitReplySection, summaryFromTool, summaryMarkdown, WakeRead } from './needs.ts';
 import type { Needs } from './needs.ts';
 import { asksForAppRestart } from './app-restarts.ts';
 import type { ConnectorsStatus } from './connectors.ts';
@@ -122,6 +125,7 @@ import {
   projectPatchFiles,
   webPage,
 } from './patches.ts';
+import { cutSafely, firstLineSafely, isSafeSlice } from './safe-cut.ts';
 import { FolderCache } from './folder-cache.ts';
 import { worktreesPart, type WorktreesPart } from './runner/worktrees.ts';
 import { networkPart, type NetworkPart } from './runner/network.ts';
@@ -133,6 +137,7 @@ import { approvalsPart, settleDeclined, type ApprovalsPart, type SecretAnswer } 
 import type { RequestAnswer } from './cross-runner.ts';
 import { SecretStore } from './secrets.ts';
 import { reviewsPart, type ReviewsPart } from './runner/reviews.ts';
+import { buttonsPart, MAX_BUTTONS, type ButtonsPart } from './runner/buttons.ts';
 import { clisPart, type ClisPart } from './runner/clis.ts';
 import { editingPart, type EditingPart } from './runner/editing.ts';
 import { patchesPart, type PatchesPart } from './runner/patches.ts';
@@ -143,6 +148,8 @@ import type { SlashCommand } from './slash-commands.ts';
 import { hibernationPart, type HibernationPart } from './runner/hibernation.ts';
 import { newThreadsPart, type NewThreadsPart } from './runner/new-threads.ts';
 import { labReviewPart, type LabReviewPart } from './runner/lab-review.ts';
+import { looseEndsPart, type LooseEndsPart } from './runner/loose-ends.ts';
+import { CONFINED_NO_SANDBOX, sandboxFor } from './sandbox.ts';
 
 export type Notification =
   | { method: 'thread.updated'; params: { thread: ThreadSummary } }
@@ -156,6 +163,7 @@ export type Notification =
   | { method: 'remoteThreads.updated'; params: import('./thread-index.ts').RemoteThreads }
   | { method: 'clis.updated'; params: { clis: CliStatus[] } }
   | { method: 'settings.updated'; params: { settings: Settings } }
+  | { method: 'instructions.updated'; params: { instructions: import('./instructions.ts').StandingInstructions } }
   | { method: 'runner.updates'; params: { updates: RunnerUpdates } }
   | { method: 'projects.updated'; params: { projects: Project[] } }
   | { method: 'librarian.updated'; params: { librarian: LibrarianStatus } }
@@ -236,8 +244,14 @@ export type BinaryReporter = { binariesInUse?(): string[] };
 // (no tool call of the agent's to point at) holds up only that subagent.
 export type PendingApproval =
   // plan: the "Plan first" plan (its itemId) this approval is Claude's ExitPlanMode for.
-  | { approvalId: string; kind: 'tool'; main: boolean; plan?: string; resolve: (a: ToolApprovalAnswer) => void }
-  | { approvalId: string; kind: 'question'; main: boolean; questions: Question[]; resolve: (a: QuestionAnswer) => void }
+  // macOnly: its whole input doesn't fit what the phone or another Mac's
+  // view shows (tools.ts, remoteCardShowsAll), so only an allow from a
+  // client that shows it all counts.
+  // title: what it's asking, for telling the agent about a subagent's.
+  // itemId and queued: the agent's call and the calls waiting behind it
+  // on the same card (docs/protocol.md, "Queued calls"), by itemId.
+  | { approvalId: string; kind: 'tool'; main: boolean; title?: string; plan?: string; macOnly?: boolean; itemId?: string; queued?: Set<string>; resolve: (a: ToolApprovalAnswer) => void }
+  | { approvalId: string; kind: 'question'; main: boolean; title?: string; questions: Question[]; resolve: (a: QuestionAnswer) => void }
   // An agent's ask_secret (docs/protocol.md, "Secrets"). The value never
   // passes through here: secrets.answer writes the file and hands this the
   // paths.
@@ -325,6 +339,9 @@ export type Turn = {
   // The Stop hook sent this turn back to call end_turn, so what it already
   // wrote is the reply (threadbear-mcp.ts, needs.ts oneReplyAlreadyWritten).
   endTurnNudged?: boolean;
+  // Whether the agent has read a background task's notification that came
+  // into the turn (needs.ts, WakeRead).
+  wake?: WakeRead;
 };
 
 type Runtime = {
@@ -334,6 +351,8 @@ type Runtime = {
   releasedGen?: number; // generation of the session being released on purpose
   resumed: boolean; // the live session was started with resume
   retriedFresh: boolean;
+  // News of the standing instructions went out in this turn (settleInstructionsNews).
+  instructionsNewsSent?: boolean;
   // Where the live session's transcript was carried from, if it moved
   // folder; used only if resuming the copy fails.
   carried?: ThreadRecord['handoff'];
@@ -369,6 +388,10 @@ type Runtime = {
   // once that CLI has exited, so a second process never touches the thread
   // while the live one still has it loaded.
   archivePending?: boolean;
+  // Its last save failed and it's waiting to be tried again (flush), and
+  // whether nothing has changed since, so the retry tells nobody.
+  saveFailed?: boolean;
+  saveRetry?: boolean;
   // The archived thread's worktree cleanup while it runs: a handover waits
   // for it before saving the record, or its result is lost (THREADBEAR-16).
   cleaning?: Promise<void>;
@@ -400,7 +423,7 @@ type Runtime = {
   // built-in panels stand in.
   // `base` is the set as the files give it; `set` is that with live state
   // applied (applyLive), which is what the app sees. `live`: base has any.
-  patches?: { cwd: string; key: string; at: number; base: PatchSet; set: PatchSet; refreshing: boolean; loaded: boolean; live?: boolean };
+  patches?: { cwd: string; key: string; at: number; base: PatchSet; set: PatchSet; refreshing: boolean; again?: boolean; loaded: boolean; live?: boolean };
   runningActions?: Set<string>;
   // Turns in a row that a hook's message started, per hook. A hook that
   // keeps failing stops being told to the agent after HOOK_TELL_LIMIT, so
@@ -417,6 +440,10 @@ type Runtime = {
   editing?: boolean;
   // Called when the running turn ends (endTurn), for an edit waiting on it.
   turnEndWaiters?: (() => void)[];
+  // The done card's loose-ends check (runner/loose-ends.ts): which run is
+  // the latest, so an older one finishing late is dropped, and when it began.
+  looseEndsRun?: number;
+  looseEndsAt?: number;
 };
 
 export type ThreadState = { rec: ThreadRecord; rt: Runtime };
@@ -424,6 +451,7 @@ export type ThreadState = { rec: ThreadRecord; rt: Runtime };
 export type Drain = {
   keep: Set<string>;
   going: Set<string>; // being let go
+  gone: Set<string>; // let go: the new runner's now (mustGet)
   onHandedOver: (threadId: string) => void;
   since: number;
   backgroundMs: number;
@@ -452,6 +480,9 @@ export const DRAIN_SETTLE_MS = 30 * 60_000;
 // How long subagents hold a kept thread after its last turn. Long, since
 // they end by themselves; only a stuck one should ever reach it.
 export const DRAIN_AGENT_MS = 4 * 60 * 60_000;
+// How soon a thread.json that failed to save is tried again. Until it's
+// saved, a crash or a handover would lose what changed (THREADBEAR-9).
+export const SAVE_RETRY_MS = 5000;
 
 export type RunnerDeps = {
   // The release it runs, when not this code's own (tests).
@@ -502,6 +533,8 @@ export type RunnerDeps = {
   // Projects (projects.ts): their folders' patches, the brief a session
   // starts with, and the summary's `projects`. Started by start().
   projects?: Projects;
+  /** Mike's standing instructions for every session (instructions.ts); '' for none. */
+  standingInstructions?: () => string;
   // A completed turn asked Mike to Restart to Update, by end_turn or in its
   // closing "What I need from you" (app-restarts.ts signs the thread up).
   appRestartAsked?: (threadId: string) => void;
@@ -563,12 +596,15 @@ export const UNTIL_RESTART = '9999-12-31T00:00:00.000Z';
 export const NO_WAKE_TIME = UNTIL_RESTART;
 
 // Parts of the Runner that live in runner/ (see each file's top).
-export interface Runner extends LabReviewPart, NewThreadsPart, HibernationPart, TitlesPart, HighlightsPart, PatchesPart, EditingPart, ClisPart, ReviewsPart, ApprovalsPart, ProjectsHostPart, StoppedWorkPart, HandoversPart, PoolsPart, NetworkPart, WorktreesPart, CommandsPart {}
+export interface Runner extends LooseEndsPart, LabReviewPart, NewThreadsPart, HibernationPart, TitlesPart, HighlightsPart, PatchesPart, EditingPart, ClisPart, ReviewsPart, ButtonsPart, ApprovalsPart, ProjectsHostPart, StoppedWorkPart, HandoversPart, PoolsPart, NetworkPart, WorktreesPart, CommandsPart {}
 export class Runner {
   // While main.ts is still starting up: waking a thread for its waits
   // (reconcileWaits) would start a CLI whose tools aren't ready, so they
   // wait for main.ts's own reconcileWaits once it's listening.
   holdWaits = false;
+  // The schedules that send to a thread (main.ts sets it from the
+  // Scheduler), for the done card's loose ends.
+  schedulesFor?: (threadId: string) => Schedule[];
   // The release this runner runs (none from a source checkout), for
   // threads hibernating until a new one (snoozedUntil "release"). Tests set it.
   release: string | undefined = RELEASE.release;
@@ -597,6 +633,7 @@ export class Runner {
   secrets: SecretStore;
   models?: Pick<Models, 'generate'>;
   projects?: Projects;
+  standingInstructions?: () => string;
   activity = new Set<(a: ThreadActivity) => void>();
   patchCache: PatchCache = new Map();
   patchTrust: PatchTrustStore;
@@ -611,6 +648,7 @@ export class Runner {
   listeners = new Set<(n: Notification) => void>();
   dirty = new Set<string>();
   flushScheduled = false;
+  saveRetryTimer?: TimerHandle;
   snoozeTimer?: TimerHandle;
   stopping = false;
   // Set while this runner drains after a handover (docs/protocol.md,
@@ -677,6 +715,7 @@ export class Runner {
     this.secrets = new SecretStore(paths.secrets(deps.config.home), () => this.clock.now());
     this.models = deps.models;
     this.projects = deps.projects;
+    this.standingInstructions = deps.standingInstructions;
     this.appRestartAsked = deps.appRestartAsked;
     this.atMac = deps.atMac;
     this.adapters = deps.adapters;
@@ -880,6 +919,9 @@ export class Runner {
     const reviews = new Map<string, DesignReview>();
     for (const event of events) if (event.type === 'review.updated') reviews.set(event.review.id, event.review);
     if (reviews.size) rec.reviews = [...reviews.values()];
+    const buttons = new Map<string, ReplyButton>();
+    for (const event of events) if (event.type === 'button.updated') buttons.set(event.button.id, event.button);
+    if (buttons.size) rec.buttons = [...buttons.values()].slice(-MAX_BUTTONS);
     if (rewinds.length) rec.rewinds = rewinds;
     if (open && lastStarted) rec.turnId = lastStarted.turnId;
     this.log.warn('thread.json was unreadable; rebuilt it from the event log', { threadId: id });
@@ -902,14 +944,27 @@ export class Runner {
     const { rec } = st;
     // A sub-agent can't outlive the runner that started its CLI.
     this.stopSubagents(st);
+    // Waiting with no turn is only a subagent's card, and that subagent is
+    // gone: there's no turn to pick up again.
+    const onlyCards = rec.status === 'waiting' && !rec.turnId;
+    if (onlyCards) rec.status = 'idle';
     const midTurn = rec.status === 'starting' || rec.status === 'running' || rec.status === 'waiting';
     if (!midTurn && rec.pendingApprovals.length === 0 && rec.queue.length === 0) return false;
     // The turn may have ended on disk just before a crash stopped
     // thread.json being saved; then it only needs its status back.
     const ended = midTurn && rec.turnId ? this.findTurnCompleted(rec.id, rec.turnId) : undefined;
+    // thread.json can be behind the log (a crash before it was saved): a card
+    // may have been answered there, and a later "expired" would replace the
+    // answer. A turn that ended there closed its own cards, but a subagent's
+    // outlives its turn, so go by what the log says (Codex review).
+    const resolved = new Set<string>();
+    if (rec.pendingApprovals.length) {
+      const log = this.store.log(rec.id);
+      for (const e of log.read(1, log.lastSeq)) if (e.type === 'approval.resolved') resolved.add(e.approvalId);
+    }
     for (const approvalId of rec.pendingApprovals) {
-      if (ended) break;
-      this.emit(st, { type: 'approval.resolved', approvalId, decision: 'expired', message: 'The runner restarted.' }, rec.turnId);
+      if (resolved.has(approvalId)) continue;
+      this.emit(st, { type: 'approval.resolved', approvalId, decision: 'expired', message: 'The runner restarted.' }, ended ? undefined : rec.turnId);
     }
     rec.pendingApprovals = [];
     if (midTurn && ended) {
@@ -1184,10 +1239,13 @@ export class Runner {
   // docs/protocol.md, "Pools". The rules are in pools.ts; this is where
   // they meet threads.
 
-  list(include: ('inbox' | 'snoozed' | 'archived')[] = ['inbox']): ThreadSummary[] {
+  // With ids, only those threads (threads.list's ids): a draining runner
+  // looking one up mustn't be sent all 900 (docs/protocol.md, "Handovers").
+  list(include: ('inbox' | 'snoozed' | 'archived')[] = ['inbox'], ids?: string[]): ThreadSummary[] {
     const want = new Set(include);
     const out: ThreadSummary[] = [];
-    for (const st of this.threads.values()) {
+    const states = ids ? [...new Set(ids)].flatMap((id) => this.threads.get(id) ?? []) : this.threads.values();
+    for (const st of states) {
       if (want.has(this.bucket(st.rec))) out.push(this.summary(st));
     }
     return sortByActivity(out);
@@ -1342,7 +1400,11 @@ export class Runner {
     // New work: its last finish no longer says it's done, for threads
     // waiting on it (runner/hibernation.ts).
     delete rec.finished;
-    // Sending to a snoozed or archived thread brings it back.
+    // Sending to a snoozed or archived thread brings it back. A schedule's
+    // message notes it came out of the archive, so the run can put it back
+    // if it ends with nothing for Mike (the end of the turn, below).
+    if (rec.archivedAt && opts.origin === 'schedule') rec.unarchivedBySchedule = { by: rec.archivedBy };
+    if (fromMike(text, opts)) delete rec.unarchivedBySchedule;
     if (rec.snoozedUntil || rec.archivedAt) {
       delete rec.snoozedUntil;
       delete rec.snoozedUntilRestart;
@@ -1429,8 +1491,8 @@ export class Runner {
   // CLI is still starting or leaving, not behind messages already waiting,
   // not once a move or a fresh CLI is due on the next turn (the message is
   // meant for that), not after Stop was pressed (the CLI would cancel it
-  // with the rest), and not into a turn opened only for a background
-  // subagent's approval, where there's no CLI turn to join.
+  // with the rest), and not into a turn opened only for a card, where
+  // there's no CLI turn to join.
   canSteer(st: ThreadState): boolean {
     const { rec, rt } = st;
     const turn = rt.turn;
@@ -1473,7 +1535,28 @@ export class Runner {
     // more thing" shouldn't send the thread away. It can ask again.
     if (turn.endTurn?.archive) turn.endTurn = { ...turn.endTurn, archive: false };
     this.markDirty(st);
-    rt.session!.send({ id: msg.turnId, text: this.forAgent(msg), images: msg.images });
+    // A change reaches a running turn too, or a clear could wait out as many
+    // messages as were sent into it (Codex review).
+    this.sendWithInstructionsNews(st, { id: msg.turnId, text: this.forAgent(msg), images: msg.images });
+  }
+
+  // A turn that had its end_turn, opened again once the agent has read a
+  // background task's notification (7 Nov 2026, thread 46de9389). Unlike a
+  // message (steer) nothing new is owed to Mike, but the work after it is the
+  // turn's latest: its text is kept and becomes the preview, and the card
+  // that was taken stands only until the next end_turn. A "What I need from
+  // you" the reply had (replyNeeds) stands until then too, as the agent may
+  // stop without another. A one-reply turn's text stays its reply (replyAfter,
+  // marked final), so a report written after the wake shows even without a
+  // new end_turn (TranscriptReducer, reply(of:), picks among them).
+  seeWake(turn: Turn, ev: { type: string; itemId?: string; wake?: true }): void {
+    turn.wake ??= new WakeRead();
+    if (!turn.wake.see(ev) || !(turn.ended || turn.tookEndTurn)) return;
+    turn.ended = false;
+    turn.owedReply = undefined;
+    turn.headline = false;
+    turn.summarized = false;
+    turn.narrationItem = undefined;
   }
 
   // The text the agent gets for a message. One from the phone says so, and
@@ -1523,7 +1606,8 @@ export class Runner {
     delete rec.waitingForNetwork;
     if (rec.netCarryOn && rec.netCarryOn.turnId !== msg.turnId) delete rec.netCarryOn;
     this.beforeTurn(st);
-    rec.status = rt.session && !rt.closing ? 'running' : 'starting';
+    // A subagent's card can still be open (docs/protocol.md, "A subagent's card").
+    rec.status = rt.session && !rt.closing ? (rt.approvals.size ? 'waiting' : 'running') : 'starting';
     this.markDirty(st);
     // A message to the thread (not a turn the CLI opened by itself), so the
     // librarian can file a new thread before its first turn is over.
@@ -1564,6 +1648,9 @@ export class Runner {
     // (its next init), but says nothing.
     if (command && rec.provider === 'claude' && /^\/clear\b/i.test(msg.text.trim())) {
       this.emit(st, { type: 'system.note', text: 'Cleared the conversation. The agent starts fresh from your next message; the transcript above stays here for you.' }, msg.turnId);
+      // The same CLI goes on with the system prompt it started with, and
+      // whatever a message told it has gone (Codex review).
+      if (rec.instructionsTold !== undefined) rec.instructionsTold = INSTRUCTIONS_REWOUND;
     }
     if (!rt.session && rec.worktreePending) {
       await this.prepareWorktree(st, msg.turnId);
@@ -1616,7 +1703,9 @@ export class Runner {
       this.emit(st, { type: 'system.note', text: `Moved to ${rec.cwd}. The session carries on there.` }, msg.turnId);
       delete rec.moved;
     }
-    rt.session!.send({ id: msg.turnId, text, images: msg.images });
+    // Kept for the next message when this one is a command, as the news is.
+    if (command) rt.session!.send({ id: msg.turnId, text, images: msg.images });
+    else this.sendWithInstructionsNews(st, { id: msg.turnId, text, images: msg.images });
     if (msg.reviewId && !rec.reviewDeliveries?.includes(msg.reviewId)) {
       (rec.reviewDeliveries ??= []).push(msg.reviewId);
       // A persisted transcript row is not proof of dispatch: both initial
@@ -1709,6 +1798,11 @@ export class Runner {
     rt.startVersion = this.cliList()?.find((c) => c.provider === rec.provider)?.installedVersion;
     // Read now, not from the patch list's cache: a pull just before this
     // message may have brought hooks.
+    // A thread shut in a sandbox starts in one or not at all (the adapters
+    // check too); one that starts in one is shut in it from now on.
+    const inSandbox = rec.provider === 'claude' && this.sandboxed(rec.cwd);
+    if (rec.confined && !inSandbox) throw new Error(rec.provider === 'claude' ? CONFINED_NO_SANDBOX(rec.cwd) : "This thread runs in a sandbox, and Codex can't, so it wasn't started. Move it to a Claude login.");
+    if (inSandbox) rec.confined = true;
     const claude = rec.provider === 'claude' ? this.patchTrust.checkClaude(rec.cwd, claudeOptions(rec)) : undefined;
     rt.claudeSkipped = claude && !claude.trusted ? claude.hash : undefined;
     rt.claudeHeldGrants = Boolean(claude?.trusted && rec.permissionMode === 'full' && !this.patchTrust.checkClaude(rec.cwd, { grants: true }).trusted);
@@ -1720,6 +1814,7 @@ export class Runner {
         model: rec.model,
         effort: rec.effort,
         permissionMode: rec.permissionMode,
+        ...(rec.confined ? { confined: true } : {}),
         sessionId: rec.nativeSessionId,
         resume,
         ...(resume && rec.resumeAt ? { resumeAt: rec.resumeAt } : {}),
@@ -1746,6 +1841,7 @@ export class Runner {
     switch (o.kind) {
       case 'event': {
         let ev = o.event;
+        if (rt.turn) this.seeWake(rt.turn, ev);
         // Text after an accepted end_turn (see Turn.ended), dropped before
         // it can become the preview or a second message. Unless the reply
         // was a narration block's summary: then this is the reply, in the
@@ -1821,6 +1917,9 @@ export class Runner {
               rt.turn.headline = true;
               rec.preview = oneLine(headline, LIMITS.previewChars);
             }
+            // A "What I need from you" taken from a reply before a wake
+            // stands until now (reopenForWake).
+            rt.turn.replyNeeds = undefined;
             const bullets = endTurnIsOneReply(ev) ? undefined : summaryFromTool(rt.turn.endTurn);
             rt.turn.owedReply = !bullets ? undefined : endTurnAsksForMessage(ev) ? 0 : endTurnOwesReply(ev) ? summaryMarkdown(bullets).length : undefined;
           }
@@ -1859,6 +1958,7 @@ export class Runner {
         // above, so it doesn't flash up and vanish.
         // That includes the message an owed reply keeps (owedReply): it
         // lands whole, as a sign-off line it drops would leave a row behind.
+        if (rt.turn && (o.delta.type === 'assistant.text.delta' || o.delta.type === 'reasoning.delta')) this.seeWake(rt.turn, { type: 'assistant.text', itemId: o.delta.itemId });
         if (rt.turn?.ended && !rt.turn.replyAfter && (o.delta.type === 'assistant.text.delta' || o.delta.type === 'reasoning.delta') && !o.delta.itemId.includes('/')) break;
         this.addDelta(st, o.delta);
         break;
@@ -1968,7 +2068,9 @@ export class Runner {
         // permission to edit a file isn't permission to run it, so what it
         // wrote waits for Mike in Patches (code-writes.ts, Gautam's scan
         // F1 and F4). Only inside the thread's own folder.
-        if (o.mode !== 'full') break;
+        // A sandboxed thread's are its container's, not this machine's: the
+        // runner and the Mac app would run them outside it.
+        if (o.mode !== 'full' || rec.confined) break;
         this.trustAgentPatches(
           o.files.map((f) => ({ ...f, path: path.resolve(rec.cwd, f.path) })),
           rec.cwd,
@@ -1983,6 +2085,13 @@ export class Runner {
         this.emit(st, { type: 'plan.proposed', itemId: o.itemId, text: o.text }, rt.turn?.turnId);
         this.markDirty(st);
         break;
+      case 'approvalQueue': {
+        const pending = [...rt.approvals.values()].find((p) => p.kind === 'tool' && p.itemId === o.toolUseId);
+        if (pending?.kind !== 'tool') break;
+        pending.queued = new Set(o.calls.map((c) => c.itemId));
+        this.emit(st, { type: 'approval.queued', approvalId: pending.approvalId, calls: o.calls }, rt.turn?.turnId);
+        break;
+      }
       case 'allowRules': {
         const rules = new Set(rec.allowRules ?? []);
         for (const r of o.rules) rules.add(r);
@@ -2065,9 +2174,14 @@ export class Runner {
     const { rec, rt } = st;
     const turn = rt.turn;
     if (!turn) return;
+    this.settleInstructionsNews(st, r.outcome === 'completed' && !turn.interruptRequested);
     this.flushDeltas(st);
     rt.inProgress.clear();
-    this.expireApprovals(st, 'The turn ended.');
+    // Not a subagent's card: it's waiting on Mike, not on this turn, and the
+    // subagent carries on after it. Expiring them here killed two subagents
+    // when their parent's next turn ended, while Mike was away, and the CLI
+    // told the parent he had stopped them (7 Nov 2026, thread 7a98a6fd).
+    this.expireApprovals(st, 'The turn ended.', { mainOnly: true });
     let turnCost: number | undefined;
     if (r.totalCostUsd !== undefined) {
       // total_cost_usd is a running total for the native session (resume
@@ -2146,10 +2260,15 @@ export class Runner {
     // Judged before endTurn, which starts any queued message.
     const finished = outcome === 'completed' && said?.needs === 'nothing' && !rec.queue.length && !archive &&
       !snoozeFromTool(turn.endTurn) && !waitForFromTool(turn.endTurn) &&
-      !rec.subagents?.some((a) => a.status === 'running') && !rt.tasks.length &&
+      !rec.subagents?.some((a) => a.status === 'running') && !rt.tasks.length && !rt.approvals.size &&
       // A job that ended mid-turn: the CLI's turn reading its result is next.
       !rt.taskEndedInTurn && !rt.finished.length;
     this.endTurn(st, ev.seq, outcome === 'failed' ? 'error' : 'idle', outcome, limitHit, netLost);
+    // The done card's loose ends (experiment looseEnds), unless it's going
+    // away now; and the card of the thread that started this one, which
+    // lists this one while it's working.
+    if (outcome === 'completed' && said?.needs === 'nothing' && !archive) void this.checkLooseEnds(st);
+    this.recheckStarter(st);
     // A code change gets another lab's review before it counts as done
     // (experiment labReview, runner/lab-review.ts): the thread waits on
     // the review, so anything waiting on it hears once it's been fixed.
@@ -2169,6 +2288,28 @@ export class Runner {
     // Owed to the next runner (a handover): finished once it's reviewed.
     else if (finished && !rec.labReviewOwed) this.markFinished(st, turn.lastText);
     if (outcome === 'completed' && this.waitedOnFor(rec.id).length) this.tellActivity({ kind: 'waited-on', threadId: rec.id });
+    // A schedule's message brought this thread out of the archive (sendTo).
+    // A run that finishes with nothing for Mike puts it back, so a watcher he
+    // archived doesn't land in his inbox each time it looks and finds
+    // nothing (7 Nov 2026, a twice-daily Pebble check). One that needs him,
+    // fails or is stopped stays out. One still going (a background job, a
+    // sub-agent, a lab review, owed or started, a wait, a pool move or a lost
+    // network) keeps the mark, so the turn that really ends the run decides;
+    // a queued message decides at the end of its own turn.
+    // A run that ends for good drops the mark even with another message
+    // queued (endTurn may have started it already), so a later run that
+    // finds nothing can't archive a question this one left for Mike.
+    if (rec.unarchivedBySchedule) {
+      const by = rec.unarchivedBySchedule.by;
+      const goingOn = !!limitHit || !!netLost || (outcome === 'completed' && said?.needs === 'nothing');
+      if (!goingOn || rec.archivedAt) delete rec.unarchivedBySchedule;
+      else if (!rec.queue.length && !rt.turn && finished && !review && !rec.labReviewOwed && !this.stopping) {
+        delete rec.unarchivedBySchedule;
+        this.emit(st, { type: 'system.note', text: 'Back in the archive: the scheduled run ended with nothing for you.' });
+        this.update({ threadId: rec.id, archived: true, archivedBy: by ?? 'threadbear' });
+      }
+      this.markDirty(st);
+    }
     if (archive && !rt.turn && !rec.archivedAt && !this.stopping) {
       this.emit(st, { type: 'system.note', text: 'Archived, as the agent was asked to once it had finished.' });
       this.update({ threadId: rec.id, archived: true, archivedBy: 'agent' });
@@ -2234,7 +2375,9 @@ export class Runner {
     rt.activeAt = this.clock.now();
     rec.turnId = undefined;
     rec.lastTurnCompletedSeq = completedSeq;
-    rec.status = status;
+    // A subagent's card outlives the turn (completeTurn), so the thread is
+    // still waiting on Mike.
+    rec.status = rt.approvals.size ? 'waiting' : status;
     rec.lastActivityAt = this.isoNow();
     this.markDirty(st);
     const waiters = rt.turnEndWaiters ?? [];
@@ -2248,8 +2391,13 @@ export class Runner {
     const { rec, rt } = st;
     const turn = rt.turn;
     if (!turn) return;
+    this.settleInstructionsNews(st, false);
     this.persistInProgress(st, turn.turnId);
     this.expireApprovals(st, 'The turn ended.');
+    // A crash or a Stop ends a scheduled run for good: it stays in the
+    // inbox, and a later run can't put it back in the archive (the end of
+    // a turn, above).
+    if (rec.unarchivedBySchedule) delete rec.unarchivedBySchedule;
     const interrupted = turn.interruptRequested;
     if (!interrupted) this.emit(st, { type: 'error', message }, turn.turnId);
     const body: EventBody = {
@@ -2310,6 +2458,9 @@ export class Runner {
     if (err && !rt.started && !missing && rt.releasedGen !== gen) this.tellStarted(rec.provider, rt.startVersion, false);
     rt.session = undefined;
     rt.frozen = false;
+    // Nothing's left to answer them: a subagent's card can be open with no
+    // turn running, and no turn ending would close it.
+    this.expireApprovals(st, 'The CLI stopped.');
     rt.tasks = [];
     rt.finished = [];
     rt.taskEndedInTurn = false;
@@ -2346,8 +2497,11 @@ export class Runner {
       const inUse = Boolean(err && !rt.resumed && /Session ID \S+ is already in use/i.test(err.message));
       if (((notFound && rt.resumed) || inUse) && !rt.retriedFresh) {
         rt.retriedFresh = true;
-        if (inUse) rec.sessionUsed = true;
-        else {
+        if (inUse) {
+          rec.sessionUsed = true;
+          // The old session goes on, not the fresh one the brief was for.
+          if (rec.instructionsTold !== undefined) rec.instructionsTold = INSTRUCTIONS_REWOUND;
+        } else {
           rec.sessionUsed = false;
           rec.nativeSessionId = crypto.randomUUID();
           rec.sessionCostTotal = 0;
@@ -2395,13 +2549,21 @@ export class Runner {
     this.archiveWhenGone(st);
   }
 
-  interrupt(threadId: string): Record<string, never> {
+  // byMike: his Stop, in the app or on the phone. Everything else that stops
+  // a turn (an agent's interrupt_thread, an archive, a move) mustn't reach
+  // the agent as his decision (docs/protocol.md, "Who stopped it").
+  interrupt(threadId: string, opts: { byMike?: boolean } = {}): Record<string, never> {
     const st = this.mustGet(threadId);
     const { rt } = st;
     const turn = rt.turn;
-    if (!turn) return {};
+    const closing = { stopped: opts.byMike === true };
+    // Stop with only a subagent's card open: that card is what's waiting.
+    if (!turn) {
+      this.expireApprovals(st, 'Interrupted.', closing);
+      return {};
+    }
     turn.interruptRequested = true;
-    this.expireApprovals(st, 'Interrupted.');
+    this.expireApprovals(st, 'Interrupted.', closing);
     const session = rt.session;
     // Nothing is running in the CLI for a turn that was only opened for a
     // background subagent's approval, so nothing would end it.
@@ -2449,6 +2611,10 @@ export class Runner {
     archivedBy?: ArchivedBy;
     verdict?: ArchiveVerdict;
     starred?: boolean;
+    // A move Mike made (the app, tb) or allowed on a card: a thread shut in
+    // a sandbox may leave it. Without it, a move or login change that would
+    // take it out is refused (ThreadRecord.confined).
+    unconfine?: boolean;
   }): { thread: ThreadSummary } {
     const st = this.mustGet(params.threadId);
     const { rec, rt } = st;
@@ -2475,7 +2641,7 @@ export class Runner {
       toAccountId = id ?? poolAccounts(pool, accounts)[0]?.id;
     }
     if (params.title !== undefined) {
-      rec.title = params.title.trim().slice(0, 200) || rec.title;
+      rec.title = cutSafely(params.title.trim(), 200) || rec.title;
       rec.titleSet = true;
       if (params.titleBy !== 'agent') rec.titleByMike = true;
     }
@@ -2487,6 +2653,11 @@ export class Runner {
       throw new RpcError(ErrorCode.accountNotFound, `No account called ${toAccountId}`);
     }
     if (newAccount && toAccountId !== rec.accountId) this.checkProvider(newAccount);
+    // Checked before anything changes: where it would run after this.
+    const stillIn = (newAccount?.provider ?? rec.provider) === 'claude' && this.sandboxed(newCwd ?? rec.cwd);
+    if (rec.confined && (newCwd !== undefined || toAccountId !== undefined) && !stillIn && !params.unconfine) {
+      throw new RpcError(ErrorCode.badParams, `"${rec.title}" runs in a sandbox, and this would take it out of it (a folder that isn't in one, or a Codex login). Only the user can do that.`);
+    }
     // Pinned (an account named, or poolId null), or into a pool.
     if (params.accountId !== undefined || params.poolId === null) {
       delete rec.poolId;
@@ -2532,6 +2703,11 @@ export class Runner {
       release = true;
     }
     if (cwdChanged) this.tellActivity({ kind: 'moved', threadId: rec.id, from: fromCwd, to: rec.cwd });
+    // Out of the sandbox, as allowed; into one, shut in it from now.
+    if (cwdChanged || accountChanged) {
+      if (stillIn) rec.confined = true;
+      else delete rec.confined;
+    }
     // The account the settings are checked against, after any change.
     const account = newAccount ?? this.accounts.get(rec.accountId);
     let model = rec.model;
@@ -2640,6 +2816,9 @@ export class Runner {
     }
     let archiving = false;
     if (params.archived !== undefined) {
+      // Mike (or an agent) archived or unarchived it himself: that settles
+      // where it lives, not the schedule run that brought it back.
+      delete rec.unarchivedBySchedule;
       if (params.archived) {
         archiving = !rec.archivedAt;
         const by = params.archivedBy ?? 'mike';
@@ -2653,7 +2832,10 @@ export class Runner {
         stop = true;
       } else delete rec.archivedAt;
     }
-    if (archiving) this.reconcileWaits();
+    if (archiving) {
+      this.reconcileWaits();
+      this.recheckStarter(st);
+    }
     if (params.starred === true) rec.starredAt ??= this.isoNow();
     else if (params.starred === false) delete rec.starredAt;
     if (accountChanged && rt.turn && rt.session && !stop) {
@@ -2676,6 +2858,7 @@ export class Runner {
     // first, then released, so that can take a moment. Resuming unarchives.
     if (archiving) {
       rt.archivePending = true;
+      if (rec.worktree && !rec.worktree.removedAt) rec.worktree.cleanupOwed = true;
       this.archiveWhenGone(st);
     }
     rec.updatedAt = this.isoNow();
@@ -2778,10 +2961,16 @@ export class Runner {
   // ------------------------------------------------------------ CLI updates
 
   // Runs a pending archive once no CLI has the session: none live and none
-  // closing. Skipped if the thread came back meanwhile.
+  // closing. Skipped if the thread came back meanwhile. A turn-end hook still
+  // running holds it too (runHooks comes back here): it's working in the
+  // folder the cleanup would remove or hand on, and on 7 Nov a typecheck
+  // lost its files that way, "failed", and woke the thread just archived.
+  // Waiting also means a real failure finds the worktree still there, as
+  // sendTo brings the thread back before the cleanup looks. A patch action
+  // still running holds it the same way (runAction comes back here).
   archiveWhenGone(st: ThreadState): void {
     const { rec, rt } = st;
-    if (!rt.archivePending || rt.session || rt.closing || rt.deleted) return;
+    if (!rt.archivePending || rt.session || rt.closing || rt.deleted || rt.hooksRunning || rt.runningActions?.size) return;
     rt.archivePending = false;
     if (rec.archivedAt) {
       this.archiveNative(st);
@@ -2951,6 +3140,7 @@ export class Runner {
 
   markDirty(st: ThreadState): void {
     if (st.rt.deleted) return;
+    st.rt.saveRetry = false;
     this.dirty.add(st.rec.id);
     if (this.flushScheduled) return;
     this.flushScheduled = true;
@@ -2958,20 +3148,37 @@ export class Runner {
   }
 
   // Saves changed thread.json files and sends thread.updated for them.
+  // One that fails stays dirty and is tried again in a moment, rather than
+  // waiting for the thread's next change (THREADBEAR-9: a new runner's
+  // start once swept away a draining runner's temp file mid-save).
   flush(): void {
     this.flushScheduled = false;
+    this.saveRetryTimer?.cancel();
+    this.saveRetryTimer = undefined;
     const ids = [...this.dirty];
     this.dirty.clear();
+    let failed = false;
     for (const id of ids) {
       const st = this.threads.get(id);
       if (!st) continue;
+      const retry = st.rt.saveRetry;
       try {
         this.store.save(st.rec);
+        st.rt.saveFailed = false;
+        st.rt.saveRetry = false;
       } catch (e) {
-        this.log.error('could not save thread', { threadId: id, error: String(e) });
+        this.dirty.add(id);
+        failed = true;
+        st.rt.saveRetry = true;
+        // Said once until it saves, as it reaches Sentry.
+        if (!st.rt.saveFailed) this.log.error('could not save thread', { threadId: id, error: String(e) });
+        st.rt.saveFailed = true;
+        // A retry with nothing new: the app already has this summary.
+        if (retry) continue;
       }
       this.notify({ method: 'thread.updated', params: { thread: this.summary(st) } });
     }
+    if (failed && !this.stopping) this.saveRetryTimer = this.clock.setTimeout(() => this.flush(), SAVE_RETRY_MS);
   }
 
   summary(st: ThreadState): ThreadSummary {
@@ -3059,6 +3266,8 @@ export class Runner {
     // A record from 28 Oct may say "people" (sharing with specific people,
     // since dropped): that's not shared.
     if (rec.share) s.share = { access: rec.share.access === 'link' ? 'link' : 'off', slug: rec.share.slug, updatedAt: rec.share.updatedAt };
+    // Only for the card it was checked for: a new turn's card waits for its own.
+    if (rec.looseEnds && this.looseEndsCard(st) === rec.looseEnds.seq) s.looseEnds = { seq: rec.looseEnds.seq, ends: rec.looseEnds.ends.map((e) => ({ ...e })), at: rec.looseEnds.at };
     return s;
   }
 
@@ -3097,9 +3306,28 @@ export class Runner {
     return moreAccess(rt.turn?.access, rec.permissionMode);
   }
 
+  // Whether a thread's CLI is shut in a sandbox (ThreadRecord.confined).
+  confinedOf(threadId: string): boolean {
+    return Boolean(this.mustGet(threadId).rec.confined);
+  }
+
+  // Whether a Claude thread in `cwd` would run in a sandbox (sandbox.ts),
+  // by where the folder really is.
+  sandboxed(cwd: string): boolean {
+    return Boolean(sandboxFor(this.cfg.sandbox, cwd));
+  }
+
   mustGet(threadId: string): ThreadState {
     const st = typeof threadId === 'string' ? this.threads.get(threadId) : undefined;
-    if (!st) throw new RpcError(ErrorCode.threadNotFound, `Thread not found: ${threadId}`);
+    if (!st) {
+      // Let go by this draining runner, which still answers on the runner's
+      // port until its drain port is up (main.ts handOver), a few seconds:
+      // the new runner has it in a moment. The Mac app tries again there on
+      // these words (AppModel.turnedAwayByRestart); Mike saw "Thread not
+      // found" picking an effort in that gap (7 Nov).
+      if (this.draining?.gone.has(threadId)) throw new RpcError(ErrorCode.busy, 'The runner is handing over to a new one; try again in a moment.');
+      throw new RpcError(ErrorCode.threadNotFound, `Thread not found: ${threadId}`);
+    }
     return st;
   }
 
@@ -3109,6 +3337,16 @@ export class Runner {
   briefFor(rec: ThreadRecord, resume: boolean): { instructions?: string } {
     if (resume) return {};
     const parts: string[] = [];
+    // Mike's own standing instructions first: they're for everything.
+    const standing = this.standingInstructions?.().trim() ?? '';
+    if (standing) {
+      rec.instructionsTold = instructionsHash(standing);
+      parts.push(standingText(standing));
+    } else if (rec.instructionsTold !== undefined) {
+      // Not forgotten: a session id already in use goes back to the session
+      // that held them (below, inUse). With none ever, nothing's written.
+      rec.instructionsTold = INSTRUCTIONS_CLEARED;
+    }
     if (this.projects) {
       rec.projectsTold = this.projects.briefIds(rec);
       const brief = this.projects.brief(rec);
@@ -3117,6 +3355,62 @@ export class Runner {
     // Where its worktree is and how its work gets to main.
     if (rec.worktree && !rec.worktree.removedAt) parts.push(worktreeInstructions(rec.worktree));
     return parts.length ? { instructions: parts.join('\n\n') } : {};
+  }
+
+  // Mike's standing instructions, when they've changed since the session
+  // last heard them (or it never has): a resumed Claude session keeps its
+  // first system prompt, so the change comes before his next message.
+  instructionsNews(rec: ThreadRecord): string | undefined {
+    if (!this.standingInstructions) return undefined;
+    const standing = this.standingInstructions().trim();
+    const before = rec.instructionsTold;
+    if (!standing) {
+      // Nothing written while it never held any: with the experiment off a
+      // thread record doesn't change at all.
+      if (before === undefined || before === INSTRUCTIONS_CLEARED) return undefined;
+      rec.instructionsTold = INSTRUCTIONS_CLEARED;
+      return 'Note from Threadbear: the user cleared their standing instructions; earlier ones no longer apply.';
+    }
+    const hash = instructionsHash(standing);
+    if (before === hash) return undefined;
+    rec.instructionsTold = hash;
+    return `Note from Threadbear: the user's standing instructions${before === undefined || before === INSTRUCTIONS_CLEARED ? '' : ' have changed, and replace any earlier ones'}.\n\n${standingText(standing)}`;
+  }
+
+  // Sends a message with any change to the standing instructions in front.
+  // They count as told only once the CLI has taken it: a send that throws
+  // (a picture gone from the queue) would otherwise use up a clear that never
+  // arrived (Codex review). In the transcript too, as a change anything made
+  // reaches every thread, so it shouldn't only be something agents can see.
+  sendWithInstructionsNews(st: ThreadState, message: UserInput): void {
+    const { rec, rt } = st;
+    const before = rec.instructionsTold;
+    const standing = this.instructionsNews(rec);
+    try {
+      rt.session!.send(standing ? { ...message, text: `${standing}\n\n${message.text}` } : message);
+    } catch (e) {
+      if (before === undefined) delete rec.instructionsTold;
+      else rec.instructionsTold = before;
+      throw e;
+    }
+    if (!standing) return;
+    // A turn that ends any other way may have dropped it (a message Codex was
+    // still holding when Stop came), so the turn's end looks at this.
+    rt.instructionsNewsSent = true;
+    // Only a note: failing here would report a message the CLI has as lost.
+    try {
+      this.emit(st, { type: 'system.note', text: "Told this thread's agent about a change to your standing instructions." }, message.id);
+    } catch (e) {
+      this.log.warn('could not note the standing instructions change', { threadId: rec.id, error: String(e) });
+    }
+  }
+
+  // At a turn's end: news sent in a turn that didn't complete may never have
+  // arrived, so the next message says what's current.
+  settleInstructionsNews(st: ThreadState, completed: boolean): void {
+    const { rec, rt } = st;
+    if (rt.instructionsNewsSent && !completed && rec.instructionsTold !== undefined) rec.instructionsTold = INSTRUCTIONS_REWOUND;
+    rt.instructionsNewsSent = false;
   }
 
   // The thread's projects its session hasn't been told about, as lines to
@@ -3201,7 +3495,7 @@ export class Runner {
 
 // The Runner's other methods live in parts under runner/, one area each;
 // they go onto its prototype here, as the class's own methods would be.
-for (const part of [labReviewPart, newThreadsPart, hibernationPart, titlesPart, highlightsPart, patchesPart, editingPart, clisPart, reviewsPart, approvalsPart, projectsHostPart, stoppedWorkPart, handoversPart, poolsPart, networkPart, worktreesPart, commandsPart]) {
+for (const part of [looseEndsPart, labReviewPart, newThreadsPart, hibernationPart, titlesPart, highlightsPart, patchesPart, editingPart, clisPart, reviewsPart, buttonsPart, approvalsPart, projectsHostPart, stoppedWorkPart, handoversPart, poolsPart, networkPart, worktreesPart, commandsPart]) {
   for (const [key, d] of Object.entries(Object.getOwnPropertyDescriptors(part))) {
     Object.defineProperty(Runner.prototype, key, { ...d, enumerable: false });
   }
@@ -3217,7 +3511,7 @@ export const STOPPED_WORK_WAKE_MAX_AGE_MS = 24 * 60 * 60_000;
 
 export function stoppedWorkMessage(what: string[], last: boolean): string {
   const one = what.length === 1;
-  const lines = what.map((w) => `- ${w.length > 200 ? `${w.slice(0, 200)}...` : w}`);
+  const lines = what.map((w) => `- ${cutSafely(w, 203, '...')}`);
   return [
     `Threadbear stopped ${one ? 'this background job' : 'these background jobs'} of yours when the runner restarted onto a new release, so nothing more will come from ${one ? 'it' : 'them'}:`,
     '',
@@ -3309,9 +3603,8 @@ function sortByActivity(list: ThreadSummary[]): ThreadSummary[] {
 }
 
 export function titleFrom(text: string): string {
-  const line = (text ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? '';
-  if (!line) return 'Image';
-  return line.length > LIMITS.titleChars ? line.slice(0, LIMITS.titleChars).trimEnd() : line;
+  if (!(text ?? '').trim()) return 'Image';
+  return firstLineSafely(text, LIMITS.titleChars);
 }
 
 // What the runner asks a small model for a thread's title. The examples
@@ -3344,6 +3637,11 @@ export function cleanTitle(text: string): string {
   if (/^(["'`]).*\1$/.test(t)) t = t.slice(1, -1);
   t = t.replace(/\.$/, '').trim();
   if (t.length > LIMITS.titleChars || t.split(/\s+/).length > 10) return '';
+  // Each tidy-up (its first line, before a dash, without quotes or a full
+  // stop) is a cut of the model's text: one through a secret is no title
+  // (safe-cut.ts), and the thread keeps the one titleFrom made.
+  const at = (text ?? '').indexOf(t);
+  if (t && (at < 0 || !isSafeSlice(text, at, at + t.length))) return '';
   return t;
 }
 
@@ -3377,7 +3675,8 @@ export function askedLine(m: { text: string; origin?: MessageOrigin; reviewId?: 
 
 export function oneLine(text: string, max: number): string {
   const s = text.replace(/\s+/g, ' ').trim();
-  return s.length > max ? s.slice(0, max - 1).trimEnd() + '…' : s;
+  // Never through a secret: these lines go to Convex (safe-cut.ts).
+  return cutSafely(s, max, '…');
 }
 
 // A provider's name in notes.
@@ -3453,4 +3752,13 @@ function openInBrowser(url: string): Promise<void> {
 const ACCESS_ORDER: PermissionMode[] = ['ask', 'auto', 'full'];
 function moreAccess(a: PermissionMode | undefined, b: PermissionMode): PermissionMode {
   return a && ACCESS_ORDER.indexOf(a) > ACCESS_ORDER.indexOf(b) ? a : b;
+}
+
+// Mike's standing instructions as an agent is given them.
+function standingText(text: string): string {
+  return `The user's standing instructions (set in Threadbear, Settings > General, the only place they can change: writing the file does nothing). Keep them in mind in everything you do for them:\n\n${text}`;
+}
+
+function instructionsHash(text: string): string {
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
 }

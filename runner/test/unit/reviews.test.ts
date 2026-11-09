@@ -5,7 +5,7 @@ import path from 'node:path';
 import { makeHarness, tick } from '../helpers/fakes.ts';
 import { makePng } from '../helpers/png.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
-import { stills } from '../../src/review-media.ts';
+import { stills, withCharset } from '../../src/review-media.ts';
 
 function fixture() {
   const h = makeHarness();
@@ -306,6 +306,16 @@ test('an option keeps its shots and url, and old single-image options are unchan
   assert.throws(()=>h.runner.createReview(thread.id,{title:'Too big',options:Array.from({length:6},(_,i)=>({id:`O${i}`,title:'Many',shots:Array.from({length:7},()=>({path:source}))}))}),/at most 40/);
 });
 
+test('recommended marks the agent\'s pick, and must name an option that can be picked', () => {
+  const {h,thread,input}=fixture();
+  const {review}=h.runner.createReview(thread.id,{...input,recommended:'B'});
+  assert.equal(review.recommended,'B');
+  assert.equal(h.restart().runner.getReview(thread.id,review.id).review.recommended,'B');
+  assert.equal(h.runner.createReview(thread.id,input).review.recommended,undefined);
+  assert.throws(()=>h.runner.createReview(thread.id,{...input,recommended:'Z'}),/option ids/);
+  assert.throws(()=>h.runner.createReview(thread.id,{...input,recommended:'D'}),/reference/);
+});
+
 test('several picks, none, and a reply go to the agent in the order of the options', () => {
   const {h,thread,input}=fixture();
   const {review}=h.runner.createReview(thread.id,input);
@@ -384,4 +394,16 @@ test('a shot can be a video or an HTML page: copied with a still, and the page b
   const notes=path.join(h.home,'notes.txt');
   fs.writeFileSync(notes,'plain text');
   assert.throws(()=>h.runner.createReview(thread.id,{title:'Bad',options:[{id:'X',title:'Text',path:notes}]}),/video \(MP4, MOV\) or HTML page/);
+});
+
+// Mike, 7 Nov: a mockup with ✓ and no charset showed "âœ“" in the review
+// window and its still, both of which read an undeclared page as Latin-1.
+test('a review page that is UTF-8 without saying so gets a charset in its copy', () => {
+  const page=(s:string|Buffer)=>withCharset(Buffer.isBuffer(s)?s:Buffer.from(s,'utf8')).toString('latin1');
+  assert.equal(page('<p>✓ done</p>'),Buffer.from('<meta charset="utf-8"><p>✓ done</p>','utf8').toString('latin1'));
+  assert.match(page('<!DOCTYPE html><html><p>✓</p>'),/^<!DOCTYPE html><meta charset="utf-8"><html>/,'after the doctype, so no quirks mode');
+  for (const s of ['<head><meta charset="windows-1252"></head>✓','<meta http-equiv="Content-Type" content="text/html; charset=utf-8">✓','﻿<p>✓</p>'])
+    assert.equal(page(s),Buffer.from(s,'utf8').toString('latin1'),'its own declaration or BOM stands');
+  const latin1=Buffer.from([0x3c,0x70,0x3e,0xe9,0x3c,0x2f,0x70,0x3e]); // <p>é</p> in Latin-1, not valid UTF-8
+  assert.deepEqual(withCharset(latin1),latin1,'a page in another encoding is left alone');
 });

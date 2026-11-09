@@ -7,7 +7,7 @@
 # its data folder.
 #
 #   Tools/dev-app.sh start [--mock [--fixtures DIR]...] [--home DIR]
-#                          [--appearance light|dark] [--size WxH] [--id NAME]
+#                          [--appearance light|dark] [--size WxH] [--bear-date 2026-12-24T23:00] [--id NAME]
 #   Tools/dev-app.sh do '<json>'... [--timeout S]
 #   Tools/dev-app.sh shot <file.png> [--sheet] [--settings]   (the sheet over it, the Settings window, or with both the sheet over Settings)
 #   Tools/dev-app.sh menu <file.png> '{"x":854,"y":19}'   (a real menu, opened and captured; realMenu in app/README.md)
@@ -345,7 +345,7 @@ show_build_errors() {
 build_binary() {
   mkdir -p "$BUILD_LOGS"
   local log="$BUILD_LOGS/$1.log"
-  if ! swift build --package-path "$APP_ROOT" --product Threadbear >"$log" 2>&1; then
+  if ! swift build --disable-keychain --package-path "$APP_ROOT" --product Threadbear >"$log" 2>&1; then
     show_build_errors "$log"
     return 1
   fi
@@ -384,7 +384,14 @@ launch_app() {
   rm -f "$I_LOG"
   # open -g launches it without bringing it forward; the app then puts its
   # window behind everything as soon as it's there (Automation.swift).
-  open -g -n "$I_BUNDLE" --stdout "$I_DIR/app.stdout" --stderr "$I_DIR/app.stderr" --args "${app_args[@]}"
+  # BROWSERBEAR_HOME given to start points the Browser panel at a stand-in
+  # BrowserBear (a fake socket and agent/tabs.json) rather than the real one
+  # on this Mac, and rebuild keeps it. open doesn't pass the shell's
+  # environment on by itself.
+  local env_args=() bear_home=""
+  [ -f "$I_DIR/browserbear.home" ] && bear_home="$(cat "$I_DIR/browserbear.home")"
+  [[ -n "$bear_home" ]] && env_args+=(--env "BROWSERBEAR_HOME=$bear_home")
+  open -g -n ${env_args[@]+"${env_args[@]}"} "$I_BUNDLE" --stdout "$I_DIR/app.stdout" --stderr "$I_DIR/app.stderr" --args "${app_args[@]}"
   for i in $(seq 1 200); do
     pid="$(bundle_pid "$I_BUNDLE")"
     [ -n "$pid" ] && break
@@ -401,7 +408,7 @@ launch_app() {
 }
 
 cmd_start() {
-  local mode="" home="" appearance="" size="" fixtures=()
+  local mode="" home="" appearance="" size="" bear_date="" fixtures=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --mock) mode=mock ;;
@@ -409,6 +416,7 @@ cmd_start() {
       --home) home="${2:?--home needs a folder}"; shift ;;
       --appearance) appearance="${2:?--appearance needs light or dark}"; shift ;;
       --size) size="${2:?--size needs WxH}"; shift ;;
+      --bear-date) bear_date="${2:?--bear-date needs a date, like 2026-12-24T23:00}"; shift ;;
       --id) ID="${2:?--id needs a name}"; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown option for start: $1" ;;
@@ -524,7 +532,10 @@ cmd_start() {
       --automation-idle-quit "$IDLE_QUIT_SECONDS"
     [ -z "$appearance" ] || printf '%s\n' --appearance "$appearance"
     [ -z "$size" ] || printf '%s\n' --window-size "$size"
+    # The date the bear goes by: its Santa hat, and bedtime under an empty Inbox.
+    [ -z "$bear_date" ] || printf '%s\n' -ThreadbearBearDate "$bear_date"
   } >"$dir/app.args"
+  [[ -n "${BROWSERBEAR_HOME:-}" ]] && printf '%s' "$BROWSERBEAR_HOME" >"$dir/browserbear.home"
   launch_app
   trap - ERR
   CLEANUP_ID=""

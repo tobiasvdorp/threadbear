@@ -93,6 +93,21 @@ public enum SlashPalette {
         }
     }
 
+    /// A command's description as it should read. Skills write theirs
+    /// with inline markdown (`computercub`, **bold**), so that's rendered,
+    /// on the one paragraph it came as. What won't parse stays as written.
+    ///
+    /// Links keep their words but stop being links. A description comes
+    /// from whoever wrote the skill (any cloned repo can have one), and
+    /// the palette is a window of its own, so a link in it went straight
+    /// to macOS: a `file:` link to a script ran it, past OpenGate's ask
+    /// (Daybreak, 8 Nov). The palette only needs the formatting.
+    public static func description(_ text: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        let parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        return parsed.withoutLinks
+    }
+
     /// A path to show: the home folder as ~.
     public static func shortPath(_ path: String, home: String = NSHomeDirectory()) -> String {
         path == home || path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
@@ -151,17 +166,52 @@ public enum SlashPalette {
     /// gives way first (its names then end in "…", whole on hover), then
     /// the categories, down to their least. Cut to fit, the list showed
     /// "/cloudfl…" in a wide window (Mike, 6 Nov).
-    public static func columnWidths(total: Double, categories: Double, list: Double,
+    /// `chosen`: Mike dragged the list to that width, so it isn't held to
+    /// half of what's left (only to leaving the detail its least).
+    public static func columnWidths(total: Double, categories: Double, list: Double, chosen: Bool = false,
                                     detailMin: Double = 200, listMin: Double = 120, categoriesMin: Double = 110) -> (categories: Double, list: Double) {
         var cats = categories
         // The list never takes more than half of what's left, so the
         // description stays readable beside a very long name.
-        var lst = min(list, max(listMin, (total - cats) / 2))
+        var lst = chosen ? max(listMin, list) : min(list, max(listMin, (total - cats) / 2))
         let over = cats + lst + detailMin - total
         if over > 0 { lst = max(listMin, lst - over) }
         let still = cats + lst + detailMin - total
         if still > 0 { cats = max(categoriesMin, cats - still) }
         return (cats, lst)
+    }
+
+    /// The sizes Mike dragged the palette and its columns to, kept for
+    /// next time (AppModel.slashPaletteLayout). Nil: worked out as before.
+    public struct Layout: Codable, Equatable, Sendable {
+        public var height: Double?
+        public var width: Double?
+        public var categories: Double?
+        public var list: Double?
+        public init(height: Double? = nil, width: Double? = nil, categories: Double? = nil, list: Double? = nil) {
+            self.height = height
+            self.width = width
+            self.categories = categories
+            self.list = list
+        }
+
+        /// A dragged height, kept to what the window has room for: never
+        /// under 220, never more than 85% of it.
+        public static func height(_ h: Double, window: Double) -> Double {
+            min(max(220, h), max(220, window * 0.85))
+        }
+
+        /// A dragged width: never under 480 (three columns and their
+        /// words), never wider than the window less a margin each side.
+        public static func width(_ w: Double, window: Double) -> Double {
+            min(max(480, w), max(480, window - 80))
+        }
+
+        /// A dragged column: at least its least, and leaving the others
+        /// theirs in a palette `total` wide.
+        public static func column(_ w: Double, least: Double, others: Double, total: Double) -> Double {
+            min(max(least, w), max(least, total - others))
+        }
     }
 
     /// The palette's height for a window `window` tall: about half of it,
@@ -173,5 +223,15 @@ public enum SlashPalette {
     /// The recently used list after using `name`: newest first, eight kept.
     public static func used(_ name: String, recent: [String]) -> [String] {
         Array(([name] + recent.filter { $0 != name }).prefix(8))
+    }
+}
+
+extension AttributedString {
+    /// The same text with nothing in it clickable: every run's link (a
+    /// Markdown link or an autolink) taken off, its words left as they are.
+    public var withoutLinks: AttributedString {
+        var copy = self
+        for run in copy.runs where run.link != nil { copy[run.range].link = nil }
+        return copy
     }
 }

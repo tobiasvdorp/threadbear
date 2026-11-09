@@ -19,6 +19,10 @@ public extension RPCClient {
         return try await call("threads.list", params, as: ThreadsResult.self).threads
     }
 
+    func deleteThread(_ threadId: String) async throws {
+        _ = try await call("threads.delete", .object(["threadId": .string(threadId)]), as: EmptyResult.self)
+    }
+
     func searchThreads(_ query: String, limit: Int? = nil) async throws -> [ThreadSummary] {
         var params: [String: JSONValue] = ["query": .string(query)]
         if let limit { params["limit"] = .number(Double(limit)) }
@@ -36,6 +40,7 @@ public extension RPCClient {
         if let mode = request.permissionMode { params["permissionMode"] = .string(mode.rawValue) }
         if let title = request.title { params["title"] = .string(title) }
         if let runnerId = request.runnerId { params["runnerId"] = .string(runnerId) }
+        if !request.projectIds.isEmpty { params["projectIds"] = .array(request.projectIds.map { .string($0) }) }
         return try await call("threads.create", .object(params), as: ThreadResult.self, timeout: RPCClient.sendTimeout).thread
     }
 
@@ -222,7 +227,9 @@ public extension RPCClient {
         ]), as: ThreadResult.self).thread
     }
 
-    func respond(threadId: String, approvalId: String, decision: ApprovalDecision, message: String? = nil, answers: [String: String]? = nil) async throws {
+    /// `queued`: answers to the calls queued on the card, by item id
+    /// (docs/protocol.md, "Queued calls").
+    func respond(threadId: String, approvalId: String, decision: ApprovalDecision, message: String? = nil, answers: [String: String]? = nil, queued: [String: ApprovalDecision]? = nil) async throws {
         var params: [String: JSONValue] = [
             "threadId": .string(threadId),
             "approvalId": .string(approvalId),
@@ -230,6 +237,7 @@ public extension RPCClient {
         ]
         if let message { params["message"] = .string(message) }
         if let answers { params["answers"] = .object(answers.mapValues { .string($0) }) }
+        if let queued, !queued.isEmpty { params["queued"] = .object(queued.mapValues { .string($0.rawValue) }) }
         _ = try await call("approvals.respond", .object(params), as: EmptyResult.self)
     }
 
@@ -338,6 +346,9 @@ public struct NewThreadRequest: Sendable, Hashable {
     /// Another runner, when this Mac's runner makes it there through
     /// Convex (docs/protocol.md, "Other runners' threads through the backend").
     public var runnerId: String?
+    /// Projects it starts in, joined before its first turn (New Thread on
+    /// a project's page).
+    public var projectIds: [String] = []
 
     public init(text: String, images: [ImageRef] = [], cwd: String? = nil, accountId: String? = nil, poolId: String? = nil, model: String? = nil, effort: String? = nil, permissionMode: PermissionMode? = nil, title: String? = nil) {
         self.text = text
@@ -563,6 +574,13 @@ public extension RPCClient {
         } catch RPCError.server(let code, _) where code == RPCError.methodNotFound {
             return RemoteThreads()
         }
+    }
+
+    /// Puts the runners in this order (every runner's id, this one's too):
+    /// the one order the phone sets as well. It comes back in
+    /// `remoteThreads.updated`.
+    func setRunnerOrder(_ runnerIds: [String]) async throws {
+        _ = try await call("runners.setOrder", .object(["runnerIds": .array(runnerIds.map { .string($0) })]), as: EmptyResult.self)
     }
 
     /// Runs it now, as if it were due, even when paused. Another runner's
@@ -861,6 +879,29 @@ public struct ProjectUpdate: Sendable, Hashable {
         if let archived { params["archived"] = .bool(archived) }
         if let notion { params["notion"] = .string(notion) }
         return params
+    }
+
+    /// The project as it will be once the runner has made this change, so
+    /// a save shows straight away however slow the runner is. Its reply
+    /// replaces the guess. A different Notion page has a board nobody has
+    /// read yet, so the old one goes.
+    public func applied(to project: Project, now: Date = Date()) -> Project {
+        var project = project
+        if let title, !title.isEmpty { project.title = title }
+        if let folders { project.folders = folders }
+        if let goals { project.goals = goals }
+        if let state {
+            project.state = state
+            project.stateUpdatedAt = now
+        }
+        if let notes { project.notes = notes }
+        if let archived { project.archived = archived }
+        if let notion {
+            let link = notion.isEmpty ? nil : notion
+            if link != project.notion { project.tasks = nil }
+            project.notion = link
+        }
+        return project
     }
 }
 

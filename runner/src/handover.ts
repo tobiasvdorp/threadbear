@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { paths } from './config.ts';
+import { RUNNER_VERSION, paths } from './config.ts';
 import { atomicWriteFileSync, readJsonSync } from './fsutil.ts';
 import type { Logger } from './log.ts';
 import { RunnerClient, RpcClientError } from './client.ts';
@@ -24,7 +24,8 @@ import { ErrorCode, RpcError } from './protocol.ts';
 import type { PermissionMode, ThreadSummary } from './protocol.ts';
 import type { Notification, Runner } from './runner.ts';
 import type { UsageReading } from './usage.ts';
-import type { AgentApprovalRequest, ProjectControl, ScheduleControl, ThreadControl } from './threadbear-mcp.ts';
+import type { AgentApprovalRequest, ProjectControl, RemoteControl, ScheduleControl, ThreadControl } from './threadbear-mcp.ts';
+import type { RemoteThreads } from './thread-index.ts';
 import type { ToolApprovalAnswer } from './adapters/types.ts';
 import type { Scheduler } from './schedules.ts';
 import type { CommandHost } from './sync.ts';
@@ -145,6 +146,9 @@ export type PeersDeps = {
 export class Peers {
   private deps: PeersDeps;
   private peers = new Map<number, Peer>();
+  // Threads of a draining runner that went, between it going and them being
+  // taken in here (lost): not on any runner for those few seconds.
+  private arriving = new Set<string>();
   private closing = false;
 
   constructor(deps: PeersDeps) {
@@ -261,17 +265,27 @@ export class Peers {
   private async lost(peer: Peer): Promise<void> {
     if (this.closing || peer.gone) return;
     peer.gone = true;
+    const left = [...peer.threads.keys()];
+    // Neither its nor here yet until they're taken in below: arriving() says
+    // so, or the mirror would take their rows (and messages) for stale.
+    for (const id of left) this.arriving.add(id);
     this.peers.delete(peer.info.pid);
     this.deps.onChange?.();
-    const left = [...peer.threads.keys()];
     if (left.length === 0) {
       this.deps.log.info('a draining runner finished', { pid: peer.info.pid });
       return;
     }
+    await this.takeIn(peer, left);
+  }
+
+  private async takeIn(peer: Peer, left: string[]): Promise<void> {
     // A runner that closed its socket is on its way out; give it a moment
     // to finish exiting before stopping what it left.
     const until = Date.now() + (this.deps.goneWaitMs ?? 10_000);
     while (this.alive(peer.info.pid) && Date.now() < until) await new Promise((r) => setTimeout(r, 200));
+    // This runner is handing over itself now: the next one takes the draining
+    // runner on, and stopping it here would stop work that one has.
+    if (this.closing) return;
     if (this.alive(peer.info.pid)) {
       this.deps.log.error('a draining runner stopped answering; stopping it', { pid: peer.info.pid });
       try {
@@ -282,7 +296,15 @@ export class Peers {
     }
     this.deps.log.warn('a draining runner went away with threads on it; taking them as after a crash', { pid: peer.info.pid, threads: left });
     await this.cleanUp(peer.info.pid);
-    for (const id of left) this.deps.runner.adopt(id, { crashed: true });
+    // One that can't be taken in stays arriving, so its row isn't taken for stale.
+    for (const id of left) {
+      try {
+        this.deps.runner.adopt(id, { crashed: true });
+        this.arriving.delete(id);
+      } catch (e) {
+        this.deps.log.error('could not take in a thread a draining runner left', { threadId: id, error: String((e as Error)?.message ?? e) });
+      }
+    }
   }
 
   private async cleanUp(pid: number): Promise<void> {
@@ -305,6 +327,15 @@ export class Peers {
 
   owns(threadId: string): boolean {
     return Boolean(this.ownerOf(threadId));
+  }
+
+  // A thread a draining runner had when it went, until it's taken in here.
+  isArriving(threadId: string): boolean {
+    return this.arriving.has(threadId);
+  }
+
+  arrivingIds(): string[] {
+    return [...this.arriving];
   }
 
   find(threadId: string): ThreadSummary | undefined {
@@ -434,7 +465,13 @@ export class PrimaryLink {
 
   private connect(): Promise<RunnerClient> {
     if (!this.client) {
-      const c = RunnerClient.connect(this.url, this.token);
+      // It says hello so the primary's log can name it (THREADBEAR-F: the
+      // primary closed one as "not reading" and couldn't say whose it was).
+      // Not waited for: frames arrive in order, so it's there before any call.
+      const c = RunnerClient.connect(this.url, this.token).then((cl) => {
+        void cl.call('hello', { client: 'threadbear-drain', version: RUNNER_VERSION, pid: process.pid }).catch(() => {});
+        return cl;
+      });
       this.client = c;
       c.then(
         (cl) => void cl.waitClosed().then(() => {
@@ -495,10 +532,32 @@ export function peersElsewhere(peers: Peers): Elsewhere {
 export function primaryElsewhere(link: PrimaryLink, runner: Pick<Runner, 'has'>): Elsewhere {
   return {
     owns: (id) => !runner.has(id),
-    find: async (id) => (await link.call<{ threads: ThreadSummary[] }>('threads.list', { include: ALL_BUCKETS })).threads.find((t) => t.id === id),
+    // Just this thread (THREADBEAR-F): list_schedules looks up every
+    // schedule's thread at once, and all 900 summaries for each lookup piled
+    // up past the primary's limit, which closed this link. An older primary
+    // ignores ids and sends them all, so the one is still picked out here.
+    find: async (id) => (await link.call<{ threads: ThreadSummary[] }>('threads.list', { include: ALL_BUCKETS, ids: [id] })).threads.find((t) => t.id === id),
     list: async (include) => (await link.call<{ threads: ThreadSummary[] }>('threads.list', { include })).threads,
     search: async (query, limit) => (await link.call<{ threads: ThreadSummary[] }>('threads.search', { query, limit })).threads,
     call: (method, params) => link.call(method, params),
+  };
+}
+
+// Other runners' threads for a draining runner's agent tools, through the
+// primary: a draining runner has stopped its own sync, but its kept turns
+// still have to reach them. On 8 Nov a thread started from the cloud runner
+// finished its turn on a draining M5 runner and couldn't send_message the
+// cloud thread its brief said to report to. The primary lists them as its
+// own tools have them (remoteThreads.list with forTools, which waits there
+// for the backend's rows), and passes a call for one of them on through its
+// relay (rpc.ts, THREAD_METHODS).
+export function primaryRemote(link: Pick<PrimaryLink, 'call'>): RemoteControl {
+  return {
+    list: async () => {
+      const r = await link.call<RemoteThreads>('remoteThreads.list', { forTools: true });
+      return { runners: r?.runners ?? [], threads: r?.threads ?? [], ...(r?.order ? { order: r.order } : {}) };
+    },
+    call: (threadId, method, params) => link.call(method, { threadId, ...params }),
   };
 }
 
@@ -539,6 +598,10 @@ export class ThreadRouter implements ThreadControl {
   // Always this runner's: it's asked by the session it runs itself.
   endTurnNudged(threadId: string): boolean {
     return this.runner.endTurnNudged(threadId);
+  }
+
+  openSubagentCards(threadId: string): string[] {
+    return this.runner.openSubagentCards(threadId);
   }
 
   async list(include: Bucket[] = ['inbox']): Promise<ThreadSummary[]> {
@@ -582,6 +645,12 @@ export class ThreadRouter implements ThreadControl {
     return e ? e.call('reviews.create', {threadId, ...input}) : this.runner.createReview(threadId, input);
   }
 
+  // Only a thread's own agent makes its buttons, from its CLI on the
+  // runner that has the thread, so this never goes elsewhere either.
+  createButton(threadId: string, input: Parameters<Runner['createButton']>[1]): ReturnType<Runner['createButton']> {
+    return this.runner.createButton(threadId, input);
+  }
+
   // Only a thread's own agent asks, from its CLI on the runner that has the
   // thread, so this never goes elsewhere.
   requestSecret(threadId: string, req: SecretRequest): Promise<SecretAnswer> {
@@ -592,6 +661,15 @@ export class ThreadRouter implements ThreadControl {
   // can't see what its turn started with (threadbear-mcp.ts, "Raising access").
   async accessOf(threadId: string): Promise<PermissionMode> {
     return this.away(threadId) ? 'full' : this.runner.accessOf(threadId);
+  }
+
+  // Likewise outside any sandbox, which is the most it could have.
+  async confinedOf(threadId: string): Promise<boolean> {
+    return this.away(threadId) ? false : this.runner.confinedOf(threadId);
+  }
+
+  sandboxed(cwd: string): boolean {
+    return this.runner.sandboxed(cwd);
   }
 
   // Likewise for a threadbear tool's own card (threadbear-mcp.ts, "Raising access").
@@ -617,12 +695,14 @@ export class ThreadRouter implements ThreadControl {
 
   async update(upd: Parameters<Runner['update']>[0]): Promise<ReturnType<Runner['update']>> {
     const e = this.away(upd.threadId);
-    return e ? e.call('threads.update', { ...upd }) : this.runner.update(upd);
+    // Said either way, as the primary takes a move with neither as Mike's.
+    return e ? e.call('threads.update', { ...upd, unconfine: upd.unconfine === true }) : this.runner.update(upd);
   }
 
   async interrupt(threadId: string): Promise<Record<string, never>> {
     const e = this.away(threadId);
-    return e ? e.call('threads.interrupt', { threadId }) : this.runner.interrupt(threadId);
+    // The router is what agents' tools go through, so this isn't Mike's Stop.
+    return e ? e.call('threads.interrupt', { threadId, byAgent: true }) : this.runner.interrupt(threadId);
   }
 
   async delete(threadId: string): Promise<Record<string, never>> {
@@ -651,12 +731,15 @@ export function phoneCommands(runner: Runner, remote?: Pick<Peers, 'owns' | 'cal
     // it over the local link, both runners sharing the one data dir.
     answerSecret: (p) => at(p.threadId, 'secrets.answer', { ...p }, () => runner.answerSecret(p)),
     update: (p) => at(p.threadId, 'threads.update', { ...p }, () => runner.update(p)),
+    hibernateWhen: (p) => at(p.threadId, 'threads.hibernateWhen', { ...p }, () => runner.hibernateWhen(p)),
     // Up to whatever it has: markSeen keeps it within the thread's events.
     markSeen: (id) => at(id, 'threads.markSeen', { seq: Number.MAX_SAFE_INTEGER }, () => runner.markSeen(id, runner.get(id).lastSeq)),
     create: (p) => runner.create(p),
     share: (id, p) => at(id, 'threads.share', { ...p }, () => runner.share(id, p)),
-    interrupt: (id) => at(id, 'threads.interrupt', {}, () => runner.interrupt(id)),
+    interrupt: (id) => at(id, 'threads.interrupt', {}, () => runner.interrupt(id, { byMike: true })),
     quickAsk: (p) => runner.quickAsk(p),
+    pressButton: (id, buttonId) => at(id, 'buttons.press', { buttonId }, () => runner.pressButton(id, buttonId)),
+    threadCommands: (id) => at(id, 'threads.commands', {}, () => runner.threadCommands(id)),
   };
 }
 

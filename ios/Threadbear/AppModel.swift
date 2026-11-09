@@ -35,6 +35,16 @@ final class AppModel {
     /// Archived from this phone, kept out of the lists until Convex says the
     /// runner has done it, which waits for the Mac if it's asleep.
     private var archiving: Set<String> = []
+    /// Whether a thread's page is over the inbox (InboxView says).
+    @ObservationIgnored var threadOpen = false
+    /// Rows sinking towards the Hibernating heading on their way out (`hibernate`).
+    private(set) var sinking: Set<String> = []
+    /// Hibernated from this phone, kept out of the lists and on the heading's
+    /// count until Convex catches up.
+    private(set) var tucks = Tucks()
+    /// He's just taken the last row away, for the empty view to wave.
+    private var inboxCleared = InboxCleared()
+    var inboxJustCleared: Bool { inboxCleared.isPending(now: .now) }
     private(set) var hibernating: [PhoneThread] = []
     private(set) var den: [PhoneThread] = []
     /// For each thread a schedule will message, the one due soonest: the
@@ -81,6 +91,14 @@ final class AppModel {
         !isFake && apnsToken != nil && (apiVersion ?? 0) >= BackendCompatibility.notificationSettingAPIVersion
     }
 
+    /// Whether to ask for notification permission. Only a backend that says
+    /// it can't send any stops it: one that can't be reached right now is
+    /// asked about as ever.
+    func backendSendsNotifications() async -> Bool {
+        guard let backend, let identity = try? await backend.me() else { return true }
+        return identity.sendsNotifications
+    }
+
     func setNotifyMode(_ mode: NotifyMode) {
         notifyMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "notifyMode")
@@ -98,9 +116,15 @@ final class AppModel {
     /// `-ThreadbearCompose <text>` (Debug only): open New thread with this
     /// typed in, for the screenshots.
     var composeText: String?
+    /// `-ThreadbearDraft <text>` (Debug only): start the open thread's reply
+    /// box with this typed in ("/co" shows the slash command palette).
+    var draftText: String?
     /// `-ThreadbearSearch <text>` (Debug only): start with this in the
     /// inbox's search, for the screenshots.
     var searchText: String?
+    /// `-ThreadbearScrollTo <threadId>` (Debug only): start with the inbox
+    /// scrolled to this row, for seeing the headings stick.
+    var scrollToThreadId: String?
     /// `-ThreadbearPhoto <path>` (Debug only): start the composers with this
     /// photo, for the screenshots, as nothing can tap the system picker.
     /// With `-ThreadbearSlowPhoto` it takes a few seconds, to see the spinner tile.
@@ -114,6 +138,54 @@ final class AppModel {
     /// Whether messages waiting for their runner can be listed and cancelled
     /// (backend API 57, phone:waiting and phone:cancel).
     var canSeeWaiting: Bool { isFake || (apiVersion ?? 0) >= BackendCompatibility.waitingSendsAPIVersion }
+    /// Whether the reply box's slash command palette can ask the runner
+    /// for a thread's list (backend API 62, phone:slashCommands).
+    var canUseSlashCommands: Bool { isFake || (apiVersion ?? 0) >= BackendCompatibility.slashCommandsAPIVersion }
+    /// Each thread's slash commands once its runner has answered (SlashPaletteList).
+    var slashCommands: [String: [SlashCommand]] = [:]
+    /// Why a thread's list didn't come: its runner is away, or it failed.
+    var slashCommandsProblem: [String: String] = [:]
+    @ObservationIgnored private var slashLoading: Set<String> = []
+    /// The commands picked from the palette lately, newest first.
+    var recentSlashCommands: [String] = UserDefaults.standard.stringArray(forKey: "recentSlashCommands") ?? [] {
+        didSet { UserDefaults.standard.set(recentSlashCommands, forKey: "recentSlashCommands") }
+    }
+
+    /// Asks the thread's runner for its commands when the palette opens,
+    /// once at a time. Kept for the session: a folder's skills change
+    /// rarely, and the runner keeps its own copy fresh. A runner that's
+    /// away leaves the command waiting; after a while the palette says so.
+    func loadSlashCommands(_ threadId: String) {
+        guard canUseSlashCommands, let backend, slashCommands[threadId] == nil, !slashLoading.contains(threadId) else { return }
+        slashLoading.insert(threadId)
+        slashCommandsProblem[threadId] = nil
+        Task { [weak self] in
+            defer { self?.slashLoading.remove(threadId) }
+            do {
+                let commandId = try await backend.slashCommands(threadId: threadId)
+                let list: [SlashCommand]? = try await withThrowingTaskGroup(of: [SlashCommand]?.self) { group in
+                    group.addTask {
+                        for try await status in backend.command(commandId) {
+                            if status?.state == .done { return status?.commands ?? [] }
+                            if status?.state == .failed { throw TransportError.server(status?.note ?? "The runner couldn't list them.") }
+                        }
+                        return nil
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: .seconds(20))
+                        return nil
+                    }
+                    let first = try await group.next() ?? nil
+                    group.cancelAll()
+                    return first
+                }
+                if let list { self?.slashCommands[threadId] = list }
+                else { self?.slashCommandsProblem[threadId] = "Its Mac hasn't answered yet. You can still type a command and send it." }
+            } catch {
+                self?.slashCommandsProblem[threadId] = "Couldn't get its commands: \(error.localizedDescription)"
+            }
+        }
+    }
 
     /// The thread's own runner by name while it's offline. Not offlineText,
     /// which only speaks up once every runner is: with Bruce and the cloud
@@ -131,7 +203,7 @@ final class AppModel {
         return Self.runnerKeys(for: pairing)
     }
     private static func runnerKeys(for pairing: Pairing) -> KeychainRunnerKeyStore {
-        KeychainRunnerKeyStore(scope: pairing.deploymentURL.host() ?? pairing.deploymentURL.absoluteString)
+        KeychainRunnerKeyStore(scope: Pairing.serverName(pairing.deploymentURL))
     }
     /// Threads whose runner is already pinned this session, so a list
     /// arriving doesn't go to the keychain for every row each time.
@@ -243,6 +315,70 @@ final class AppModel {
         for photo in photos { photo.upload?.keep() }
     }
 
+    // MARK: Starting threads
+
+    /// New threads asked for from this phone that their runner hasn't made
+    /// yet, newest first. The sheet closes as soon as the backend has the
+    /// request, and these stand in for them at the top of the inbox: the
+    /// runner reports a new thread only once its row is in Convex, which
+    /// waits behind any sync it's in the middle of, and on 7 Nov the sheet's
+    /// spinner sat there 22 seconds after the M5's runner had restarted.
+    private(set) var starting: [StartingThread] = []
+    private var startingTasks: [String: Task<Void, Never>] = [:]
+    /// A thread that started soon after it was asked for, for the inbox to
+    /// open as the sheet used to. One that took longer (its Mac was asleep)
+    /// just turns up in the list, rather than pulling you out of what you're on.
+    var justStarted: (commandId: String, threadId: String)?
+    /// A failed start's sheet, to open again as it was (AppModel.retryStarting).
+    var retryDraft: NewThreadDraft?
+    /// Only the newest start opens by itself: an earlier one landing while
+    /// you wait on the next mustn't take its place.
+    private var latestStart: String?
+
+    func started(commandId: String, message: String, draft: NewThreadDraft) {
+        starting.insert(StartingThread(id: commandId, message: message, draft: draft, startedAt: .now), at: 0)
+        latestStart = commandId
+        watchStarting(commandId)
+    }
+
+    /// Gone from the list: a failed one dismissed, or tapped to try again.
+    func dropStarting(_ id: String) {
+        startingTasks.removeValue(forKey: id)?.cancel()
+        starting.removeAll { $0.id == id }
+    }
+
+    /// A failed one back in the new thread sheet as it was: words, photos,
+    /// runner, model and effort. The photos go up again, as the backend
+    /// deleted its copies with the failed command.
+    func retryStarting(_ row: StartingThread) {
+        dropStarting(row.id)
+        retryDraft = row.draft
+    }
+
+    private func watchStarting(_ id: String) {
+        guard let backend else { return }
+        startingTasks[id]?.cancel()
+        startingTasks[id] = follow(backend.command(id)) { $0.startingChanged(id, $1) }
+    }
+
+    private func startingChanged(_ id: String, _ status: CommandStatus?) {
+        guard let i = starting.firstIndex(where: { $0.id == id }) else { return }
+        if let threadId = status?.threadId {
+            let row = starting[i]
+            dropStarting(id)
+            if id == latestStart, Date.now.timeIntervalSince(row.startedAt) < 60 { justStarted = (id, threadId) }
+        } else if status?.state == .failed {
+            starting[i].failed = status?.note ?? "The runner couldn't start it."
+            for photo in starting[i].draft.photos { photo.upload = nil }
+            startingTasks.removeValue(forKey: id)?.cancel()
+        } else if status == nil || status?.state == .done {
+            // The command's gone from the backend (pruned long after), or
+            // done without saying which thread: nothing left to wait for,
+            // and the thread, if any, is in the list.
+            dropStarting(id)
+        }
+    }
+
     private var tasks: [Task<Void, Never>] = []
     private(set) var apnsToken: String?
     /// Bumped each time the Convex connection is rebuilt (comingBack), so
@@ -267,7 +403,21 @@ final class AppModel {
             // -ThreadbearRunners: the Mac asleep and two more runners, for the runner picker.
             // -ThreadbearOffline: the Mac's been asleep for hours, so messages wait, and a3 has two waiting.
             let offline = args.contains("-ThreadbearOffline")
-            connect(FakeBackend(runnerOnline: !offline, listDelay: args.contains("-ThreadbearSlowLoad") ? .seconds(6) : .zero, pictures: args.contains("-ThreadbearPictures"), long: args.contains("-ThreadbearLong"), secret: args.contains("-ThreadbearSecret"), diagrams: args.contains("-ThreadbearDiagrams"), runners: args.contains("-ThreadbearRunners"), queued: offline), pairing: nil)
+            // -ThreadbearManyThreads: and a long inbox, a few more running and starred, to scroll.
+            let fake = FakeBackend(runnerOnline: !offline, listDelay: args.contains("-ThreadbearSlowLoad") ? .seconds(6) : .zero, pictures: args.contains("-ThreadbearPictures"), long: args.contains("-ThreadbearLong"), secret: args.contains("-ThreadbearSecret"), diagrams: args.contains("-ThreadbearDiagrams"), runners: args.contains("-ThreadbearRunners"), queued: offline, many: args.contains("-ThreadbearManyThreads"))
+            // -ThreadbearSlowStart: a new thread takes a minute to start, so its Starting row stays.
+            if args.contains("-ThreadbearSlowStart") { fake.startDelay = .seconds(60) }
+            // -ThreadbearShortInbox: one thread in the inbox, one running, one of each put away.
+            if args.contains("-ThreadbearShortInbox") { fake.keepOnly(["a4", "a5", "a6", "a7"]) }
+            // -ThreadbearEmptyInbox: nothing in the inbox from the start, one running.
+            if args.contains("-ThreadbearEmptyInbox") { fake.keepOnly(["a5", "a6", "a7"]) }
+            // -ThreadbearFinishSoon: the running thread's turn ends after a while, to see its row move.
+            // -ThreadbearSlowAnswers: answers to cards take a few seconds to reach the "runner".
+            if args.contains("-ThreadbearSlowAnswers") { fake.answerDelay = .seconds(3) }
+            // -ThreadbearRefuseAnswers: and it refuses them.
+            if args.contains("-ThreadbearRefuseAnswers") { fake.answerDelay = .seconds(3); fake.answersFail = true }
+            if args.contains("-ThreadbearFinishSoon") { fake.finishRunningThread(after: .seconds(14)) }
+            connect(fake, pairing: nil)
         } else if let saved = PairingStore.load() {
             connect(ConvexBackend(deploymentURL: saved.deploymentURL, token: saved.token), pairing: saved)
         }
@@ -280,7 +430,18 @@ final class AppModel {
         // `-ThreadbearOpen <threadId>`: start on that thread, for screenshots.
         if let i = args.firstIndex(of: "-ThreadbearOpen"), i + 1 < args.count { openThreadId = args[i + 1] }
         if let i = args.firstIndex(of: "-ThreadbearCompose"), i + 1 < args.count { composeText = args[i + 1] }
+        if let i = args.firstIndex(of: "-ThreadbearDraft"), i + 1 < args.count { draftText = args[i + 1] }
         if let i = args.firstIndex(of: "-ThreadbearSearch"), i + 1 < args.count { searchText = args[i + 1] }
+        // `-ThreadbearScrollTo <threadId>`: start with the inbox scrolled to that row, to see the headings stick.
+        if let i = args.firstIndex(of: "-ThreadbearScrollTo"), i + 1 < args.count { scrollToThreadId = args[i + 1] }
+        // `-ThreadbearStart <text>`: start a thread with it, as the sheet's Start does.
+        if let i = args.firstIndex(of: "-ThreadbearStart"), i + 1 < args.count, let backend {
+            let text = args[i + 1]
+            Task {
+                guard let id = try? await backend.create(text: text, runnerId: nil, cwd: nil, images: [], settings: NewThreadSettings(model: nil, effort: nil)) else { return }
+                started(commandId: id, message: text, draft: NewThreadDraft(text: text, photos: []))
+            }
+        }
         if let i = args.firstIndex(of: "-ThreadbearPhoto"), i + 1 < args.count {
             let sample = FileManager.default.contents(atPath: args[i + 1])
             let slow = args.contains("-ThreadbearSlowPhoto")
@@ -300,8 +461,25 @@ final class AppModel {
 
     var isPaired: Bool { backend != nil && authProblem == nil }
 
-    var sections: InboxSections {
-        InboxSections.build(inbox.filter { !archiving.contains($0.threadId) }, now: now, wakes: wakes)
+    var sections: InboxSections { sections(of: inbox) }
+
+    private func sections(of list: [PhoneThread]) -> InboxSections {
+        InboxSections.build(list.filter { !archiving.contains($0.threadId) && !tucks.hidden.contains($0.threadId) }, now: now, wakes: wakes)
+    }
+
+    /// A thread this phone has a row for (inbox, hibernating, archived).
+    func knownThread(_ id: String) -> PhoneThread? {
+        inbox.first { $0.threadId == id } ?? hibernating.first { $0.threadId == id } ?? den.first { $0.threadId == id }
+    }
+
+    /// A pasted thread id as the `[title](thread:<id>)` link it goes in as,
+    /// for a thread this phone has a row for (inbox, hibernating, archived),
+    /// or nil to paste the words. Same as the Mac's composer.
+    func threadReference(pasted: String) -> String? {
+        let known = inbox + hibernating + den
+        func title(_ id: String) -> String? { known.first { $0.threadId == id }?.title }
+        guard let id = CardMentions.pastedThreadId(pasted, known: { title($0) != nil }) else { return nil }
+        return CardMentions.threadReference(id: id, title: title(id) ?? "")
     }
 
     /// Archives a thread, gone from the inbox at once. `leavingThread` is for
@@ -323,14 +501,15 @@ final class AppModel {
             // The Mac may have archived it during the wait; an id that's not
             // in the list would never get cleared by the next list update.
             if inbox.contains(where: { $0.threadId == threadId }) {
-                withAnimation(.snappy(duration: 0.25)) { _ = archiving.insert(threadId) }
+                takeOffInbox { _ = archiving.insert(threadId) }
             }
             slidingOff.remove(threadId)
             do {
-                let command = try await backend.update(threadId: threadId, change: .archive)
-                for try await status in backend.command(command) {
-                    if status?.state == .failed { throw TransportError.server(status?.note ?? "The runner couldn't archive that thread.") }
-                    if status?.state == .done { return }
+                // With a deadline: on a client replaced meanwhile it may never
+                // answer, and the row would stay hidden with nothing watching.
+                let command = try await Deadline.run(seconds: 20) { try await backend.update(threadId: threadId, change: .archive) }
+                if let status = await commandOutcome(command), status.state == .failed {
+                    throw TransportError.server(status.note ?? "The runner couldn't archive that thread.")
                 }
             } catch {
                 withAnimation(.snappy(duration: 0.25)) { _ = archiving.remove(threadId) }
@@ -338,6 +517,133 @@ final class AppModel {
             }
         }
     }
+
+    /// How a command ended: failed or done, or nil once it's gone from the
+    /// backend. On whichever Convex client is current, so a reconnect partway
+    /// through (coming back, a pull to refresh) doesn't leave it watching one
+    /// that may never answer, and a subscription that errors is tried again.
+    func commandOutcome(_ commandId: String) async -> CommandStatus? {
+        final class Seen { var status: CommandStatus?? ; var ended = false }
+        while !Task.isCancelled {
+            guard let backend else { return nil }
+            let on = connection, seen = Seen()
+            let watch = Task {
+                do {
+                    for try await status in backend.command(commandId) where status == nil || status?.state == .failed || status?.state == .done {
+                        seen.status = .some(status)
+                        return
+                    }
+                } catch {}
+                seen.ended = true
+            }
+            while seen.status == nil, !seen.ended, connection == on, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            watch.cancel()
+            if let status = seen.status { return status }
+            if seen.ended, connection == on { try? await Task.sleep(for: .seconds(2)) }
+        }
+        return nil
+    }
+
+    /// Cards answered from this phone, by approval id, until the card goes:
+    /// kept here rather than in the card, so leaving the thread and coming back
+    /// doesn't offer the buttons again while the answer's on its way.
+    private(set) var cardAnswers: [String: CardAnswer] = [:]
+    /// Secret cards whose answer didn't go through, and which it was ("save"
+    /// or "decline"), for the card to say so, even opened again later.
+    private(set) var refusedSecrets: [String: String] = [:]
+
+    /// Sends a card's answer with its button spinning. False if one's already
+    /// on its way. The spinner stays until the card goes; it gives up if the
+    /// runner refuses, or took it and the row still hasn't said so after a few
+    /// seconds, or the backend never answers the send (a replaced client).
+    @discardableResult
+    func answerCard(_ approvalId: String, choice: String, secret: Bool = false,
+                    send: @escaping @Sendable (any Backend) async throws -> String, sent: @escaping (String) -> Void = { _ in }) -> Bool {
+        guard let backend, cardAnswers[approvalId] == nil else { return false }
+        cardAnswers[approvalId] = CardAnswer(choice: choice)
+        refusedSecrets[approvalId] = nil
+        Task {
+            do {
+                let command = try await Deadline.run(seconds: 20) { try await send(backend) }
+                sent(command)
+                let status = await commandOutcome(command)
+                if status?.state == .done { try? await Task.sleep(for: .seconds(5)) }
+                if status?.state == .failed, secret { refusedSecrets[approvalId] = choice }
+            } catch {
+                // A secret card says it in its own words, but a refused token
+                // still goes to pairing.
+                if case TransportError.unauthorized = error { report(error) }
+                else if secret { refusedSecrets[approvalId] = choice } else { report(error) }
+            }
+            cardAnswers[approvalId] = nil
+        }
+        return true
+    }
+
+    /// Hibernates a thread, as `archive` archives one, but the row sinks rather
+    /// than slides: archive goes sideways, this goes down towards its heading,
+    /// whose count rolls on and whose moon bounces as the row leaves. A starred
+    /// thread stays under Starred with a moon, and one only waiting on a schedule
+    /// is under Hibernating already, so neither has anywhere to sink to.
+    func hibernate(_ threadId: String, _ change: ThreadChange, leavingThread: Bool = false) {
+        guard let backend, !archiving.contains(threadId), !slidingOff.contains(threadId),
+              !sinking.contains(threadId), !tucks.hidden.contains(threadId) else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        func hasRow() -> Bool { (sections.inbox + sections.running).contains { $0.threadId == threadId } }
+        let sinks = hasRow()
+        Task {
+            if sinks {
+                try? await Task.sleep(for: .milliseconds(280))
+                if leavingThread {
+                    // SwiftUI holds the page's dismiss until the dialog has
+                    // gone, which can be half a second, so the wait for the
+                    // page to clear starts when it really starts to leave.
+                    let giveUp = Date.now.addingTimeInterval(1.5)
+                    while threadOpen, Date.now < giveUp { try? await Task.sleep(for: .milliseconds(30)) }
+                    try? await Task.sleep(for: .milliseconds(420))
+                }
+                withAnimation(.easeIn(duration: 0.24)) { _ = sinking.insert(threadId) }
+                try? await Task.sleep(for: .milliseconds(240))
+                // The Mac may have moved it during the wait; `tucks` only
+                // lets go of an id when a list update says so.
+                if hasRow() {
+                    takeOffInbox { tucks.tuck(threadId) }
+                }
+                // Not until it's collapsed: back at full opacity, the row
+                // going away would show again on its way out.
+                Task {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    sinking.remove(threadId)
+                }
+            }
+            do {
+                let command = try await Deadline.run(seconds: 20) { try await backend.update(threadId: threadId, change: change) }
+                if let status = await commandOutcome(command), status.state == .failed {
+                    throw TransportError.server(status.note ?? "The runner couldn't hibernate that thread.")
+                }
+            } catch {
+                withAnimation(.snappy(duration: 0.25)) { tucks.undo(threadId) }
+                report(error)
+            }
+        }
+    }
+
+    /// A row he's taken away collapsing, which may be the last: only this
+    /// counts as clearing the inbox, so the bear never waves at a launch or when
+    /// the Mac empties it.
+    private func takeOffInbox(_ change: () -> Void) {
+        let before = sections
+        withAnimation(.snappy(duration: 0.25)) {
+            change()
+            // In the same breath, as the empty view reads it when it's made.
+            inboxCleared.note(before: before, after: sections, now: .now)
+        }
+    }
+
+    /// Whether to wave, once: the empty view asks as it appears.
+    func takeInboxCleared() -> Bool { inboxCleared.take(now: .now) }
 
     func toggle(_ section: PhoneSection) {
         folds.toggle(section)
@@ -360,7 +666,7 @@ final class AppModel {
         case .running: sections.running.count
         // Folded, the snoozed ones aren't loaded, but the scheduled ones come
         // from the inbox list, so they're added to phone:counts' number.
-        case .hibernating: loaded.contains(.hibernating) ? hibernatingRows.count : (counts?.hibernating).map { $0 + sections.scheduled.count }
+        case .hibernating: (loaded.contains(.hibernating) ? hibernatingRows.count : (counts?.hibernating).map { $0 + sections.scheduled.count }).map { $0 + tucks.uncounted }
         // The den list is capped at 100; the count isn't.
         case .archived: counts?.den ?? (loaded.contains(.den) ? den.count : nil)
         }
@@ -379,6 +685,50 @@ final class AppModel {
         case .running: sections.running
         case .hibernating: hibernatingRows
         case .archived: den
+        }
+    }
+
+    /// Rows on their way to a new heading, whose tick or dot waits until they're
+    /// there: it's the row arriving that says the thread's finished.
+    private(set) var landing: Set<String> = []
+
+    /// Rows flying from one heading to another over the list (RowFlight.swift),
+    /// each hiding its real row until it's there.
+    private(set) var flights: [String: RowFlight] = [:]
+    @ObservationIgnored let rowFrames = RowFrames()
+
+    /// The moving rows that can fly: those on show now, or under a folded
+    /// heading that is. None under Reduce Motion, or with a thread open over the
+    /// list, where the change just happens.
+    private func flights(for moves: [String: InboxMove], in list: [PhoneThread]) -> [String: RowFlight] {
+        guard Juice.rows != nil, !threadOpen else { return [:] }
+        var flights: [String: RowFlight] = [:]
+        for (id, move) in moves where !(folds.isFolded(move.from) && folds.isFolded(move.to)) {
+            guard let thread = list.first(where: { $0.threadId == id }) else { continue }
+            if !folds.isFolded(move.from), let from = rowFrames.visible(RowFrames.row(id, under: move.from)) {
+                flights[id] = RowFlight(id: id, thread: thread, move: move, from: from, fromHeading: false)
+            } else if folds.isFolded(move.from), let from = rowFrames.visible(RowFrames.heading(move.from)) {
+                flights[id] = RowFlight(id: id, thread: thread, move: move, from: from, fromHeading: true)
+            }
+        }
+        return flights
+    }
+
+    /// A row's there: its real one shows in place of the picture, and its tick
+    /// or dot pops in.
+    func endFlight(_ id: String) {
+        guard flights.removeValue(forKey: id) != nil else { return }
+        withAnimation(Juice.pop) { _ = landing.remove(id) }
+    }
+
+    private func popMarksAfterLanding(flying: Set<String>) {
+        Task {
+            try? await Task.sleep(for: Juice.landing)
+            // A row still flying pops its own when it lands.
+            withAnimation(Juice.pop) { landing = landing.filter { flights[$0] != nil } }
+            // However its flight went, never leave a row hidden.
+            try? await Task.sleep(for: .seconds(1))
+            for id in flying { endFlight(id) }
         }
     }
 
@@ -403,9 +753,25 @@ final class AppModel {
                 model.pinRunners(list)
                 switch view {
                 case .inbox:
-                    model.inbox = list
-                    // Gone from the list means it's done, so a later unarchive shows.
-                    model.archiving.formIntersection(list.map(\.threadId))
+                    // Watching the phone while the Mac works, a row gliding up is
+                    // a thread finishing. Only for a change of heading, and not
+                    // the first answer, so a title or a working line changing
+                    // leaves the list still under his thumb.
+                    let (old, new) = (model.sections, model.sections(of: list))
+                    let glides = model.loaded.contains(.inbox) && old.changedHeadings(to: new)
+                    // Outside the animation, so the pictures are there at once,
+                    // over the rows they stand in for.
+                    let flying = glides ? model.flights(for: old.moves(to: new), in: list) : [:]
+                    model.flights.merge(flying) { $1 }
+                    withAnimation(glides ? Juice.rows : nil) {
+                        model.inbox = list
+                        // Gone from the list means it's done, so a later unarchive shows.
+                        model.archiving.formIntersection(list.map(\.threadId))
+                        model.tucks.inboxArrived(list, now: .now)
+                        if glides { model.landing.formUnion(old.landed(in: new)) }
+                    }
+                    if glides { model.popMarksAfterLanding(flying: Set(flying.keys)) }
+                    model.inboxAnswers += 1
                 case .hibernating: model.hibernating = list
                 case .den: model.den = list
                 }
@@ -499,11 +865,13 @@ final class AppModel {
         pocket = []
         pocketSeenUpTo = UserDefaults.standard.string(forKey: "pocketSeenUpTo")
         backend = nil
+        starting = []
         isFake = false
         runners = []
         projects = [:]
         accounts = []
         inbox = []
+        tucks = Tucks()
         hibernating = []
         den = []
         wakes = [:]
@@ -543,6 +911,7 @@ final class AppModel {
         pinnedThreads = []
         stop()
         backend = nil
+        starting = []
         pairing = nil
         authProblem = nil
         backendProblem = nil
@@ -551,6 +920,7 @@ final class AppModel {
         projects = [:]
         accounts = []
         inbox = []
+        tucks = Tucks()
         hibernating = []
         den = []
         wakes = [:]
@@ -569,14 +939,40 @@ final class AppModel {
     /// hours. So back from the background, a fresh client.
     func comingBack() {
         defer { backgroundedAt = nil }
-        guard let since = backgroundedAt, Date.now.timeIntervalSince(since) > 5,
-              !isFake, let pairing, authProblem == nil else { return }
+        guard let since = backgroundedAt, Date.now.timeIntervalSince(since) > 5, !isFake else { return }
+        freshConnection()
+    }
+
+    /// Pulling the inbox down: a fresh Convex client, as coming back from the
+    /// background has, and back once the inbox has answered on it (or a few
+    /// seconds have gone), so the list holds open while it really reconnects.
+    /// It used to wait 400 ms and do nothing. The demo follows its sample
+    /// threads again, as there's no client to replace.
+    func reconnect() async {
+        let answered = inboxAnswers
+        guard freshConnection() else { return }
+        let giveUp = Date.now.addingTimeInterval(6)
+        while inboxAnswers == answered, Date.now < giveUp { try? await Task.sleep(for: .milliseconds(50)) }
+    }
+
+    /// Answers the inbox list has had, on any connection, for `reconnect`.
+    @ObservationIgnored private var inboxAnswers = 0
+
+    @discardableResult
+    private func freshConnection() -> Bool {
+        guard authProblem == nil, let backend else { return false }
         let kept = loaded
-        connect(ConvexBackend(deploymentURL: pairing.deploymentURL, token: pairing.token), pairing: pairing, registerPush: false)
+        if isFake {
+            connect(backend, pairing: nil, registerPush: false)
+        } else {
+            guard let pairing else { return false }
+            connect(ConvexBackend(deploymentURL: pairing.deploymentURL, token: pairing.token), pairing: pairing, registerPush: false)
+        }
         // What's on screen stays until the fresh answers replace it, rather
         // than flashing the loading rows.
         loaded = kept
         connection += 1
+        return true
     }
 
     private func connect(_ backend: any Backend, pairing: Pairing?, registerPush: Bool = true) {
@@ -596,12 +992,19 @@ final class AppModel {
         loaded = []
         followLists()
         tasks.append(follow(backend.accounts()) { $0.accounts = $1 })
-        tasks.append(follow(backend.schedules()) { $0.wakes = InboxSections.wakes($1) })
         tasks.append(Task { [weak self] in
             for await up in backend.connectionStates() { self?.connected = up }
         })
         tasks.append(Task { [weak self] in
-            guard let identity = try? await backend.me() else { return }
+            guard let identity = try? await backend.me() else {
+                // Can't tell how new the backend is: the whole list works on any.
+                if !Task.isCancelled, let self { self.followWakes(backend, small: false) }
+                return
+            }
+            // Once the version's known, so a backend from before 45 isn't
+            // asked for phone:wakes, and one since never reads every schedule
+            // whole (Backend.wakes says why).
+            if !Task.isCancelled, let self { self.followWakes(backend, small: (identity.apiVersion ?? 0) >= BackendCompatibility.wakesAPIVersion) }
             self?.backendProblem = BackendCompatibility.problem(identity)
             self?.apiVersion = identity.apiVersion ?? 0
             // The inbox started before this was known: over to following its
@@ -614,7 +1017,10 @@ final class AppModel {
             // An older backend has no phone:counts, and asking would only
             // fail and retry.
             if (identity.apiVersion ?? 0) >= BackendCompatibility.countsAPIVersion, !Task.isCancelled, let self {
-                self.tasks.append(self.follow(backend.counts()) { $0.counts = $1 })
+                self.tasks.append(self.follow(backend.counts()) { model, counts in
+                    model.tucks.countsArrived(old: model.counts?.hibernating, new: counts.hibernating)
+                    model.counts = counts
+                })
             }
             if (identity.apiVersion ?? 0) >= BackendCompatibility.pocketAPIVersion, !Task.isCancelled, let self {
                 self.tasks.append(self.follow(backend.pocket()) { model, cards in
@@ -623,12 +1029,21 @@ final class AppModel {
                 })
             }
         })
+        for row in starting where row.failed == nil { watchStarting(row.id) }
         if registerPush, let apnsToken { register(apnsToken) }
+    }
+
+    /// Which threads a schedule will message, for the Hibernating section.
+    private func followWakes(_ backend: any Backend, small: Bool) {
+        tasks.append(follow(small ? backend.wakes() : backend.schedules()) { $0.wakes = InboxSections.wakes($1) })
     }
 
     private func stop() {
         tasks.forEach { $0.cancel() }
         tasks = []
+        // Followed again on the new connection (connect), unless it's unpairing.
+        startingTasks.values.forEach { $0.cancel() }
+        startingTasks = [:]
         listTasks.values.forEach { $0.cancel() }
         listTasks = [:]
     }
@@ -714,6 +1129,47 @@ final class AppModel {
         }
     }
 
+    /// Reply buttons pressed from this phone, by "<threadId> <buttonId>",
+    /// until the row says so itself: on the way (`status` nil) or the
+    /// command's state. A row outside the live tail may never catch up.
+    private(set) var presses: [String: CommandStatus?] = [:]
+
+    func pressLook(_ button: MessageButton, in threadId: String) -> ReplyButtons.Look {
+        let press = presses["\(threadId) \(button.id)"]
+        return ReplyButtons.look(button, status: press ?? nil, asking: press != nil && (press ?? nil) == nil)
+    }
+
+    /// A tap on a reply button: presses it once (a second tap while it's
+    /// on its way does nothing), or once pressed, opens the thread it
+    /// started or messaged if this phone has a row for it.
+    func tap(_ button: MessageButton, in threadId: String, pushThread: @MainActor (String) -> Void) {
+        switch pressLook(button, in: threadId) {
+        case .pressing:
+            return
+        case let .pressed(id):
+            guard let id else { return }
+            if (inbox + hibernating + den).contains(where: { $0.threadId == id }) { pushThread(id) } else { report(TransportError.server("That thread isn't on this phone yet.")) }
+            return
+        case .ready, .failed:
+            break
+        }
+        guard let backend else { return }
+        let key = "\(threadId) \(button.id)"
+        presses[key] = .some(nil)
+        Task {
+            do {
+                let command = try await backend.press(threadId: threadId, buttonId: button.id)
+                for try await status in backend.command(command) {
+                    guard let status, status.state == .done || status.state == .failed else { continue }
+                    presses[key] = status
+                    return
+                }
+            } catch {
+                presses[key] = CommandStatus(state: .failed, note: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            }
+        }
+    }
+
     func clearError() { lastError = nil }
 
     func report(_ error: Error) {
@@ -733,19 +1189,19 @@ enum PairingStore {
 
     static func load() -> Pairing? {
         guard let raw = UserDefaults.standard.string(forKey: urlKey), let url = URL(string: raw),
-              let token = Keychain.read(service: service, account: url.host() ?? raw) else { return nil }
+              let token = Keychain.read(service: service, account: Pairing.serverName(url)) else { return nil }
         return Pairing(deploymentURL: url, token: token)
     }
 
     static func save(_ pairing: Pairing) {
-        let account = pairing.deploymentURL.host() ?? pairing.deploymentURL.absoluteString
+        let account = Pairing.serverName(pairing.deploymentURL)
         Keychain.write(pairing.token, service: service, account: account)
         UserDefaults.standard.set(pairing.deploymentURL.absoluteString, forKey: urlKey)
     }
 
     static func clear() {
         if let pairing = load() {
-            Keychain.delete(service: service, account: pairing.deploymentURL.host() ?? pairing.deploymentURL.absoluteString)
+            Keychain.delete(service: service, account: Pairing.serverName(pairing.deploymentURL))
         }
         UserDefaults.standard.removeObject(forKey: urlKey)
     }
@@ -781,4 +1237,32 @@ enum Keychain {
         ]
         SecItemDelete(query as CFDictionary)
     }
+}
+
+/// A card's answer on its way (AppModel.cardAnswers): which button was tapped.
+struct CardAnswer {
+    var choice: String
+}
+
+/// A new thread on its way (AppModel.starting): what was asked, until the
+/// runner has made it, or why it couldn't.
+struct StartingThread: Identifiable {
+    /// The create command's id.
+    let id: String
+    /// What went to the runner, photos as "Picture 1" chips' text.
+    let message: String
+    /// The sheet as it was, for trying again if it fails.
+    let draft: NewThreadDraft
+    let startedAt: Date
+    var failed: String?
+}
+
+/// What the new thread sheet had in it when Start was tapped.
+struct NewThreadDraft {
+    var text: String
+    var photos: [PickedPhoto]
+    /// Nil when the backend picks (only one runner).
+    var runnerId: String?
+    var modelId: String?
+    var effort: String?
 }

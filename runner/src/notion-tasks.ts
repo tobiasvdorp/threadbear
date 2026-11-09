@@ -16,6 +16,7 @@ import type { Logger } from './log.ts';
 import type { ProjectTask, ProjectTasks, TaskColumn } from './protocol.ts';
 import { atomicWriteFileSync, readJsonSync } from './fsutil.ts';
 import { isSpace, seeker } from './linear-text.ts';
+import { credentialUrlProblem } from './secure-url.ts';
 
 // How often a board is read when nobody's asking. Opening the project page
 // asks again once it's older than FRESH_MS.
@@ -40,14 +41,22 @@ export type CallTool = (name: string, args: Record<string, unknown>) => Promise<
 
 // Calls one of the gateway's tools and gives back its text. The answer is
 // JSON or a one-event SSE stream, depending on the gateway's mood.
+//
+// The headers are the gateway's token: only to https, or plain http to this
+// Mac (secure-url.ts), and never a redirect, so a 307 can't send the call on
+// somewhere else. The gateway's sign-in pages are links Mike opens in his
+// browser, never followed from here.
 export function gatewayCaller(opts: { mcpUrl: string; headers: () => Promise<Record<string, string>>; fetch?: typeof fetch }): CallTool {
   const f = opts.fetch ?? fetch;
+  const problem = credentialUrlProblem(opts.mcpUrl);
   let id = 0;
   return async (name, args) => {
+    if (problem) throw new Error(`The Connectors gateway URL ${problem}.`);
     const res = await f(opts.mcpUrl, {
       method: 'POST',
       headers: { ...(await opts.headers()), 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
       body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }),
+      redirect: 'error',
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`the gateway answered ${res.status}`);
@@ -108,6 +117,8 @@ export function findGatewayClient(raw: { url?: unknown; enabled?: unknown; heade
   const url = typeof raw?.url === 'string' && raw.url.trim() ? raw.url.trim() : entry?.url;
   const helper = typeof raw?.headersHelper === 'string' && raw.headersHelper.trim() ? raw.headersHelper.trim() : entry?.headersHelper;
   if (typeof url !== 'string' || typeof helper !== 'string' || !url || !helper) return undefined;
+  // Its calls carry the token the helper prints (secure-url.ts).
+  if (credentialUrlProblem(url)) return undefined;
   try {
     const u = new URL(url);
     // A bare base (https://host:8443) means its /mcp.

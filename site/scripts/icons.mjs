@@ -14,6 +14,11 @@ const ICONS = {
   "qr-code": "QrCode", "coins": "Coins", "code": "Code", "cursor-click": "CursorClick", "wrench": "Wrench",
   "user-circle": "UserCircle", "git-fork": "GitFork", "desktop": "Desktop", "copy": "Copy", "check": "Check",
   "columns": "Columns", "books": "Books",
+  // The docs pages' own icons (site/docs-icons.json).
+  "chats-circle": "ChatsCircle", "paper-plane-tilt": "PaperPlaneTilt", "archive": "Archive", "push-pin": "PushPin",
+  "stack": "Stack", "clock": "Clock", "users-three": "UsersThree", "keyboard": "Keyboard", "flask": "Flask",
+  "plugs-connected": "PlugsConnected", "warning-circle": "WarningCircle", "hard-drives": "HardDrives",
+  "lifebuoy": "Lifebuoy", "compass": "Compass", "book-open": "BookOpen",
 };
 for (const [file, name] of Object.entries(ICONS)) {
   const src = readFileSync(join(pkg, "dist/defs", `${name}.es.js`), "utf8");

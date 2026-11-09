@@ -297,30 +297,6 @@ public enum HighlightText {
     }
 }
 
-/// Decides when a fetch should open a pin in the pane by itself: a pin the
-/// agent asked to have shown (`show`) that wasn't there, shown, last time.
-/// Never on a thread's first fetch this session, so opening an old thread
-/// doesn't throw its old mockups at Mike.
-public struct HighlightAutoShow: Sendable {
-    /// Per thread, the ids that had `show` in the last fetch. An item that
-    /// goes away (unpinned) leaves it, so pinning it again shows it again.
-    private var shown: [String: Set<String>] = [:]
-
-    public init() {}
-
-    public mutating func receive(_ highlights: ThreadHighlights, threadId: String) -> Highlight? {
-        let showing = highlights.highlights.filter(\.show)
-        let previous = shown[threadId]
-        shown[threadId] = Set(showing.map(\.id))
-        guard let previous else { return nil }
-        return showing.filter { !previous.contains($0.id) }.max { max($0.seq, $0.lastSeq) < max($1.seq, $1.lastSeq) }
-    }
-
-    /// Forgets a thread (it was deleted), so a thread with the same id
-    /// later counts as new.
-    public mutating func forget(_ threadId: String) { shown[threadId] = nil }
-}
-
 /// The SF Symbol for a panel's button on the rail: its own, else one for
 /// the built-in panels, else one by kind.
 public enum PanelIcon {

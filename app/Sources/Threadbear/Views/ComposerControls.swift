@@ -109,7 +109,7 @@ struct ComposerControls: View {
             .frame(height: zoomed(26))
             .tip("\(place), in \(thread.cwd.abbreviatingHome)")
             Spacer(minLength: zoomed(8))
-            SendButton(running: running, canSend: canSend, sending: sending, onSend: onSend, onStop: { app.interrupt() })
+            SendButton(running: running, canSend: canSend, sending: sending, stopping: app.isBusy(BusyKey.stop(thread.id)), onSend: onSend, onStop: { app.interrupt(thread.id) })
                 .layoutPriority(1)
         }
         .frame(height: SendButton.size)
@@ -122,6 +122,9 @@ struct ComposerControls: View {
         // A new thread for another runner: no pictures or schedules from
         // here (paths on this Mac). Its folder is in the machine chip's menu.
         let draftAway = thread == nil && app.newThreadRunnerId != nil
+        // A login or pool pick can't be guessed (ThreadUpdate.applied), so
+        // the chips that show it spin until the runner has made it.
+        let moving = thread.map { app.isBusy(BusyKey.moving($0.id)) } ?? false
         HStack(spacing: zoomed(4)) {
             if let remote {
                 runnerChip(remote.thread, place: remote.place)
@@ -131,7 +134,7 @@ struct ComposerControls: View {
                 runsOnChip
                     .padding(.leading, -zoomed(7))
             } else {
-                PlusButton { settings.plusMenu(attach: onAttach, schedule: app.schedulesSupported ? onSchedule : nil) }
+                PlusButton(busy: thread.map { app.isBusy(BusyKey.movingFolder($0.id)) } ?? false) { settings.plusMenu(attach: onAttach, schedule: app.schedulesSupported ? onSchedule : nil) }
                     // Pulls the glyph back so it lines up with the text above.
                     .padding(.leading, -zoomed(7))
                 runsOnChip
@@ -140,12 +143,12 @@ struct ComposerControls: View {
             // chip: the model chip names the pool (or the pinned login).
             if !settings.usesPools {
                 ComposerChip(icon: "person.crop.circle", title: AccountName.short(account, accounts: settings.logins.accounts), help: settings.accountChipHelp,
-                             badge: settings.accountBadge, popover: {
+                             badge: settings.accountBadge, busy: moving, popover: {
                     NSHostingController(rootView: AccountPickerView(threadId: thread?.id, close: $0).environment(app))
                 }, openRequest: app.accountPickerRequest)
                 ChipDivider()
             }
-            ComposerChip(icon: settings.modelChipIcon, logo: settings.modelChipLogo, title: settings.modelChipTitle, help: settings.modelChipHelp, badge: settings.modelChipBadge, popover: {
+            ComposerChip(icon: settings.modelChipIcon, logo: settings.modelChipLogo, title: settings.modelChipTitle, help: settings.modelChipHelp, badge: settings.modelChipBadge, busy: moving, popover: {
                 // The picker reads the thread live, so a pick made while
                 // it's open shows straight away.
                 NSHostingController(rootView: ModelPickerView(threadId: thread?.id, close: $0).environment(app))
@@ -166,7 +169,7 @@ struct ComposerControls: View {
                     NSHostingController(rootView: ContextPopover(threadId: thread.id).environment(app))
                 }
             }
-            SendButton(running: running, canSend: canSend, sending: sending, onSend: onSend, onStop: { app.interrupt() })
+            SendButton(running: running, canSend: canSend, sending: sending, stopping: thread.map { app.isBusy(BusyKey.stop($0.id)) } ?? false, onSend: onSend, onStop: { app.interrupt(thread?.id) })
                 .layoutPriority(1)
                 // Right-click send for later, as Mail and Slack do. Not on
                 // another Mac's thread: its schedules are made from there.
@@ -733,6 +736,9 @@ private struct ComposerChip: View {
     /// After the title: "· 12%" in orange, "Limit reached" in red. Colour
     /// only here, where it means the account is running out.
     var badge: AccountUsageText.ChipBadge? = nil
+    /// A pick from this chip is on its way: a spinner for the icon, and it
+    /// won't open again until that's landed.
+    var busy = false
     var menu: (() -> NSMenu)? = nil
     /// Instead of a menu: a popover above the chip, given a way to close
     /// itself.
@@ -749,7 +755,10 @@ private struct ComposerChip: View {
         } label: {
             HStack(spacing: zoomed(4)) {
                 Group {
-                    if let logo {
+                    if busy {
+                        SpinnerMark(color: .secondaryLabelColor)
+                            .frame(width: TypeScale.chip, height: TypeScale.chip)
+                    } else if let logo {
                         ProviderMark(provider: logo, symbol: icon, side: TypeScale.chip - 1)
                     } else {
                         Image(systemName: icon)
@@ -798,10 +807,12 @@ private struct ComposerChip: View {
         .background(MenuAnchorView(anchor: anchor))
         .onHover { hovering = $0 }
         .onChange(of: openRequest) { _, _ in open() }
-        .tip(help)
+        .disabled(busy)
+        .tip(busy ? "Moving this thread" : help)
     }
 
     private func open() {
+        guard !busy else { return }
         if let menu { anchor.popUp(menu()) }
         else if let popover { anchor.show(popover) }
     }
@@ -901,6 +912,8 @@ private struct ChipDivider: View {
 
 /// Opens a small menu: "Attach images…" and the folder.
 private struct PlusButton: View {
+    /// A folder picked from its menu is on its way.
+    var busy = false
     let menu: () -> NSMenu
     @State private var hovering = false
     @State private var anchor = MenuAnchor()
@@ -917,6 +930,7 @@ private struct PlusButton: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .busy(busy)
         .background(MenuAnchorView(anchor: anchor))
         .onHover { hovering = $0 }
         .tip("Attach images, change the folder or schedule the message")
@@ -930,8 +944,11 @@ private struct SendButton: View {
     let running: Bool
     let canSend: Bool
     let sending: Bool
+    /// The Stop is on its way: a spinner until the turn has ended.
+    var stopping = false
     let onSend: () -> Void
     let onStop: () -> Void
+    @Environment(\.sendNudges) private var nudges
 
     static var size: CGFloat { zoomed(28) }
 
@@ -949,6 +966,13 @@ private struct SendButton: View {
                 .background(Circle().fill(Color.primary.opacity(0.1)))
                 .tip("Starting the thread")
                 .accessibilityLabel("Starting the thread")
+        } else if running && !canSend && stopping {
+            SpinnerMark(color: .secondaryLabelColor)
+                .padding(zoomed(6))
+                .frame(width: Self.size, height: Self.size)
+                .background(Circle().fill(Color.primary.opacity(0.1)))
+                .tip("Stopping")
+                .accessibilityLabel("Stopping")
         } else if running && !canSend {
             Button(action: onStop) {
                 Image(systemName: "stop.fill").font(.system(size: zoomed(9), weight: .bold))
@@ -961,6 +985,14 @@ private struct SendButton: View {
         } else {
             Button(action: onSend) {
                 Image(systemName: "arrow.up").font(.system(size: zoomed(13), weight: .semibold))
+                    // Up 3 pt and back as Return lands: the first half of
+                    // the message leaving (`SendLift`).
+                    .keyframeAnimator(initialValue: CGFloat(0), trigger: Juice.reduceMotion ? 0 : nudges) { arrow, y in
+                        arrow.offset(y: y)
+                    } keyframes: { _ in
+                        CubicKeyframe(-zoomed(3), duration: 0.05)
+                        CubicKeyframe(0, duration: 0.07)
+                    }
             }
             .buttonStyle(CircleButtonStyle(filled: canSend))
             .disabled(!canSend)

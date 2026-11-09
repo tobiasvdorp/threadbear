@@ -55,6 +55,15 @@ UPLOAD=1 ios/scripts/appstore-upload.sh   # the real thing; note the build numbe
 node ios/scripts/appstore-submit.mjs <build>   # waits for processing, attaches it, manual release
 ```
 
+With `UPLOAD=1` the script skips `altool --validate-app`, as the upload validates the build
+itself (on 7 Nov altool sat silent for 8+ minutes; the upload took two). `VALIDATE=1` runs it
+anyway, and it's stopped with a warning after `VALIDATE_TIMEOUT` seconds (300). If a run stopped
+after archiving, `UPLOAD=1 BUILD_NUMBER=<build> ios/scripts/appstore-upload.sh` uploads the archive
+already in `~/Library/Caches/Threadbear/ios-builds/appstore/<build>` without building it again.
+That folder and the derived data must be your account's alone, and an archive is only reused when
+`BUILD_NUMBER` names it and the script finished it: until 8 Nov they were under `/tmp`, where
+another account on the Mac could plant an archive for the upload to sign and send.
+
 The upload script refuses an archive that mentions a Convex deployment, has the Debug-only launch
 arguments, isn't on production APNs or has no privacy manifest.
 

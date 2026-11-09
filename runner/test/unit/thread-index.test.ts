@@ -388,3 +388,62 @@ test("a runner key's archived rows, which a backend before API 54 dropped, go ag
   await flush();
   assert.deepEqual(third.writes.flatMap((w) => w.rows.map((r) => r.threadId)), []);
 });
+
+test("Mike's runner order (API 58) comes with the other runners, and an update says it at once", async () => {
+  const h = makeHarness();
+  let orderAnswer: ((v: unknown) => void) | undefined;
+  const heard: RemoteThreads[] = [];
+  const index = new ThreadIndex({
+    post: async () => null,
+    subscribe: (fn, args, onUpdate) => {
+      if (fn === 'sync:runnerOrder') {
+        assert.deepEqual(args, { key: 'k' });
+        orderAnswer = onUpdate;
+      } else if (fn === 'sync:otherRunnersList') queueMicrotask(() => onUpdate([{ runnerId: 'r-cloud', name: 'Cloud', lastSeenAt: Date.now() }]));
+      return () => undefined;
+    },
+    key: 'k',
+    runnerId: 'r-m5',
+    home: h.home,
+    host: h.runner,
+    publish: (n: Notification) => n.method === 'remoteThreads.updated' && heard.push(n.params),
+    clock: h.clock,
+    log: nullLogger,
+    takesSince: () => true,
+    takesOrder: () => true,
+  });
+  index.start();
+  index.list();
+  for (let i = 0; i < 5; i++) await tick();
+  orderAnswer!(['r-cloud', 'r-m5']);
+  assert.deepEqual(heard.at(-1)!.order, ['r-cloud', 'r-m5']);
+  assert.equal(heard.at(-1)!.runners[0]!.id, 'r-cloud', 'the runners stay with it');
+  assert.deepEqual(index.list().order, ['r-cloud', 'r-m5']);
+  index.stop();
+});
+
+test('an older backend is never asked for the order', async () => {
+  const h = makeHarness();
+  const asked: string[] = [];
+  const index = new ThreadIndex({
+    post: async () => null,
+    subscribe: (fn) => {
+      asked.push(fn);
+      return () => undefined;
+    },
+    key: 'k',
+    runnerId: 'r-m5',
+    home: h.home,
+    host: h.runner,
+    clock: h.clock,
+    log: nullLogger,
+    takesSince: () => true,
+    takesOrder: () => false,
+  });
+  index.start();
+  index.list();
+  await tick();
+  assert.equal(asked.includes('sync:runnerOrder'), false);
+  assert.equal(index.list().order, undefined);
+  index.stop();
+});

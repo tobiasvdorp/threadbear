@@ -37,6 +37,23 @@ final class PanelRequestsTests: XCTestCase {
         XCTAssertNil(PanelRequests.panel(PanelRequest(id: "r", panel: "patches", title: "Patches"), in: bare), "no patches, no Patches")
     }
 
+    /// `pin` with `show` (8 Nov 2026): a request naming the pin, found in
+    /// the thread's highlights, each time it's asked.
+    func testAPinRequestNamesItsHighlight() throws {
+        let t = try thread(#","panelRequest":{"id":"r2","panel":"highlights","title":"Preview check","highlight":"file:/w/page.html","at":"2026-11-08T08:01:00Z"}"#)
+        let request = try XCTUnwrap(t.panelRequest)
+        XCTAssertEqual(request.highlight, "file:/w/page.html")
+        XCTAssertEqual(try JSONDecoder().decode(ThreadSummary.self, from: JSONEncoder().encode(t)).panelRequest, request)
+        // An app without the pin's case still opens Highlights.
+        XCTAssertEqual(PanelRequests.panel(request, in: t), .section(.highlights))
+        let page = Highlight(id: "file:/w/page.html", kind: .file, title: "page.html", path: "/w/page.html", how: .pinned, seq: 3)
+        let other = Highlight(id: "file:/w/b.md", kind: .file, title: "b.md", path: "/w/b.md", how: .written, seq: 2)
+        XCTAssertEqual(PanelRequests.pin(request, in: ThreadHighlights(highlights: [other, page]))?.id, page.id)
+        XCTAssertNil(PanelRequests.pin(request, in: nil), "not fetched yet")
+        XCTAssertNil(PanelRequests.pin(request, in: ThreadHighlights(highlights: [other])), "unpinned since")
+        XCTAssertNil(PanelRequests.pin(PanelRequest(id: "r", panel: "highlights", title: "Highlights"), in: ThreadHighlights(highlights: [page])), "a plain show_panel")
+    }
+
     func testPlaces() {
         func place(_ w: String?) -> RequestedPlace { PanelRequests.place(PanelRequest(id: "r", panel: "usage", title: "Usage", where: w)) }
         XCTAssertEqual(place(nil), .usual)
@@ -58,6 +75,9 @@ final class PanelRequestsTests: XCTestCase {
         XCTAssertNil(gate.take(nil, looking: true))
         XCTAssertEqual(gate.take(waiting, looking: true)?.id, "r1")
         XCTAssertNil(gate.take(waiting, looking: true), "a summary still carrying it while the runner clears it")
+        // Handed back unshown (a pin's fetch failed, or Mike moved on): taken again next look.
+        gate.release("r1")
+        XCTAssertEqual(gate.take(waiting, looking: true)?.id, "r1")
         let next = try thread(#","panelRequest":{"id":"r2","panel":"highlights","title":"Highlights","at":"2026-10-28T08:02:00Z"}"#)
         XCTAssertEqual(gate.take(next, looking: true)?.id, "r2")
         XCTAssertNil(gate.take(try thread(""), looking: true))

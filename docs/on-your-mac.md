@@ -22,6 +22,19 @@ File references are where to look.
   If that login goes missing or expires, the Convex panel's Sign in to
   Convex button runs `convex login` again from the runner, which writes
   the same file; you approve it in your browser on auth.convex.dev.
+- **Or a self-hosted backend** (`setup --self-hosted`, docs/self-hosting.md;
+  Convex cloud is the one we recommend): no Convex login or deploy key.
+  Instead two Docker containers, `threadbear-convex` (Convex's open source
+  backend) and `threadbear-convex-dashboard`, from pinned
+  `ghcr.io/convex/*` images, with the data in the Docker volume
+  `threadbear-convex-data`. They listen on this Mac's loopback only
+  (ports 13210, 13211 and 16791), and `tailscale serve` puts them on your
+  tailnet as `https://<this Mac>.<tailnet>.ts.net` ports 3210 (the API),
+  3211 (the website) and 6791 (the dashboard), so nothing is reachable off
+  your tailnet. The backend's admin key is in
+  `secrets/convex-self-hosted.env`, and setup sets `PUSH_RELAY=off` on it,
+  as the push relay only works with Convex cloud. runner.json gets
+  `sync.site`, the website's address.
 - **Apps:** `~/Applications/Threadbear.app` and
   `~/Applications/Threadbear Runner.app`, both built and signed on your Mac.
 - **A LaunchAgent:** `~/Library/LaunchAgents/com.mikerosoft.threadbear.runner.plist`,
@@ -38,7 +51,9 @@ File references are where to look.
   `shared-pools.json`, the last pools your Convex backend had, which every
   runner shares, so one starts with them while the backend can't be reached,
   and `shortcuts.json`, the keyboard shortcuts you've changed in Settings >
-  Keyboard, which the app reads and writes and never sends anywhere). In `secrets/`, `asked/` holds the answers you
+  Keyboard, which the app reads and writes and never sends anywhere, and
+  with the standing instructions experiment on, `instructions.md`, which every
+  agent is given, and `instructions.sig`, which says Settings saved it). In `secrets/`, `asked/` holds the answers you
   type into an agent's secret card, one owner-only file each with a small
   script beside it that prints it for `sudo -A`, removed after 24 hours,
   and `secret-box.key` is the key your phone seals those answers to;
@@ -67,8 +82,9 @@ File references are where to look.
   `~/Library/Logs/threadbear-runner.log` and `threadbear-update.log`;
   `~/Library/Logs/Threadbear/hangs` (the last 10 times the app froze: if its
   main thread is stuck for 4 seconds it runs macOS's `sample` on itself, in
-  a sandbox, and
-  nothing else ever reads these); and `~/ThreadbearThreads`, the default
+  a sandbox, and notes the main thread's priority, the Mac's load average
+  and how long since the last keyboard or mouse input (just how long, never
+  what); nothing else ever reads these); and `~/ThreadbearThreads`, the default
   folder for new threads. A folder you open from a link in the side pane
   is listed, and watched for changes only while it's showing, and macOS may
   ask for permission the first time that's somewhere like Documents. The runner also runs `vm_stat` and `sw_vers` on a Mac, or reads `/proc/meminfo` and `/etc/os-release` on Linux, for the memory and system figures in the website's Runners view and the Mac app's runner details (`runner/src/runner-stats.ts`), every 5 minutes and while either is open. It also runs `ps`, and `sample` (in a
@@ -111,7 +127,7 @@ File references are where to look.
   `scheduleChecks`, off by default): a schedule's check command runs in
   `/bin/sh` before each run, as you, for at most a minute (or up to five,
   if the schedule says). Each keeps a
-  state file in `schedule-checks/` in Threadbear's data folder, and
+  state file (and a note that a held check was told about, `<id>.held`) in `schedule-checks/` in Threadbear's data folder, and
   beside it what the check last printed (`<id>.<hash>.kept.json`, readable
   only by you) until a run carrying it has been sent, and, while a check
   runs, which runner process is running it (`<id>.running.json`).
@@ -121,11 +137,12 @@ File references are where to look.
   <runner pid>`, which stops idle sleep only (the display still sleeps
   and the screen still locks). While it does, it reads `pmset -g batt`
   every 2 minutes and lets go on battery below 15%.
-- **Mike's releases** (`runner/src/upstream.ts`): every 6 hours it fetches
-  `upstream`'s signed `release/*` tags into `refs/threadbear/upstream-incoming/`
-  in your checkout, checks each with `ssh-keygen -Y verify` against the
-  pinned key (the signature goes in a temp file under `$TMPDIR` for a
-  moment), and copies those that pass to `refs/threadbear/upstream/`. It never changes your code by
+- **Mike's releases** (`runner/src/upstream.ts`): every 6 hours it lists
+  `upstream`'s `release/*` tags, fetches the newest few into a folder of
+  their own (`<home>/runner/upstream-fetch`, deleted after each check),
+  checks each with `ssh-keygen -Y verify` against the pinned key (the
+  signature goes in a temp file under `$TMPDIR` for a moment), and copies
+  the newest that passes into your checkout, as `refs/threadbear/upstream/`. It never changes your code by
   itself. Every 5 days, when there's one your copy doesn't have, it starts
   one thread (on your own Claude or Codex login, like any thread) that
   merges it in a worktree, runs the checks and asks you before it lands
@@ -217,7 +234,7 @@ File references are where to look.
 
 | Service | Whose | What goes there |
 |---|---|---|
-| Your Convex deployment | yours | Thread titles and status, all message text (each message cut at 8,000 characters), one line per tool call, projects, schedules, your logins' emails and usage, whether you're at the Mac, whether this machine is low on memory or disk, and the pictures you paste into a message, up to 10 MB each, so your own website can show them. Those go up as they are, in your deployment's file storage: unlike text, nothing can scrub a secret out of a picture, so a screenshot of something sensitive goes too. `"sync": { "pastedPictures": false }` in `runner.json` keeps them on this Mac. While someone has the website's Runners view open, this machine's CPU, memory and disk use, its processor model, operating system and time since it started, every 10 seconds; with nobody looking, none of that is sent. Photos you send from the phone, deleted once the Mac has fetched them. Pictures and videos agents put in their replies or pin, at most 10 MB each, for the phone to show. Other images only for threads you share by link. Other tool output and files stay on the Mac. Text has known secrets taken out first: see below. |
+| Your Convex deployment | yours | Thread titles and status, all message text (each message cut at 8,000 characters), one line per tool call, projects, schedules, your logins' emails and usage, whether you're at the Mac, whether this machine is low on memory or disk, and the pictures you paste into a message, up to 10 MB each, so your own website can show them. Those go up as they are, in your deployment's file storage: unlike text, nothing can scrub a secret out of a picture, so a screenshot of something sensitive goes too. `"sync": { "pastedPictures": false }` in `runner.json` keeps them on this Mac. While someone has the website's Runners view open, this machine's CPU, memory and disk use, its processor model, operating system and time since it started, every 10 seconds; with nobody looking, none of that is sent. Photos you send from the phone, and pictures you send from the Mac app to a thread on another of your Macs, deleted once that Mac has fetched them. Pictures and videos agents put in their replies or pin, at most 10 MB each, for the phone to show. Other images only for threads you share by link. Other tool output and files stay on the Mac. Text has known secrets taken out first: see below. |
 | Convex (the Convex panel) | yours | Only for a thread in a Convex project, when its Convex panel opens: the runner's Convex CLI asks api.convex.dev for the project's deployments and a deploy key, the runner asks the deployment whether a kept key still works (`/api/check_admin_key`), and the panel loads Convex's embedded dashboard (dashboard-embedded.convex.dev) with that key. Sign in to Convex goes to auth.convex.dev. (`runner/src/convex-keys.ts`) |
 | Your other Macs, over ssh | yours | Only when you run `tb runner add <name> --ssh <host>` or `tb runner check --ssh <host>` on your first Mac: it reads that Mac's Threadbear `runner.json`, writes its id and the deployment's address there if it hasn't them, writes its new key into that Mac's `secrets/convex-key`, and looks whether that Mac has a deploy key, Convex panel keys or a Convex login (names only, never a key), through your own ssh setup with agent and port forwarding off (`runner/src/runner-keys.ts`). `tb runner audit` asks this Mac's runner for its threads' last seqs and your deployment for what the main key made. `tb runner rotate-owner` sets env vars on your deployment with your deploy key, and, if you give it a Convex team access token for that run (`CONVEX_TEAM_TOKEN`, never kept), asks api.convex.dev for the deployment's deploy keys (their names and dates) before it rotates. |
 | GitHub | Mike's repo | Release tags fetched every 6 hours; the fork at setup |
@@ -250,21 +267,17 @@ if you have BrowserBear, to ask whether an agent's Chrome tab is already
 on that page (`app/Sources/Threadbear/BrowserBear.swift`). Only the link
 goes there.
 
-The Browser panel also uses that private socket to list connected Chrome profiles
-and the pages agents associate with threads. In an existing profile, frames and
-your mouse and keys go through BrowserBear's extension; the page uses Chrome's
-original sign-ins. Threadbear does not read Chrome's cookie database or copy
-credentials. Frames stay on this Mac, in memory, and are not sent to Convex.
-BrowserBear stores thread/tab/profile/target associations and cached page titles in `panel-tabs.json` in
-its own folder (0600); it verifies the target before reconnecting after a service
-restart. Closing a panel releases its viewport and focus overrides. Chrome's
-native-window button pauses panel capture and input for native dialogs.
+The Browser panel also uses that private socket to list the pages agents
+associate with threads, ask for a small still of each and bring a page's real
+window to the front (`app/Sources/Threadbear/Views/AgentBrowserPanel.swift`).
+Threadbear does not read Chrome's cookie database or copy credentials, and
+stills stay on this Mac, in memory, not sent to Convex. BrowserBear stores
+thread/tab/profile associations in `panel-tabs.json` in its own folder (0600).
 
-The optional separate agent Chrome (`browserbear ... --profile agent`) keeps its
-existing path: the panel reads `agent/tabs.json` in BrowserBear's folder and connects
-to that Chrome's local debugging port. It is real Google Chrome with its own profile
-folder; any program on this Mac could reach that port, so it holds only what you
-sign it in to (`app/Sources/Threadbear/Views/AgentBrowserPanel.swift`).
+The agents' own browser (`browserbear ... --profile agent`) is Helium where it's
+installed, else Google Chrome, with its own profile folder; the panel reads
+`agent/tabs.json` in BrowserBear's folder for its pages. Any program on this Mac
+could reach its local debugging port, so it holds only what you sign it in to.
 
 Nothing else: no analytics, no ads, no tracking.
 

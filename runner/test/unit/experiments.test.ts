@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { EXPERIMENTS, experimentOn } from '../../src/experiments.ts';
+import { EXPERIMENTS, EXPERIMENTS_DIR, experimentOn, parseExperiment } from '../../src/experiments.ts';
 import { tmpDir } from '../helpers/fakes.ts';
 
 test('experiments: each has a unique id, a landing date, a title and the schedule that asks about it', () => {
@@ -30,4 +30,32 @@ test("experiments: runner.json's switch wins over the default, read afresh each 
   assert.equal(experimentOn(home, 'labReview'), true);
   fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ experiments: { labReview: 'yes' } }));
   assert.equal(experimentOn(home, 'labReview'), false, 'only a true or false counts');
+});
+
+test('experiments: every experimentOn in the runner names an experiment that has a file', () => {
+  const ids = new Set(EXPERIMENTS.map((x) => x.id));
+  const src = path.join(import.meta.dirname, '..', '..', 'src');
+  const used = new Set<string>();
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const at = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(at);
+      else if (entry.name.endsWith('.ts')) {
+        for (const m of fs.readFileSync(at, 'utf8').matchAll(/experimentOn\([^,()]+,\s*'(\w+)'\)/g)) used.add(m[1]);
+      }
+    }
+  };
+  walk(src);
+  assert.ok(used.size >= 3, 'found the calls');
+  for (const id of used) assert.ok(ids.has(id), `experimentOn(..., '${id}') has no src/experiments/${id}.md`);
+});
+
+test("experiments: a file's name is its id", () => {
+  for (const f of fs.readdirSync(EXPERIMENTS_DIR).filter((f) => f.endsWith('.md'))) {
+    assert.equal(parseExperiment(fs.readFileSync(path.join(EXPERIMENTS_DIR, f), 'utf8'), f).id, f.slice(0, -3));
+  }
+});
+
+test('experiments: a file missing a section says which', () => {
+  assert.throws(() => parseExperiment('---\nid: x\nname: X\ntitle: Does a thing\nadded: 2026-11-07\non: false\nreminder: 12345678\n---\n\n## What it does\n\nA thing.\n', 'x.md'), /x\.md: has no "## Lives in"/);
 });

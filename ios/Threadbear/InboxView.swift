@@ -26,6 +26,8 @@ struct InboxView: View {
     @Environment(QuickAskModel.self) private var quick
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var path: [String] = []
+    /// What Back has popped, for a swipe left on a thread (PageSwipe.swift).
+    @State private var forward = ForwardStack()
     @State private var composing = false
     @State private var composeText = ""
     @State private var hibernateTarget: PhoneThread?
@@ -35,8 +37,17 @@ struct InboxView: View {
     /// Settings pushed at launch (`-ThreadbearSettings`, for screenshots).
     @State private var settingsOpen = false
     @State private var afterPocket: PocketView.Next?
-    /// The thread a new thread sheet just made, to open once the sheet has gone.
+    /// A thread started from the sheet that's ready before the sheet's gone,
+    /// to open once it has.
     @State private var afterCompose: String?
+    /// The start the sheet closed with, until it's slid away: only that one's
+    /// thread waits to open, not one asked for earlier landing meanwhile.
+    @State private var closingFor: String?
+    /// A failed start, back in the sheet as it was.
+    @State private var composeDraft: NewThreadDraft?
+    /// How far the list's pulled down, for the bear peeking over it. Only the
+    /// bear reads it, so a pull redraws the bear and not the whole list.
+    @State private var pull = PullState()
 
     private var pocketValue: String {
         let count = model.pocket.count
@@ -46,200 +57,306 @@ struct InboxView: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            List {
-                if let problem = model.backendProblem {
-                    Section {
-                        Label(problem, systemImage: "arrow.down.circle")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if let offline = model.offlineText {
-                    Section {
-                        Label(offline, systemImage: "moon.zzz")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    } footer: {
-                        Text("Anything you send waits until it's back.")
-                    }
-                }
-                let sections = model.sections
-                if !query.trimmingCharacters(in: .whitespaces).isEmpty {
-                    results(ThreadSearch(query, sections: sections, hibernating: model.hibernating, archived: model.den, olderArchived: olderArchived))
-                } else if !model.loaded.contains(.inbox) {
-                    LoadingRows()
-                } else if sections.isEmpty {
-                    ContentUnavailableView {
-                        Label { Text("Nothing in the inbox") } icon: { BearView(pose: .sit, size: 44) }
-                    } description: {
-                        Text("Threads that finish or need you turn up here.")
-                    }
-                    .listRowBackground(Color.clear)
-                }
-                if query.trimmingCharacters(in: .whitespaces).isEmpty, model.loaded.contains(.inbox) {
-                    ForEach(PhoneSection.allCases, id: \.self) { section($0) }
-                }
-            }
-            // A flat list with the Mac sidebar's headings, not grouped cards.
-            .listStyle(.plain)
-            .listSectionSeparator(.hidden)
-            // Folded headings sit one under another, without the gap an
-            // empty section would leave.
-            .listSectionSpacing(0)
-            .navigationTitle("Threadbear")
-            // Always showing, rather than tucked under the title until you
-            // pull down: on the phone it's the quickest way to an old thread.
-            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always))
-            // The phone has only the newest 100 archived threads, so Convex
-            // looks through the rest, once typing pauses.
-            .task(id: query) {
-                olderArchived = []
-                let text = query.trimmingCharacters(in: .whitespaces)
-                guard !text.isEmpty else { return }
-                try? await Task.sleep(for: .milliseconds(300))
-                guard !Task.isCancelled else { return }
-                let found = await model.searchOlderArchived(text)
-                if !Task.isCancelled { olderArchived = found }
-            }
-            .navigationDestination(for: String.self) { ThreadView(threadId: $0) }
-            .navigationDestination(isPresented: $settingsOpen) {
-                if model.opensRunnerOrderAtLaunch { RunnerOrderView() } else { SettingsView() }
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Menu {
-                        NavigationLink { SettingsView() } label: { Label("Settings", systemImage: "gear") }
-                        if model.isFake {
-                            Button { model.leaveDemo() } label: {
-                                Label("Leave the demo", systemImage: "rectangle.portrait.and.arrow.right")
-                            }
+            ScrollViewReader { proxy in
+                List {
+                    if let problem = model.backendProblem {
+                        Section {
+                            Label(problem, systemImage: "arrow.down.circle")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
                         }
-                    } label: {
-                        Image(systemName: "line.3.horizontal")
+                    }
+                    if let offline = model.offlineText {
+                        Section {
+                            Label(offline, systemImage: "moon.zzz")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        } footer: {
+                            Text("Anything you send waits until it's back.")
+                        }
+                    }
+                    if query.trimmingCharacters(in: .whitespaces).isEmpty, !model.starting.isEmpty {
+                        Section { ForEach(model.starting) { startingRow($0) } }
+                    }
+                    let sections = model.sections
+                    if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                        results(ThreadSearch(query, sections: sections, hibernating: model.hibernating, archived: model.den, olderArchived: olderArchived))
+                    } else if !model.loaded.contains(.inbox) {
+                        LoadingRows()
+                    }
+                    if query.trimmingCharacters(in: .whitespaces).isEmpty, model.loaded.contains(.inbox) {
+                        // Real sections, so each heading sticks to the top while
+                        // its rows scroll under it. A row changing heading flies
+                        // there over the list (RowFlight.swift), as a List only
+                        // fades a row from one section to another.
+                        ForEach(PhoneSection.allCases, id: \.self) { section($0) }
                     }
                 }
-                if model.showsPocket {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { pocketOpen = true } label: {
-                            // A frame with room for the badge: the toolbar clips a
-                            // button's label to its bounds, so an offset badge lost its top.
-                            Image(systemName: "wallet.pass")
-                                .frame(width: 44, height: 36)
-                                .overlay(alignment: .topTrailing) {
-                                    PocketBadge(count: model.pocket.count, hasNew: model.pocketHasNew)
+                // A flat list with the Mac sidebar's headings, not grouped cards.
+                .listStyle(.plain)
+                .listSectionSeparator(.hidden)
+                // Folded headings sit one under another, without the gap an
+                // empty section would leave.
+                .listSectionSpacing(0)
+                .navigationTitle("Threadbear")
+                // As it sits anyway with the search field always showing. A large
+                // title also grew out of it on a pull, over the bear peeking up.
+                .navigationBarTitleDisplayMode(.inline)
+                // Always showing, rather than tucked under the title until you
+                // pull down: on the phone it's the quickest way to an old thread.
+                .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always))
+                // The phone has only the newest 100 archived threads, so Convex
+                // looks through the rest, once typing pauses.
+                .task(id: query) {
+                    olderArchived = []
+                    let text = query.trimmingCharacters(in: .whitespaces)
+                    guard !text.isEmpty else { return }
+                    try? await Task.sleep(for: .milliseconds(300))
+                    guard !Task.isCancelled else { return }
+                    let found = await model.searchOlderArchived(text)
+                    if !Task.isCancelled { olderArchived = found }
+                }
+                .navigationDestination(for: String.self) { ThreadView(threadId: $0) }
+                .navigationDestination(isPresented: $settingsOpen) {
+                    if model.opensRunnerOrderAtLaunch { RunnerOrderView() } else { SettingsView() }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Menu {
+                            NavigationLink { SettingsView() } label: { Label("Settings", systemImage: "gear") }
+                            if model.isFake {
+                                Button { model.leaveDemo() } label: {
+                                    Label("Leave the demo", systemImage: "rectangle.portrait.and.arrow.right")
                                 }
-                                .compositingGroup()
+                            }
+                        } label: {
+                            Image(systemName: "line.3.horizontal")
                         }
-                        .accessibilityLabel("Pocket")
-                        .accessibilityValue(pocketValue)
                     }
-                }
-                if quick.settings.isReady {
+                    if model.showsPocket {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button { pocketOpen = true } label: {
+                                // A frame with room for the badge: the toolbar clips a
+                                // button's label to its bounds, so an offset badge lost its top.
+                                Image(systemName: "wallet.pass")
+                                    .frame(width: 44, height: 36)
+                                    .overlay(alignment: .topTrailing) {
+                                        PocketBadge(count: model.pocket.count, hasNew: model.pocketHasNew)
+                                    }
+                                    .compositingGroup()
+                            }
+                            .accessibilityLabel("Pocket")
+                            .accessibilityValue(pocketValue)
+                        }
+                    }
+                    if quick.settings.isReady {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button { quick.open() } label: { Image(systemName: "waveform") }
+                                .accessibilityLabel("Ask")
+                        }
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button { quick.open() } label: { Image(systemName: "waveform") }
-                            .accessibilityLabel("Ask")
+                        Button { composing = true } label: { Image(systemName: "square.and.pencil") }
+                            .accessibilityLabel("New thread")
                     }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { composing = true } label: { Image(systemName: "square.and.pencil") }
-                        .accessibilityLabel("New thread")
+                .fullScreenCover(isPresented: $pocketOpen, onDismiss: {
+                    // Only once the cover has gone: nothing else can present
+                    // or push while it's still up.
+                    switch afterPocket {
+                    case let .thread(id): path.append(id)
+                    case .add: model.composeText = "Add to my pocket: "
+                    case nil: break
+                    }
+                    afterPocket = nil
+                }) {
+                    PocketView { afterPocket = $0 }
                 }
-            }
-            .fullScreenCover(isPresented: $pocketOpen, onDismiss: {
-                // Only once the cover has gone: nothing else can present
-                // or push while it's still up.
-                switch afterPocket {
-                case let .thread(id): path.append(id)
-                case .add: model.composeText = "Add to my pocket: "
-                case nil: break
+                .onAppear {
+                    if model.opensPocketAtLaunch {
+                        model.opensPocketAtLaunch = false
+                        pocketOpen = true
+                    }
+                    if model.opensSettingsAtLaunch || model.opensRunnerOrderAtLaunch {
+                        model.opensSettingsAtLaunch = false
+                        settingsOpen = true
+                    }
                 }
-                afterPocket = nil
-            }) {
-                PocketView { afterPocket = $0 }
-            }
-            .onAppear {
-                if model.opensPocketAtLaunch {
-                    model.opensPocketAtLaunch = false
-                    pocketOpen = true
+                .sheet(isPresented: $composing, onDismiss: {
+                    composeText = ""
+                    // Only once the sheet has gone, as with the Pocket's cover. Pushed while
+                    // it was still sliding away with the keyboard, the thread could open
+                    // blank on the phone until you went back and in again.
+                    composeDraft = nil
+                    closingFor = nil
+                    if let id = afterCompose, path.isEmpty { path.append(id) }
+                    afterCompose = nil
+                }) {
+                    if let composeDraft {
+                        NewThreadView(draft: composeDraft) { closingFor = $0 }
+                    } else {
+                        NewThreadView(text: composeText) { closingFor = $0 }
+                    }
                 }
-                if model.opensSettingsAtLaunch || model.opensRunnerOrderAtLaunch {
-                    model.opensSettingsAtLaunch = false
-                    settingsOpen = true
+                // A thread that started soon after Start opens, as the sheet
+                // used to wait to do, unless you've gone into another or are
+                // writing the next one meanwhile.
+                .onChange(of: model.justStarted?.threadId) {
+                    guard let started = model.justStarted else { return }
+                    model.justStarted = nil
+                    if started.commandId == closingFor { afterCompose = started.threadId }
+                    else if !composing, path.isEmpty { path.append(started.threadId) }
                 }
-            }
-            .sheet(isPresented: $composing, onDismiss: {
-                composeText = ""
-                // Only once the sheet has gone, as with the Pocket's cover. Pushed while
-                // it was still sliding away with the keyboard, the thread could open
-                // blank on the phone until you went back and in again.
-                if let id = afterCompose { path.append(id) }
-                afterCompose = nil
-            }) {
-                NewThreadView(text: composeText) { afterCompose = $0 }
-            }
-            .onChange(of: model.composeText, initial: true) { _, text in
-                guard let text else { return }
-                composeText = text
-                composing = true
-                model.composeText = nil
-            }
-            .hibernateDialog(for: $hibernateTarget)
-            .refreshable { try? await Task.sleep(for: .milliseconds(400)) }
-            .overlay(alignment: .bottom) { ConnectionToast() }
-            .onChange(of: query, initial: true) { _, text in
-                model.setSearching(!text.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-            .onChange(of: model.searchText, initial: true) { _, text in
-                guard let text else { return }
-                query = text
-                model.searchText = nil
-            }
-            .onChange(of: model.openThreadId, initial: true) { _, id in
-                guard let id else { return }
-                path = [id]
-                model.openThreadId = nil
+                .onChange(of: model.retryDraft != nil) {
+                    guard let draft = model.retryDraft else { return }
+                    model.retryDraft = nil
+                    composeDraft = draft
+                    composing = true
+                }
+                .onChange(of: model.composeText, initial: true) { _, text in
+                    guard let text else { return }
+                    composeText = text
+                    composing = true
+                    model.composeText = nil
+                }
+                .hibernateDialog(for: $hibernateTarget)
+                // Its own pull to refresh rather than .refreshable, whose spinner
+                // holds back until the list's been pulled about 190 pt: the bear
+                // blinks at 80, as in the mockup Mike picked, and letting go there
+                // refreshes, holding the list open while it does.
+                .onScrollGeometryChange(for: CGPoint.self) { CGPoint(x: $0.contentInsets.top, y: $0.contentOffset.y) } action: { _, g in
+                    pull.scrolled(offset: g.y, topInset: g.x)
+                }
+                .onScrollPhaseChange { old, new in
+                    if new == .interacting { pull.touching = true }
+                    if old == .interacting, new != .interacting {
+                        pull.touching = false
+                        if pull.letGo() { Task { await refresh() } }
+                    }
+                }
+                .contentMargins(.top, pull.holding ? PullPeek.hold : 0, for: .scrollContent)
+                .accessibilityAction(named: "Reconnect") { Task { await refresh() } }
+                .overlay { RowFlightLayer() }
+                .overlay(alignment: .top) {
+                    if query.trimmingCharacters(in: .whitespaces).isEmpty { PullPeekBear(pull: pull) }
+                }
+                .overlay(alignment: .bottom) { ConnectionToast() }
+                .onChange(of: query, initial: true) { _, text in
+                    model.setSearching(!text.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                .onChange(of: model.searchText, initial: true) { _, text in
+                    guard let text else { return }
+                    query = text
+                    model.searchText = nil
+                }
+                .onChange(of: path.isEmpty, initial: true) { _, empty in model.threadOpen = !empty }
+                .onChange(of: path) { old, new in
+                    forward.pathChanged(from: old, to: new)
+                    // `-ThreadbearForward <threadId>`: that thread forward from the
+                    // first one opened, for screenshots of the swipe card.
+                    let args = ProcessInfo.processInfo.arguments
+                    if old.isEmpty, forward.next == nil, let i = args.firstIndex(of: "-ThreadbearForward"), i + 1 < args.count {
+                        forward = ForwardStack(ids: [args[i + 1]])
+                    }
+                }
+                .onChange(of: model.openThreadId, initial: true) { _, id in
+                    guard let id else { return }
+                    path = [id]
+                    model.openThreadId = nil
+                }
+                // `-ThreadbearScrollTo`: once the rows are there.
+                .onChange(of: model.loaded.contains(.inbox), initial: true) { _, loaded in
+                    guard loaded, let id = model.scrollToThreadId else { return }
+                    model.scrollToThreadId = nil
+                    let under: PhoneSection = model.sections.running.contains { $0.threadId == id } ? .running
+                        : model.sections.starred.contains { $0.threadId == id } ? .starred : .inbox
+                    Task {
+                        try? await Task.sleep(for: .milliseconds(300))
+                        proxy.scrollTo(RowFrames.row(id, under: under), anchor: .top)
+                    }
+                }
             }
         }
         .environment(\.pushThread) { path.append($0) }
+        .environment(\.pageForward, forward.next.map { id in PageForward(threadId: id) { path.append(id) } })
     }
 
-    /// A heading and its rows, as on the Mac's sidebar: tap the heading to
-    /// fold it away, and folded it says how many it hides. Empty sections
-    /// are left out, Inbox aside, which has the empty view above instead.
+    /// Pull to refresh: the bear blinks with a light tap as the list's held open,
+    /// the app reconnects to Convex for real, the bear nods, then ducks back
+    /// behind the list as it slides home.
+    private func refresh() async {
+        guard !pull.refreshing else { return }
+        pull.refreshing = true
+        pull.holding = true
+        await model.reconnect()
+        if !reduceMotion {
+            pull.nods += 1
+            try? await Task.sleep(for: .milliseconds(560))
+        }
+        withAnimation(.easeIn(duration: 0.2)) { pull.ducked = true }
+        try? await Task.sleep(for: .milliseconds(200))
+        withAnimation(.snappy(duration: 0.32)) { pull.holding = false }
+        try? await Task.sleep(for: .milliseconds(320))
+        pull.refreshing = false
+    }
+
+    /// As on the Mac's sidebar: tap a heading to fold it away, and folded it says
+    /// how many it hides. The Inbox never folds.
+    @ViewBuilder private func heading(_ section: PhoneSection) -> some View {
+        if section == .inbox {
+            SectionHeading(title: section.title, icon: section.icon)
+                .reportsFrame(RowFrames.heading(section), to: model.rowFrames)
+        } else {
+            let folded = model.folds.isFolded(section)
+            // A tap rather than a Button: a button in a list header
+            // is drawn dimmed, so the heading looked disabled.
+            SectionHeading(title: section.title, icon: section.icon, fold: .init(folded: folded, count: model.count(section)),
+                           bounce: section == .hibernating && !reduceMotion ? model.tucks.bounces : 0)
+                .onTapGesture { withAnimation(.snappy(duration: 0.2)) { model.toggle(section) } }
+                .accessibilityAction { model.toggle(section) }
+                .accessibilityHint(folded ? "Shows these threads" : "Hides these threads")
+                // Where a row rises from, or sinks into, while it's folded.
+                .reportsFrame(RowFrames.heading(section), to: model.rowFrames)
+        }
+    }
+
+    /// A heading and its rows, as on the Mac's sidebar. Hibernating and Archived
+    /// load only once they're opened, and a folded one with no count (an older
+    /// backend) still shows its heading, so there's a way to open it. Empty
+    /// sections are left out, Inbox aside, which has the empty view instead.
     @ViewBuilder private func section(_ section: PhoneSection) -> some View {
-        let folded = model.folds.isFolded(section)
         let count = model.count(section)
-        let threads = model.threads(section)
-        // A folded put-away section with no count (an older backend) still
-        // shows its heading, so there's a way to open it.
-        if section != .inbox, count != 0 || (count == nil && section.view != nil) {
+        if section == .inbox {
+            let threads = model.threads(section)
+            if !threads.isEmpty {
+                Section { rows(threads) } header: { heading(section) }
+            } else if model.sections.isInboxZero {
+                // In the Inbox's place, so anything still running sits under it.
+                InboxZeroView(celebrating: model.inboxJustCleared)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+        } else if count != 0 {
             Section {
-                if !folded {
-                    if section == .hibernating {
+                if !model.folds.isFolded(section) {
+                    if section == .starred || section == .running {
+                        rows(model.threads(section), running: section == .running, starred: section == .starred)
+                    } else if section == .hibernating {
                         // The scheduled ones are in the inbox list already;
                         // the snoozed ones load once it's opened.
-                        hibernatingRows(threads)
+                        hibernatingRows(model.threads(section))
                         if !model.loaded.contains(.hibernating) { LoadingRows(count: 3) }
                     } else if let view = section.view {
                         if !model.loaded.contains(view) {
                             LoadingRows(count: 3)
                         } else {
-                            putAwayRows(threads, from: view)
+                            putAwayRows(model.threads(section), from: view)
                         }
-                    } else {
-                        rows(threads, running: section == .running, starred: section == .starred)
                     }
                 }
             } header: {
-                // A tap rather than a Button: a button in a list header
-                // is drawn dimmed, so the heading looked disabled.
-                SectionHeading(title: section.title, icon: section.icon, fold: .init(folded: folded, count: count))
-                    .onTapGesture { withAnimation(.snappy(duration: 0.2)) { model.toggle(section) } }
-                    .accessibilityAction { model.toggle(section) }
-                    .accessibilityHint(folded ? "Shows these threads" : "Hides these threads")
+                heading(section)
             }
-        } else if section == .inbox, !threads.isEmpty {
-            Section { rows(threads) } header: { SectionHeading(title: section.title, icon: section.icon) }
         }
     }
 
@@ -295,8 +412,30 @@ struct InboxView: View {
         }
     }
 
+    /// A new thread the runner hasn't made yet. A failed one opens the sheet
+    /// again with what was typed, or swipes away.
+    private func startingRow(_ row: StartingThread) -> some View {
+        Button { if row.failed != nil { model.retryStarting(row) } } label: { StartingRow(row: row) }
+            .buttonStyle(.plain)
+            .disabled(row.failed == nil)
+            .listRowInsets(ThreadRow.insets)
+            .listRowSeparator(.hidden)
+            .swipeActions(edge: .trailing) {
+                if row.failed != nil {
+                    Button(role: .destructive) { model.dropStarting(row.id) } label: { Label("Remove", systemImage: "xmark") }
+                }
+            }
+    }
+
+    /// Each row's id says its heading too, so a row changing heading is one going
+    /// and another coming, not the same row moved: a List moving one between
+    /// sections redrew its old look sliding about inside the new row. The
+    /// picture flying over the list (RowFlight.swift) is what travels.
     private func rows(_ threads: [PhoneThread], running: Bool = false, starred: Bool = false) -> some View {
-        ForEach(threads) { row($0, running: running, starred: starred) }
+        let under: PhoneSection = running ? .running : starred ? .starred : .inbox
+        return ForEach(threads.map { (key: RowFrames.row($0.threadId, under: under), thread: $0) }, id: \.key) {
+            row($0.thread, running: running, starred: starred)
+        }
     }
 
     @ViewBuilder private func row(_ thread: PhoneThread, running: Bool = false, scheduled: Bool = false, starred: Bool = false) -> some View {
@@ -304,11 +443,21 @@ struct InboxView: View {
         let asleep = starred && InboxSections.isSnoozed(thread, now: model.now)
         // A plain row, not a NavigationLink: the Mac's rows have no
         // chevron, and the status sits where it would go.
+        let under: PhoneSection = running ? .running : scheduled ? .hibernating : starred ? .starred : .inbox
         Button { path.append(thread.threadId) } label: {
             ThreadRow(thread: thread, underRunning: running, wake: scheduled ? model.wakes[thread.threadId] : nil, asleep: asleep)
+                .reportsFrame(RowFrames.row(thread.threadId, under: under), to: model.rowFrames)
+                // Flying here from another heading: the picture stands in until it lands.
+                .opacity(model.flights[thread.threadId] == nil ? 1 : 0)
+                // At once, both ways: the list's change is animated, and fading
+                // in it showed a ghost of the row under the picture as it landed.
+                .animation(nil, value: model.flights[thread.threadId] == nil)
                 // Off to the left, the way a swipe to archive goes.
                 .offset(x: model.slidingOff.contains(thread.threadId) && !reduceMotion ? -500 : 0)
-                .opacity(model.slidingOff.contains(thread.threadId) ? 0 : 1)
+                // Hibernating goes down instead, towards its heading.
+                .offset(y: model.sinking.contains(thread.threadId) && !reduceMotion ? 14 : 0)
+                .scaleEffect(model.sinking.contains(thread.threadId) && !reduceMotion ? 0.96 : 1)
+                .opacity(model.slidingOff.contains(thread.threadId) || model.sinking.contains(thread.threadId) ? 0 : 1)
         }
         .buttonStyle(.plain)
         .listRowInsets(ThreadRow.insets)
@@ -338,6 +487,7 @@ struct InboxView: View {
             if thread.unread || thread.needsYou {
                 Button { Task { await perform(thread, .markSeen) } } label: { Label("Mark as read", systemImage: "envelope.open") }
             }
+            Button { UIPasteboard.general.string = thread.threadId } label: { Label("Copy Thread ID", systemImage: "number") }
         }
     }
 
@@ -386,6 +536,63 @@ private struct BringBackSwipe: ViewModifier {
 /// the title across the width, and under it where the thread belongs and
 /// what it's doing, with the unread dot (or the done tick) in the gutter
 /// left of the tile.
+/// A thread row's look for a new thread on its way: what was asked, and
+/// "Starting" with a spinner where a working row's time goes, until the
+/// runner has made it and its own row takes over.
+private struct StartingRow: View {
+    @Environment(AppModel.self) private var model
+    var row: StartingThread
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            ProjectTiles(projects: [])
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.body)
+                    .foregroundStyle(row.failed == nil ? .secondary : .primary)
+                    .lineLimit(1)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(line2).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                    Spacer(minLength: 6)
+                    if row.failed != nil {
+                        Text("Failed").font(.footnote.weight(.medium)).foregroundStyle(Look.failed)
+                    } else {
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(.accentColor)
+                                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
+                            Text("Starting")
+                        }
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(Color.accentColor)
+                    }
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(row.failed != nil ? "Opens it again to try once more" : "")
+    }
+
+    private var title: String {
+        let first = row.message.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        if !first.isEmpty { return first }
+        let photos = row.draft.photos.count
+        return photos == 1 ? "A photo" : "\(photos) photos"
+    }
+
+    private var line2: String {
+        if let failed = row.failed { return "Tap to try again · \(failed)" }
+        // Its Mac asleep: it starts when it's back, maybe much later.
+        // No runner picked: the backend's, which with one runner is that one.
+        let picked = row.draft.runnerId.flatMap { id in model.runners.first { $0.runnerId == id } }
+        guard let runner = picked ?? (model.runners.count == 1 ? model.runners.first : nil) else { return model.offlineText ?? "On its way" }
+        guard runner.isOnline(at: model.now) else { return "\(runner.name) offline, starts when it's back" }
+        return runner.name
+    }
+}
+
 struct ThreadRow: View {
     @Environment(AppModel.self) private var model
     var thread: PhoneThread
@@ -406,7 +613,9 @@ struct ThreadRow: View {
         HStack(alignment: .center, spacing: 10) {
             ProjectTiles(projects: thread.projects ?? [])
                 .overlay(alignment: .leading) {
-                    if done {
+                    if model.landing.contains(thread.threadId) {
+                        // On its way to a new heading: the mark pops in as it lands.
+                    } else if done {
                         // Finished with nothing needed: a tick where the
                         // unread dot would be.
                         Image(systemName: "checkmark")
@@ -415,12 +624,14 @@ struct ThreadRow: View {
                             .frame(width: 10, height: 10)
                             .offset(x: -19)
                             .accessibilityLabel("Done, unread")
+                            .transition(Juice.popIn)
                     } else if unread {
                         Circle()
                             .fill(Color.accentColor)
                             .frame(width: 7, height: 7)
                             .offset(x: -17)
                             .accessibilityLabel("Needs you")
+                            .transition(Juice.popIn)
                     }
                 }
             VStack(alignment: .leading, spacing: 3) {
@@ -509,9 +720,121 @@ struct ThreadRow: View {
             // When its schedule messages it next: "10:42", "Mon 10:42".
             Text(RelativeTime.clock(wake?.nextRunAt ?? model.now, now: model.now))
                 .font(.footnote).monospacedDigit().foregroundStyle(Look.faint)
-                .accessibilityLabel("Scheduled: \(wake?.whenText ?? "")")
+                // phone:wakes has no whenText (backend API 45): the time then.
+                .accessibilityLabel("Scheduled: \(wake.map { $0.whenText.isEmpty ? RelativeTime.clock($0.nextRunAt ?? model.now, now: model.now) : $0.whenText } ?? "")")
         case .time:
             Text(RowStatus.text(thread, now: model.now)).font(.footnote).monospacedDigit().foregroundStyle(Look.faint)
+        }
+    }
+}
+
+/// The inbox's pull, kept apart from InboxView so only the bear redraws as it
+/// changes (`PullPeek` has the sums).
+@MainActor @Observable
+final class PullState {
+    private(set) var peek = PullPeek()
+    /// Held open while it reconnects: the whole head shows.
+    var refreshing = false {
+        didSet { if refreshing { ducked = false } }
+    }
+    /// Gone back down behind the list, until the list is home again.
+    var ducked = false
+    var blinks = 0
+    var nods = 0
+
+    /// The list held open below the search field while it reconnects.
+    var holding = false
+    /// A finger's on the list.
+    var touching = false
+    @ObservationIgnored private let tap = UIImpactFeedbackGenerator(style: .light)
+
+    func scrolled(offset: CGFloat, topInset: CGFloat) {
+        var next = peek
+        next.scrolled(offset: offset, topInset: topInset, refreshing: refreshing)
+        if touching, !refreshing, next.pulling(gap: next.gap) {
+            // The refresh point: a blink and a light tap, so he knows letting go will do it.
+            blinks += 1
+            tap.impactOccurred()
+        }
+        // Every scroll lands here: only a change is news.
+        if next != peek { peek = next }
+        if ducked, !refreshing, peek.gap == 0 { ducked = false }
+    }
+
+    func letGo() -> Bool { peek.letGo() }
+}
+
+/// The sat bear's head coming up over the top of the inbox as it's pulled
+/// down, in the gap between the search field and the list, as far as the
+/// pull goes. Under Reduce Motion it fades in whole rather than rising.
+private struct PullPeekBear: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var pull: PullState
+
+    var body: some View {
+        let gap = pull.peek.gap
+        let rising = pull.refreshing ? PullPeek.head : PullPeek.shown(gap: gap)
+        let shown = pull.ducked ? 0 : reduceMotion ? (rising > 0 ? PullPeek.head : 0) : rising
+        // The list's first heading has room above its words, so the bear can
+        // come up from just behind them.
+        let room = gap + 10
+        PeekingBear(size: 64, blinks: pull.blinks, nods: pull.nods)
+            .foregroundStyle(.secondary)
+            .offset(y: room - shown)
+            .opacity(reduceMotion && shown == 0 ? 0 : 1)
+            .animation(reduceMotion ? .easeOut(duration: 0.15) : nil, value: shown)
+            .frame(maxWidth: .infinity, maxHeight: room, alignment: .top)
+            .frame(height: room, alignment: .top)
+            .clipped()
+            .allowsHitTesting(false)
+            .opacity(gap > 0 || pull.refreshing ? 1 : 0)
+    }
+}
+
+/// "Nothing in the inbox". Having just taken the last row away, the bear stands
+/// up and gives one wave as the row's collapse finishes, with one soft tap, as the
+/// Mac's InboxZero does. Open the app to an empty inbox and it just sits there:
+/// it's a reward for clearing it, not a launch animation.
+private struct InboxZeroView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var shown: Bool
+    @State private var waves = 0
+    @State private var taps = 0
+
+    init(celebrating: Bool) {
+        // Hidden from the first frame when it's about to rise, or it flashes.
+        _shown = State(initialValue: !celebrating)
+    }
+
+    var body: some View {
+        ContentUnavailableView {
+            Label { Text("Nothing in the inbox") } icon: { WaveOnceBear(size: 46, waves: waves) }
+        } description: {
+            Text("Threads that finish or need you turn up here.")
+        }
+        .opacity(shown ? 1 : 0)
+        .offset(y: shown || reduceMotion ? 0 : 8)
+        .sensoryFeedback(.impact(flexibility: .soft, intensity: 0.6), trigger: taps)
+        .onAppear {
+            // Asked here rather than from the archive call: the List only puts
+            // this row in as the last one starts to collapse.
+            guard model.takeInboxCleared() else { shown = true; return }
+            if reduceMotion {
+                withAnimation(.easeOut(duration: 0.2)) { shown = true }
+                taps += 1
+                return
+            }
+            // The collapse is 250 ms, then 100 ms, then the snappy rise. Waited for
+            // here rather than with the animation's delay: a change made as a
+            // List's row appears goes in with its first frame, not animated.
+            Task {
+                try? await Task.sleep(for: .milliseconds(350))
+                withAnimation(.snappy(duration: 0.4)) { shown = true }
+                try? await Task.sleep(for: .milliseconds(250))
+                waves += 1
+                taps += 1
+            }
         }
     }
 }
@@ -551,15 +874,18 @@ struct ConnectionToast: View {
 }
 
 extension View {
-    /// The Hibernate presets as a dialog, for a swipe or a menu.
-    func hibernateDialog(for target: Binding<PhoneThread?>) -> some View {
-        modifier(HibernateDialog(target: target))
+    /// The Hibernate presets as a dialog, for a swipe or a menu. `leaving` is
+    /// for a thread's own page: picking one goes back to the inbox, as archive
+    /// does, rather than leaving him on a thread he's just put to sleep.
+    func hibernateDialog(for target: Binding<PhoneThread?>, leaving: (() -> Void)? = nil) -> some View {
+        modifier(HibernateDialog(target: target, leaving: leaving))
     }
 }
 
 private struct HibernateDialog: ViewModifier {
     @Environment(AppModel.self) private var model
     @Binding var target: PhoneThread?
+    var leaving: (() -> Void)?
 
     func body(content: Content) -> some View {
         content.confirmationDialog("Hibernate until", isPresented: Binding(get: { target != nil }, set: { if !$0 { target = nil } }),
@@ -572,10 +898,8 @@ private struct HibernateDialog: ViewModifier {
     }
 
     private func change(_ thread: PhoneThread, _ change: ThreadChange) {
-        Task {
-            guard let backend = model.backend else { return }
-            do { _ = try await backend.update(threadId: thread.threadId, change: change) } catch { model.report(error) }
-        }
+        model.hibernate(thread.threadId, change, leavingThread: leaving != nil)
+        leaving?()
     }
 }
 

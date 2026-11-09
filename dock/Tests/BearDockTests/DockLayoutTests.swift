@@ -224,7 +224,9 @@ private func threeColumns() -> DockLayout {
     ], fractions: [0.25, 0.5, 0.25])
     let shown = SplitView.shownIndices(split) { $0 != "tandem" && $0 != "convex" }
     #expect(shown == [1, 2])
-    #expect(SplitView.normalized(shown.map { split.fractions[$0] }) == [2.0 / 3, 1.0 / 3])
+    let shares: [Double] = SplitView.normalized(shown.map { split.fractions[$0] })
+    let expected: [Double] = [2.0 / 3, 1.0 / 3]
+    #expect(shares == expected)
     // A divider dragged meanwhile keeps the hidden side's share.
     #expect(SplitView.merged([0.5, 0.5], into: split.fractions, at: shown) == [0.25, 0.375, 0.375])
     // Nothing available anywhere: all of it, as a group does.

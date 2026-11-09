@@ -35,9 +35,8 @@ struct SlashPaletteView: View {
     /// runner is another Mac's, whose files aren't here.
     var onOpen: ((String) -> Void)?
 
-    /// SlashPalette.height for the window: about half of it. A fixed 300
-    /// left a big window's palette showing eight rows (Mike, 6 Nov).
-    var height: CGFloat = zoomed(300)
+    /// The column widths Mike dragged (AppModel.slashPaletteLayout).
+    @Binding var layout: SlashPalette.Layout
 
     var body: some View {
         let all = commands ?? []
@@ -47,31 +46,50 @@ struct SlashPaletteView: View {
         // the rest (SlashPalette.columnWidths). Measured over every command,
         // not just the matches, so the columns hold still while typing.
         GeometryReader { geo in
+            let total = geo.size.width
             let widths = SlashPalette.columnWidths(
-                total: geo.size.width,
-                categories: Self.categoriesWidth(all, query: query, recent: recent, provider: provider),
-                list: Self.listWidth(all)
+                total: total,
+                categories: layout.categories ?? Self.categoriesWidth(all, query: query, recent: recent, provider: provider),
+                list: layout.list ?? Self.listWidth(all),
+                chosen: layout.list != nil
             )
             HStack(spacing: 0) {
                 categories(all)
                     .frame(width: widths.categories)
-                Divider()
+                // The dividers drag to size the column on their left.
+                ResizeHandle(edge: .column, tip: "Drag to size the categories; double-click for their own width",
+                             start: { widths.categories },
+                             drag: { base, moved in layout.categories = SlashPalette.Layout.column(base + moved.width, least: 110, others: widths.list + 200, total: total) },
+                             reset: { layout.categories = nil })
                 list(matches, picked: picked)
                     .frame(width: widths.list)
-                Divider()
+                ResizeHandle(edge: .column, tip: "Drag to size the list; double-click for its own width",
+                             start: { widths.list },
+                             drag: { base, moved in layout.list = SlashPalette.Layout.column(base + moved.width, least: 120, others: widths.categories + 200, total: total) },
+                             reset: { layout.list = nil })
                 detail(picked)
                     .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
-        .frame(maxWidth: .infinity)
-        .frame(height: height)
+        // It fills its panel (SlashPalettePanel), whose own edges size it.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             RoundedRectangle(cornerRadius: zoomed(14), style: .continuous)
                 .fill(Color(nsColor: .windowBackgroundColor))
-                .shadow(color: .black.opacity(0.35), radius: zoomed(18), y: zoomed(6))
         }
         .overlay(RoundedRectangle(cornerRadius: zoomed(14), style: .continuous).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
         .clipShape(RoundedRectangle(cornerRadius: zoomed(14), style: .continuous))
+        // Its edges are a window's, which have no double-click of their own.
+        .iconContextMenu {
+            Button("Default Size", systemImage: "arrow.down.right.and.arrow.up.left") {
+                layout.width = nil
+                layout.height = nil
+            }
+            Button("Default Column Widths", systemImage: "rectangle.split.3x1") {
+                layout.categories = nil
+                layout.list = nil
+            }
+        }
     }
 
     private func categories(_ all: [SlashCommand]) -> some View {
@@ -162,7 +180,7 @@ struct SlashPaletteView: View {
                 Text("/\(command.name)")
                     .font(.system(size: TypeScale.cardTitle + 3, weight: .semibold))
                 if let text = command.description, !text.isEmpty {
-                    Text(text)
+                    Text(SlashPalette.description(text))
                         .font(.system(size: TypeScale.label + 1))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -313,5 +331,39 @@ extension AppModel {
                 AppLog.write("rpc", "threads.commands failed: \(error.localizedDescription)")
             }
         }
+    }
+}
+
+/// A line between the palette's columns that drags to size the column on
+/// its left, with the resize pointer, and a double-click back to the
+/// width worked out for it. (The palette's own edges are its panel's.)
+struct ResizeHandle: View {
+    enum Edge { case column }
+    let edge: Edge
+    let tip: String
+    /// The size when the drag starts.
+    let start: () -> Double
+    /// The size at the start, and how far the pointer has moved since.
+    let drag: (Double, CGSize) -> Void
+    let reset: () -> Void
+    @State private var base: Double?
+
+    var body: some View {
+        // A hairline to see, with a wider strip to grab.
+        Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
+            .padding(.horizontal, zoomed(3))
+            .contentShape(Rectangle())
+            .pointerStyle(.columnResize)
+        .gesture(
+            DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                .onChanged { value in
+                    let from = base ?? start()
+                    base = from
+                    drag(from, value.translation)
+                }
+                .onEnded { _ in base = nil }
+        )
+        .onTapGesture(count: 2) { reset() }
+        .tip(tip)
     }
 }

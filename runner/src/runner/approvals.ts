@@ -4,7 +4,7 @@
 // is the Runner; runner.ts puts them on its prototype.
 import type { Runner } from '../runner.ts';
 import type { RunnerPart } from './part.ts';
-import type { ApprovalDecision, EventBody, PermissionMode } from '../protocol.ts';
+import type { ApprovalDecision, EventBody, PermissionMode, QueuedAnswers } from '../protocol.ts';
 import { ErrorCode, RpcError } from '../protocol.ts';
 import type { QuestionAnswer, QuestionRequest, ToolApprovalAnswer, ToolApprovalRequest } from '../adapters/types.ts';
 import { approvalTitle, type AgentApprovalRequest } from '../threadbear-mcp.ts';
@@ -13,17 +13,28 @@ import type { PendingApproval, ThreadState } from '../runner.ts';
 import { matchAnswers } from '../runner.ts';
 import { SECRET_TIMEOUT_DEFAULT_MIN, SECRET_TIMEOUT_MAX_MIN, type SecretFiles } from '../secrets.ts';
 import { START_CARD, type RequestAnswer } from '../cross-runner.ts';
+import { REMOTE_ALLOW_REFUSED, remoteCardShowsAll } from '../tools.ts';
 
 export type SecretRequest = { label: string; reason: string; placeholder?: string; timeoutMinutes?: number; toolUseId?: string; signal?: AbortSignal };
 export type SecretAnswer = ({ status: 'saved' } & SecretFiles) | { status: 'declined' | 'expired'; message?: string };
 
 // Closes a pending card of any kind without an answer: Mike wrote instead,
 // the turn ended, the thread went.
-export function settleDeclined(p: PendingApproval, decision: 'deny' | 'expired', message?: string): void {
-  if (p.kind === 'tool') p.resolve({ decision, message });
-  else if (p.kind === 'question') p.resolve({ answers: null, message });
+// `stopped`: because someone pressed Stop, the one case the agent may be
+// told the user stopped it (ToolApprovalAnswer).
+export function settleDeclined(p: PendingApproval, decision: 'deny' | 'expired', message?: string, stopped = false): void {
+  if (p.kind === 'tool') p.resolve({ decision, message, ...(stopped ? { stopped } : {}) });
+  else if (p.kind === 'question') p.resolve({ answers: null, message, ...(stopped ? { stopped } : {}) });
   else if (p.kind === 'request') p.resolve({ status: decision === 'deny' ? 'declined' : 'expired', ...(message ? { message } : {}) });
   else p.resolve({ status: decision === 'deny' ? 'declined' : 'expired', message });
+}
+
+// The answers for calls that were queued on the card, or nothing.
+function listedAnswers(listed: Set<string> | undefined, answers: QueuedAnswers | undefined): QueuedAnswers | undefined {
+  if (!listed || !answers) return undefined;
+  const out: QueuedAnswers = {};
+  for (const id of listed) if (answers[id] === 'allow' || answers[id] === 'deny') out[id] = answers[id];
+  return Object.keys(out).length ? out : undefined;
 }
 
 // What Go ahead says to an agent whose plan isn't waiting on a call.
@@ -36,10 +47,18 @@ export const approvalsPart = {
     decision: ApprovalDecision;
     message?: string;
     answers?: Record<string, string>;
+    // Answers to the calls queued on the card (docs/protocol.md, "Queued calls").
+    queued?: QueuedAnswers;
+    // From the phone or another Mac's view of this runner, through the
+    // backend (sync.ts), which show only a line of a card's input.
+    remote?: boolean;
   }): Record<string, never> {
     const st = this.mustGet(params.threadId);
     const pending = st.rt.approvals.get(params.approvalId);
     if (!pending) throw new RpcError(ErrorCode.badParams, 'That approval is no longer pending.');
+    if (params.remote && pending.kind === 'tool' && pending.macOnly && (params.decision === 'allow' || params.decision === 'allowAlways')) {
+      throw new RpcError(ErrorCode.badParams, `${REMOTE_ALLOW_REFUSED} Deny still works from here.`);
+    }
     if (pending.kind === 'secret') {
       // A phone from before secrets draws any card it doesn't know as
       // Allow/Deny: Deny declines, and Allow can't carry a value.
@@ -80,7 +99,9 @@ export const approvalsPart = {
       this.resolveApproval(st, pending.approvalId, params.decision, params.message);
       // An approved plan goes ahead in the mode resolveApproval just left plan mode for.
       const mode = pending.plan && params.decision !== 'deny' ? st.rec.permissionMode : undefined;
-      pending.resolve({ decision: params.decision, message: params.message, ...(mode ? { mode } : {}) });
+      // Only calls the card listed, and never from a view that didn't show them.
+      const queued = params.remote ? undefined : listedAnswers(pending.queued, params.queued);
+      pending.resolve({ decision: params.decision, message: params.message, ...(mode ? { mode } : {}), ...(queued ? { queued } : {}) });
     }
     return {};
   },
@@ -117,18 +138,21 @@ export const approvalsPart = {
     return rec.permissionMode;
   },
 
-  // A request can come with no turn running: a background subagent keeps
-  // working after the turn that started it ended. It gets a turn of its own
-  // so the card is shown rather than the subagent being stopped.
-  turnForRequest(this: Runner, st: ThreadState, gen: number): boolean {
+  // A card for the agent's own call can come just before its turn does, so
+  // it gets a turn. A background subagent's (no toolUseId) gets none: it's
+  // between the subagent and Mike, whatever the agent is doing. A turn opened
+  // for one held Mike's messages back until the CLI next ran one, and ending
+  // it cleared the asks of the turn before (docs/protocol.md, "A subagent's
+  // card").
+  turnForRequest(this: Runner, st: ThreadState, gen: number, main = true): boolean {
     const { rt } = st;
     if (rt.generation !== gen || rt.closing || this.stopping) return false;
-    if (!rt.turn) this.openCliTurn(st);
+    if (main && !rt.turn) this.openCliTurn(st);
     return true;
   },
 
   requestApproval(this: Runner, st: ThreadState, gen: number, req: ToolApprovalRequest): Promise<ToolApprovalAnswer> {
-    if (!this.turnForRequest(st, gen)) return Promise.resolve({ decision: 'expired' });
+    if (!this.turnForRequest(st, gen, Boolean(req.toolUseId))) return Promise.resolve({ decision: 'expired', message: 'The thread is shutting down.' });
     const approvalId = crypto.randomUUID();
     const body: EventBody = {
       type: 'approval.requested',
@@ -144,7 +168,10 @@ export const approvalsPart = {
       // A card offered without "Always allow" never answers with it, even
       // if a client sends it: it would save a rule Mike was never offered.
       const answer = req.canAlwaysAllow ? resolve : (a: ToolApprovalAnswer) => resolve(a.decision === 'allowAlways' ? { ...a, decision: 'allow' } : a);
-      this.addApproval(st, { approvalId, kind: 'tool', main: Boolean(req.toolUseId), ...(plan ? { plan } : {}), resolve: answer }, body, req.signal);
+      const macOnly = !remoteCardShowsAll(req.name, req.input, st.rec.cwd, req.title);
+      const queued = req.toolUseId && req.queued?.length ? new Set(req.queued.map((c) => c.itemId)) : undefined;
+      this.addApproval(st, { approvalId, kind: 'tool', title: String(body.title), main: Boolean(req.toolUseId), ...(plan ? { plan } : {}), ...(macOnly ? { macOnly } : {}), ...(req.toolUseId ? { itemId: req.toolUseId } : {}), ...(queued ? { queued } : {}), resolve: answer }, body, req.signal);
+      if (queued) this.emit(st, { type: 'approval.queued', approvalId, calls: req.queued! }, st.rt.turn?.turnId);
     });
   },
 
@@ -159,17 +186,17 @@ export const approvalsPart = {
     const body: EventBody = { type: 'approval.requested', approvalId, name: req.name, title: req.title, input: req.input, options: ['allow', 'deny'] };
     return new Promise((resolve) => {
       const answer = (a: ToolApprovalAnswer) => resolve(a.decision === 'allowAlways' ? { ...a, decision: 'allow' } : a);
-      this.addApproval(st, { approvalId, kind: 'tool', main: true, resolve: answer }, body, req.signal ?? new AbortController().signal);
+      this.addApproval(st, { approvalId, kind: 'tool', main: true, macOnly: true, resolve: answer }, body, req.signal ?? new AbortController().signal);
     });
   },
 
   requestQuestion(this: Runner, st: ThreadState, gen: number, req: QuestionRequest): Promise<QuestionAnswer> {
-    if (!this.turnForRequest(st, gen)) return Promise.resolve({ answers: null });
+    if (!this.turnForRequest(st, gen, Boolean(req.toolUseId))) return Promise.resolve({ answers: null, message: 'Threadbear closed this question before the user saw it: the thread is shutting down.' });
     const approvalId = crypto.randomUUID();
     const body: EventBody = { type: 'question.requested', approvalId, questions: req.questions };
     if (req.toolUseId) body.itemId = req.toolUseId;
     return new Promise((resolve) => {
-      this.addApproval(st, { approvalId, kind: 'question', main: Boolean(req.toolUseId), questions: req.questions, resolve }, body, req.signal);
+      this.addApproval(st, { approvalId, kind: 'question', title: req.questions[0]?.question ?? 'A question', main: Boolean(req.toolUseId), questions: req.questions, resolve }, body, req.signal);
     });
   },
 
@@ -243,8 +270,16 @@ export const approvalsPart = {
     const { rec, rt } = st;
     rt.approvals.set(pending.approvalId, pending);
     rec.pendingApprovals.push(pending.approvalId);
-    this.emit(st, body, rt.turn?.turnId);
+    // Before the event: sync reads the status as the event goes by, and takes
+    // the card off the phone's row if the thread looks idle (Codex review).
     rec.status = 'waiting';
+    this.emit(st, body, rt.turn?.turnId);
+    // A subagent's card with no turn running: not finished for anything
+    // waiting on this thread, and it just did something.
+    delete rec.finished;
+    rec.lastActivityAt = this.isoNow();
+    rt.idleTimer?.cancel();
+    rt.idleTimer = undefined;
     this.markDirty(st);
     signal.addEventListener('abort', () => this.expireApproval(st, pending.approvalId, 'Cancelled.'), { once: true });
   },
@@ -270,17 +305,34 @@ export const approvalsPart = {
     }
     if (rec.status === 'waiting' && rt.approvals.size === 0) rec.status = rt.turn ? 'running' : 'idle';
     this.markDirty(st);
+    // The last card of a thread with no turn and nothing left running: its
+    // idle countdown (or a release that waited on the card) starts now, as
+    // nothing else would start it. With background work it starts when that
+    // ends, and scheduleIdle mustn't release the CLI under a subagent Mike
+    // has just allowed.
+    if (!rt.turn && rt.approvals.size === 0 && rt.tasks.length === 0) this.scheduleIdle(st);
   },
 
-  expireApproval(this: Runner, st: ThreadState, approvalId: string, message: string): void {
+  expireApproval(this: Runner, st: ThreadState, approvalId: string, message: string, stopped = false): void {
     const pending = st.rt.approvals.get(approvalId);
     if (!pending) return;
     this.resolveApproval(st, approvalId, 'expired', message);
-    settleDeclined(pending, 'expired', message);
+    settleDeclined(pending, 'expired', message, stopped);
   },
 
-  expireApprovals(this: Runner, st: ThreadState, message: string): void {
-    for (const id of [...st.rt.approvals.keys()]) this.expireApproval(st, id, message);
+  expireApprovals(this: Runner, st: ThreadState, message: string, opts: { stopped?: boolean; mainOnly?: boolean } = {}): void {
+    for (const [id, pending] of [...st.rt.approvals]) {
+      if (opts.mainOnly && !pending.main) continue;
+      this.expireApproval(st, id, message, opts.stopped);
+    }
+  },
+
+  // What the thread's agent should hear at end_turn: subagents of its that
+  // are parked on a card, not working (threadbear-mcp.ts, end_turn).
+  openSubagentCards(this: Runner, threadId: string): string[] {
+    const st = this.threads.get(threadId);
+    if (!st) return [];
+    return [...st.rt.approvals.values()].flatMap((p) => (p.main || !('title' in p) || !p.title ? [] : [p.title]));
   },
 };
 

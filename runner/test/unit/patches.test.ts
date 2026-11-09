@@ -450,7 +450,7 @@ test('a tool patch (appliesTo) applies only where its name is found, from any pr
   assert.equal(readPatchModule('x', 'project', '/x.ts', { appliesTo: 'a/*.tandem' }).info.error, 'appliesTo should be a name glob like "*.tandem", or a list of them (names in a folder, no slashes).');
 });
 
-test('live state: when hides, badge counts, a shared command runs once, a failure is liveError', async () => {
+test('live state: when hides, badge counts, label retitles, a shared command runs once, a failure is liveError', async () => {
   const { applyLive, hasLive } = await import('../../src/patches.ts');
   const home = tmpDir();
   const app = project(home, 'dev/app', { 'package.json': '{}' });
@@ -462,6 +462,9 @@ test('live state: when hides, badge counts, a shared command runs once, a failur
         { title: "Hidden", run: "true", when: () => false },
         { title: "Plain", run: "true" },
         { title: "Zero", run: "true", badge: () => 0 },
+        { title: "Merge", run: "true", label: async (ctx) => "Merge #" + (await count(ctx)) },
+        { title: "Blank", run: "true", label: () => "  " },
+        { title: "Lines", run: "true", label: () => "a\\n".repeat(30) },
       ],
       panels: [
         { title: "Waiting", items: () => [], badge: () => ["a", "b"], summary: () => ["2 to review", "", "1 comment"] },
@@ -474,7 +477,8 @@ test('live state: when hides, badge counts, a shared command runs once, a failur
   const commands: string[] = [];
   const ctx = { cwd: app, threadId: 't1', run: async (command: string, cwd: string) => { commands.push(command); return runCommand(command, { cwd, env: process.env }); } };
   const set = await applyLive(base, ctx);
-  assert.deepEqual(set.actions.map((a) => [a.title, a.badge]), [['Your turn', 3], ['Plain', undefined], ['Zero', undefined]]);
+  assert.deepEqual(set.actions.map((a) => [a.title, a.badge]), [['Your turn', 3], ['Plain', undefined], ['Zero', undefined], ['Merge #3', undefined], ['Blank', undefined], ['a a a a a a a a a a a a a a a a a a a a a a a a a a a a a a', undefined]]);
+  assert.deepEqual(set.actions.map((a) => a.id).slice(-3), ['review.merge', 'review.blank', 'review.lines']);
   assert.deepEqual(set.panels.map((p) => [p.title, p.badge, p.summary]), [['Waiting', 2, '2 to review\n1 comment'], ['Broken', undefined, undefined]]);
   assert.equal(readPatchModule('x', 'project', '/x.ts', { actions: [{ title: 'A', run: 'x', summary: () => 'no' }] }).actions.length, 1);
   for (const a of set.actions) assert.deepEqual(checkAction(a as never), []);
@@ -482,7 +486,8 @@ test('live state: when hides, badge counts, a shared command runs once, a failur
   assert.equal(commands.length, 1);
   assert.equal(set.patches[0]?.liveError, "tandem isn't running");
   // The base set is left as it was, so a when that turns true brings it back.
-  assert.equal(base.actions.length, 4);
+  assert.equal(base.actions.length, 7);
+  assert.equal(base.actions[4]?.title, 'Merge');
   assert.equal(base.patches[0]?.liveError, undefined);
   const without = await loadPatchSet(project(home, 'dev/none'), home);
   assert.equal(hasLive(without), false);

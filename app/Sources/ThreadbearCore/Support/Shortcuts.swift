@@ -139,12 +139,15 @@ public enum ShortcutCommand: String, CaseIterable, Sendable {
     case newThread, archive, hibernate, stop, copyTranscript
     case back, forward, nextInboxThread, showInbox, showScheduled, showProjects, showLibrarian, showHibernating, showArchived
     case zoomIn, zoomOut, actualSize, toggleThreads, togglePanels, resetPanelLayout
+    case settings
 
     public var group: ShortcutGroup {
         switch self {
         case .newThread, .archive, .hibernate, .stop, .copyTranscript: .threads
         case .back, .forward, .nextInboxThread, .showInbox, .showScheduled, .showProjects, .showLibrarian, .showHibernating, .showArchived: .go
         case .zoomIn, .zoomOut, .actualSize, .toggleThreads, .togglePanels, .resetPanelLayout: .view
+        // The app menu's Settings…, which opens the Settings window.
+        case .settings: .go
         }
     }
 
@@ -164,6 +167,7 @@ public enum ShortcutCommand: String, CaseIterable, Sendable {
         case .showLibrarian: "Show Librarian"
         case .showHibernating: "Show Hibernating"
         case .showArchived: "Show Archived"
+        case .settings: "Settings…"
         case .zoomIn: "Zoom In"
         case .zoomOut: "Zoom Out"
         case .actualSize: "Actual Size"
@@ -189,6 +193,7 @@ public enum ShortcutCommand: String, CaseIterable, Sendable {
     public var defaultKey: ShortcutKey? {
         switch self {
         case .newThread: ShortcutKey("n")
+        case .settings: ShortcutKey(",")
         case .archive: ShortcutKey("e")
         case .stop: ShortcutKey(".")
         case .copyTranscript: ShortcutKey("c", shift: true)

@@ -28,12 +28,28 @@ struct ThreadView: View {
     /// arrive (the oldest seq changes) or the runner says it couldn't.
     /// (A backend before API 2.)
     @State private var loadingBefore: Int?
-    /// From API 2: the newest `limit` messages and tool lines, from Convex.
-    @State private var page: MessagePage?
+    /// From API 2: the newest `limit` messages and tool lines live from
+    /// Convex, and older chunks once you've scrolled back past those.
+    @State private var history = MessageHistory()
     @State private var limit = ThreadView.firstPage
-    /// The rows on screen when older ones were asked for, to stay on once they
-    /// arrive above them.
-    @State private var keepAbove: [Int]?
+    /// A chunk of older rows has been asked for and hasn't come yet.
+    @State private var loadingChunk = false
+    /// A finger's on the list, or it's still gliding from a flick.
+    @State private var scrolling = false
+    /// Older rows that came while `scrolling`, put in once it stops: a bigger
+    /// live page (with the limit it was asked for), or a chunk (with the seq
+    /// it comes before).
+    @State private var heldPage: (page: MessagePage, limit: Int)?
+    @State private var heldChunk: (page: MessagePage, before: Int)?
+    /// Older rows have just gone in above: until then, the list's next growth
+    /// is theirs, and the view moves down by it to stay on the same rows.
+    /// Older rows that fold into what's there (more of a cut-off turn's work)
+    /// may not change the height, so it doesn't wait forever. Not half a
+    /// second either: a chunk of long replies took longer than that to lay
+    /// out on 8 Nov and left the view at the top. A new message arriving in
+    /// the meantime scrolls to the bottom anyway.
+    @State private var prependedUntil: Date?
+    @State private var scrollPosition = ScrollPosition()
     /// Answers picked on the open card of asks (ask index to choice), until
     /// they're sent; the composer sends them along with what's typed.
     @State private var picks: [Int: Int] = [:]
@@ -41,6 +57,18 @@ struct ThreadView: View {
     /// Follow-ups ticked on the done card, and the reply it's under.
     @State private var nextPicks: Set<Int> = []
     @State private var nextPickedFor: Int?
+    /// A card's answer is on its way to the backend: it spins and can't be
+    /// pressed again. Uploading first can take a while.
+    @State private var sendingCard = false
+    /// That answer's command, watched to its end, as an older backend's
+    /// refusal comes after `taken`, when `sent` has already gone.
+    @State private var answeredCommand: String?
+    /// The card of asks, and the reply under a done card, that's been answered
+    /// from here. `sent` goes when the runner takes the message, which is before
+    /// the thread's row says so, and the card coming back live for that moment
+    /// could be pressed twice.
+    @State private var answeredAsks: Double?
+    @State private var answeredDone: Int?
     /// The working a work: link opened.
     @State private var workLink: ThreadLinks.Hit?
     @Environment(\.pushThread) private var pushThread
@@ -75,12 +103,26 @@ struct ThreadView: View {
                 menu(thread)
             }
         }
-        .hibernateDialog(for: $hibernateTarget)
+        .hibernateDialog(for: $hibernateTarget, leaving: { dismiss() })
         // model.connection in each id: a fresh Convex client after the app
         // comes back from the background, so these follow it, not the old one.
         .task(id: "\(threadId):\(model.connection)") { await follow() }
+        .task {
+            // For sim-shots.sh: a reply box with something typed in.
+            if let text = model.draftText {
+                draft = text
+                model.draftText = nil
+            }
+        }
         .task(id: "\(threadId):\(limit):\(model.hasMessagePages):\(model.connection)") { await followMessages() }
         .task(id: "\(sent?.id ?? ""):\(model.connection)") { await followCommand() }
+        .task(id: answeredCommand) {
+            guard let id = answeredCommand, let status = await model.commandOutcome(id), status.state == .failed,
+                  answeredCommand == id else { return }
+            // Refused, even after the runner took it: its card comes back.
+            answeredAsks = nil
+            answeredDone = nil
+        }
         .task(id: "\(threadId):\(model.canSeeWaiting):\(model.connection)") { await followWaiting() }
     }
 
@@ -88,14 +130,15 @@ struct ThreadView: View {
         let thread = detail.thread
         // From API 2 the page from phone:messages (tool lines included);
         // until it arrives, and on an older backend, phone:thread's messages.
-        let messages = page?.messages ?? detail.messages
+        let messages = history.live != nil ? history.messages : detail.messages
         let items = Turns.fold(messages, busy: thread.isBusy)
-        let pictures = ThreadPictures(page?.images ?? [])
+        let pictures = ThreadPictures(history.images)
         let pins = pictures.pinned(in: items)
-        let paged = model.hasMessagePages && page != nil
-        let canLoadMore = paged ? page?.hasMore == true : thread.hasEarlier(than: detail.messages.first?.seq)
-        // Paged: a bigger page has been asked for and hasn't arrived yet.
-        let loadingMore = paged ? (page?.hasMore == true && messages.count < limit) : loadingBefore == detail.messages.first?.seq
+        let paged = model.hasMessagePages && history.live != nil
+        let canLoadMore = paged ? history.hasMore : thread.hasEarlier(than: detail.messages.first?.seq)
+        // Paged: a bigger page or a chunk has been asked for, or is waiting
+        // for the list to stop, and isn't shown yet.
+        let loadingMore = paged ? (history.liveLimit != limit || loadingChunk || heldPage != nil || heldChunk != nil) : loadingBefore == detail.messages.first?.seq
         return ScrollViewReader { proxy in
             ScrollView {
                 // Not a LazyVStack. Opening a long thread left the screen blank
@@ -108,7 +151,6 @@ struct ThreadView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     if canLoadMore {
                         EarlierButton(loading: loadingMore, fromMac: !paged) {
-                            keepAbove = items.map(\.id)
                             loadMore(thread, detail: detail, paged: paged)
                         }
                         // Scrolling up to it loads by itself, like any chat.
@@ -120,7 +162,6 @@ struct ThreadView: View {
                         // wherever the row is.
                         .onScrollVisibilityChange { visible in
                             guard visible, items.count >= 20 else { return }
-                            keepAbove = items.map(\.id)
                             loadMore(thread, detail: detail, paged: paged)
                         }
                     }
@@ -142,17 +183,21 @@ struct ThreadView: View {
                     }
                     if let pending = thread.pendingApproval {
                         PendingCard(threadId: thread.threadId, runnerId: thread.runnerId, pending: pending) { sent = ($0, nil) }
+                            // Its own state per question: a tapped button doesn't carry over to the next.
+                            .id(pending.id)
+                            .transition(Juice.cardGoes)
                     } else if thread.isBusy || thread.working != nil {
                         WorkingLine(text: thread.working)
                             .id("working:\(thread.status == .running)")
-                    } else if let asks = thread.asks, !asks.isEmpty, sent == nil, waiting.isEmpty {
-                        AsksCard(asks: asks, picks: $picks, busy: sent != nil) {
-                            Task { _ = await send("", to: thread) }
+                    } else if let asks = thread.asks, !asks.isEmpty, showsAsks(thread) {
+                        AsksCard(asks: asks, picks: $picks, busy: sendingCard) {
+                            sendCard(thread, lastSeq: messages.last?.seq)
                         }
                         .onChange(of: thread.asksSeq, initial: true) {
                             // A new card starts with nothing picked.
                             if pickedFor != thread.asksSeq { picks = [:]; pickedFor = thread.asksSeq }
                         }
+                        .transition(Juice.cardGoes)
                     } else if thread.status == .error {
                         Label("The last turn failed. Send a message to try again.", systemImage: "exclamationmark.triangle")
                             .font(.subheadline)
@@ -160,8 +205,8 @@ struct ThreadView: View {
                     } else if isDone(thread, messages: messages) {
                         // Ticked follow-ups go from the card's Send on their
                         // own; anything typed stays in the box for later.
-                        DoneCard(next: thread.next ?? [], picked: $nextPicks, busy: sent != nil) {
-                            Task { _ = await send("", to: thread) }
+                        DoneCard(next: thread.next ?? [], picked: $nextPicks, busy: sendingCard) {
+                            sendCard(thread, lastSeq: messages.last?.seq)
                         } archive: {
                             archive()
                         }
@@ -169,6 +214,7 @@ struct ThreadView: View {
                             // A new reply's card starts with nothing ticked.
                             if nextPickedFor != messages.last?.seq { nextPicks = []; nextPickedFor = messages.last?.seq }
                         }
+                        .transition(Juice.cardGoes)
                     }
                     if let note = sentNote {
                         Text(note).font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .trailing)
@@ -177,26 +223,52 @@ struct ThreadView: View {
                 }
                 .padding(.horizontal)
                 .padding(.top, 8)
+                // A tap opens or closes a row, which changes the height too:
+                // older rows that went in without changing it (folded into a
+                // line already there) mustn't take that for theirs.
+                .simultaneousGesture(TapGesture().onEnded { prependedUntil = nil })
+                // Only when the card changes: the rest of what comes in just appears.
+                .animation(Juice.card, value: cardShowing(thread, messages: messages))
             }
             .defaultScrollAnchor(.bottom)
+            .scrollPosition($scrollPosition)
+            .onScrollPhaseChange { _, phase in
+                scrolling = phase.isScrolling
+                guard !scrolling else { return }
+                if let held = heldPage { putIn(held.page, limit: held.limit) }
+                if let held = heldChunk { putIn(chunk: held.page, before: held.before) }
+            }
+            // Older rows have gone in above: down by their height, so the rows
+            // on screen stay put. By height rather than back to a row, as a
+            // row can be cut in two by the page's edge and get a new id once
+            // more of its turn comes, and a long one may be half on screen.
+            // Only growth: if a turn folds below in the same moment and the
+            // list comes out shorter, it stays where it is rather than going up.
+            .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in
+                let grew = new.contentSize.height - old.contentSize.height
+                guard let until = prependedUntil, grew != 0 else { return }
+                prependedUntil = nil
+                guard grew > 0, Date.now < until else { return }
+                scrollPosition.scrollTo(y: new.contentOffset.y + new.contentInsets.top + grew)
+            }
+            // A backend before API 2: older text messages come in through
+            // phone:thread, not as a page.
+            .onChange(of: messages.first?.seq) { old, new in
+                guard !paged, let old, let new, new < old else { return }
+                prependedUntil = .now + 5
+            }
             .scrollDismissesKeyboard(.interactively)
+            // Swipe left for Forward (and right for Back before iOS 26).
+            .pageSwipes()
             .environment(\.threadPictures, pictures)
             .environment(\.picturesWaitUntilSeen, true)
             .environment(\.threadLink) { url, seq in follow(url, from: seq, in: items) }
+            .environment(\.buttonThreadId, threadId)
             .sheet(item: $workLink) { WorkingSheet(link: $0).environment(\.threadPictures, pictures) }
             .onChange(of: messages.last?.seq) { proxy.scrollTo("bottom", anchor: .bottom) }
             // The first page takes over from phone:thread's newest text
             // messages, usually at a different height. Stay on the newest.
-            .onChange(of: page != nil) { proxy.scrollTo("bottom", anchor: .bottom) }
-            // Older rows have arrived above: back to the row that was at the
-            // top. The first one still here, as a turn cut off by the page's
-            // edge gets a new id once more of it has come.
-            .onChange(of: items.first?.id) {
-                guard let keep = keepAbove else { return }
-                keepAbove = nil
-                let now = Set(items.map(\.id))
-                if let row = keep.first(where: now.contains) { proxy.scrollTo(row, anchor: .top) }
-            }
+            .onChange(of: history.live != nil) { proxy.scrollTo("bottom", anchor: .bottom) }
             // A voice follow-up's reply is read out once the turn's over, so it's the answer and
             // not a line the agent wrote on the way.
             .onChange(of: "\(messages.last?.seq ?? 0):\(thread.isBusy)", initial: true) {
@@ -207,7 +279,7 @@ struct ThreadView: View {
                 if quick.voiceThreadId == threadId, !typing {
                     VoiceBar(threadId: threadId, afterSeq: messages.last?.seq ?? 0, working: thread.isBusy) { typing = true }
                 } else {
-                    Composer(text: $draft, placeholder: composerPlaceholder(thread), links: thread.links ?? []) { text, photos in
+                    Composer(text: $draft, placeholder: composerPlaceholder(thread), links: thread.links ?? [], threadId: thread.id, provider: thread.provider) { text, photos in
                         await send(text, photos: photos, to: thread)
                     }
                 }
@@ -224,16 +296,24 @@ struct ThreadView: View {
         case nil:
             // A relative link (`[plan](shorts-plan/candidates.md)`) is a
             // file in the thread's folder on the Mac; iOS can't open it.
-            guard url.scheme != nil else {
+            guard url.scheme != nil, !url.isFileURL else {
                 model.report(TransportError.server("That file opens on the Mac."))
                 return .handled
             }
-            return .systemAction
+            // A web page, or another app's link only once Mike says yes.
+            return LinkGate.shared.decide(url)
         case let .thread(id):
             // Agents may give only the start of the id.
             pushThread(model.inbox.first { $0.threadId.hasPrefix(id) }?.threadId ?? id)
         case .review:
             model.report(TransportError.server("That review opens on the Mac."))
+        case let .button(id):
+            // One partway through a line, drawn as a link (ReplyButtons.trailing
+            // only takes the ones at the end). An id the row doesn't carry is
+            // just its words.
+            let buttons = (history.live != nil ? history.messages : detail?.messages ?? []).first { $0.seq == seq }?.buttons ?? []
+            guard let button = buttons.first(where: { $0.id == id }) else { return .discarded }
+            model.tap(button, in: threadId, pushThread: pushThread)
         case let .step(quote):
             guard let hit = ThreadLinks.find(quote: quote, from: seq, in: items) else { return .discarded }
             workLink = hit
@@ -295,6 +375,9 @@ struct ThreadView: View {
         }
         if status?.state == .failed {
             gone.removeAll { $0.id == send.id }
+            // Refused after the runner took it: a card it answered comes back.
+            answeredAsks = nil
+            answeredDone = nil
             guard status?.note != "Cancelled" else { return }
             // The last one sent from here already says so under the transcript.
             if sent?.id != send.commandId {
@@ -321,6 +404,9 @@ struct ThreadView: View {
                     // Gone from the list straight away rather than on the next update.
                     waiting.removeAll { $0.id == send.id }
                     if sent?.id == send.commandId { sent = nil }
+                    // Taken back, so a card it answered is there again.
+                    answeredAsks = nil
+                    answeredDone = nil
                     if draft.isEmpty { draft = send.text }
                 } else {
                     model.report(TransportError.server("Too late to cancel: it's already gone to the Mac."))
@@ -349,6 +435,11 @@ struct ThreadView: View {
                             Label(starred ? "Remove Star" : "Star", systemImage: starred ? "star.slash" : "star")
                         }
                     }
+                }
+                Section {
+                    // To point another thread at this one: pasted into a
+                    // message here or on the Mac, it goes in as a link to it.
+                    Button { UIPasteboard.general.string = thread.threadId } label: { Label("Copy Thread ID", systemImage: "number") }
                 }
                 Section {
                     Label(thread.cwd, systemImage: "folder")
@@ -397,18 +488,77 @@ struct ThreadView: View {
     private func followMessages() async {
         guard model.hasMessagePages, let backend = model.backend else { return }
         do {
-            for try await value in backend.messages(threadId, limit: limit) { page = value }
+            let asked = limit
+            for try await value in backend.messages(threadId, limit: asked) { receive(value, limit: asked) }
         } catch {
             model.report(error)
         }
     }
 
+    /// Older rows wait while the list is moving. Scrolling up to the top
+    /// loads them, so they often land mid-flick or while the list is still
+    /// bouncing off the top, and a scroll made then was ignored: you were
+    /// left at the very top of the new rows with Load earlier showing, so
+    /// the next pull loaded another page, and so on (8 Nov, seen on a real
+    /// 7,500-message thread with real flicks on Tinker Desk). Meanwhile the
+    /// rows already on screen keep up, so a new message isn't held back.
+    private func receive(_ value: MessagePage, limit asked: Int) {
+        guard let shown = history.live?.messages.first?.seq, let first = value.messages.first?.seq, first < shown else {
+            heldPage = nil
+            history.takeLive(value, limit: asked)
+            return
+        }
+        if scrolling {
+            heldPage = (value, asked)
+            // And only their pictures: one pinned above them would find no
+            // reply of its own and land under the first one shown. Still the
+            // old limit, so it shows as loading.
+            history.takeLive(MessagePage(messages: value.messages.filter { $0.seq >= shown }, hasMore: true, images: value.images.filter { $0.seq >= shown }), limit: history.liveLimit)
+        } else {
+            putIn(value, limit: asked)
+        }
+    }
+
+    /// A live page with older rows above the ones shown, in place.
+    private func putIn(_ value: MessagePage, limit asked: Int) {
+        heldPage = nil
+        prependedUntil = .now + 5
+        history.takeLive(value, limit: asked)
+    }
+
+    /// Older rows than the live page holds, once the server won't make it
+    /// any bigger (MessageHistory).
+    private func loadChunk(before seq: Int) {
+        guard let backend = model.backend else { return }
+        history.startChunks()
+        loadingChunk = true
+        Task {
+            defer { loadingChunk = false }
+            do {
+                let chunk = try await backend.olderMessages(threadId, beforeSeq: seq, limit: ThreadView.morePerPage)
+                if scrolling { heldChunk = (chunk, seq) } else { putIn(chunk: chunk, before: seq) }
+            } catch {
+                model.report(error)
+            }
+        }
+    }
+
+    private func putIn(chunk: MessagePage, before seq: Int) {
+        heldChunk = nil
+        if history.takeOlder(chunk, before: seq) { prependedUntil = .now + 5 }
+    }
+
     /// Older messages: from API 2 a bigger page from Convex (works with the
-    /// Mac asleep); before that, the runner pages them in.
+    /// Mac asleep), then chunks past what one page may hold; before that,
+    /// the runner pages them in.
     private func loadMore(_ thread: PhoneThread, detail: ThreadDetail, paged: Bool) {
         if paged {
-            guard let page, page.hasMore, page.messages.count >= limit else { return }
-            limit += ThreadView.morePerPage
+            guard heldPage == nil, heldChunk == nil, !loadingChunk else { return }
+            switch history.next(limit: limit, step: ThreadView.morePerPage) {
+            case let .grow(next): limit = next
+            case let .older(before): loadChunk(before: before)
+            case .none: break
+            }
         } else {
             loadEarlier(thread, before: detail.messages.first?.seq)
         }
@@ -420,15 +570,59 @@ struct ThreadView: View {
             for try await status in backend.command(id) {
                 guard sent?.id == id else { return }
                 sent?.status = status
+                if status?.state == .failed {
+                    // Its card comes back, with why under it.
+                    answeredAsks = nil
+                    answeredDone = nil
+                }
                 if status?.state == .done || status?.state == .taken { sent = nil; return }
             }
         } catch {}
     }
 
+    /// Nothing's on its way that would replace a card. A refused one doesn't
+    /// count: it says why under the transcript, and the card's there to try again.
+    private var nothingOnItsWay: Bool {
+        (sent == nil || sent?.status?.state == .failed) && waiting.isEmpty
+    }
+
+    private func showsAsks(_ thread: PhoneThread) -> Bool {
+        nothingOnItsWay && (answeredAsks == nil || answeredAsks != thread.asksSeq)
+    }
+
     /// A finished turn that needs nothing from Mike: the done card's place.
     private func isDone(_ thread: PhoneThread, messages: [PhoneMessage]) -> Bool {
         thread.status == .idle && !thread.needsYou && thread.archivedAt == nil && thread.working == nil
-            && messages.last?.role == .assistant && sent == nil && waiting.isEmpty
+            && messages.last?.role == .assistant && nothingOnItsWay
+            && (answeredDone == nil || answeredDone != messages.last?.seq)
+    }
+
+    /// Which card is showing, so it's only that changing that animates.
+    private func cardShowing(_ thread: PhoneThread, messages: [PhoneMessage]) -> String {
+        if let pending = thread.pendingApproval { return pending.id }
+        if thread.isBusy || thread.working != nil { return "working" }
+        if !(thread.asks ?? []).isEmpty, showsAsks(thread) { return "asks" }
+        return isDone(thread, messages: messages) ? "done" : "none"
+    }
+
+    /// A tap on a card of asks' answer, or Send on either card. Spinning from
+    /// the tap, and a single ask's chip goes back if it couldn't be sent.
+    private func sendCard(_ thread: PhoneThread, lastSeq: Int?) {
+        guard !sendingCard else { return }
+        sendingCard = true
+        Task {
+            // No deadline here, unlike an approval: a second tap after one
+            // would send the message twice, as nothing on the backend joins
+            // them up. Leaving the thread and coming back resets it.
+            defer { sendingCard = false }
+            if await send("", to: thread) {
+                answeredAsks = thread.asksSeq
+                answeredDone = lastSeq
+                answeredCommand = sent?.id
+            } else if thread.asks?.count == 1 {
+                picks = [:]
+            }
+        }
     }
 
     /// Sends what's typed, with any answers picked on the card of asks
@@ -440,7 +634,7 @@ struct ThreadView: View {
         let answers = AskAnswer.answers(asks: asks, picks: picks).map(\.answer)
         let next = thread.next ?? []
         // Only while the card they were ticked on is the last reply's.
-        let lastSeq = (page?.messages ?? detail?.messages)?.last?.seq
+        let lastSeq = (history.live?.messages ?? detail?.messages)?.last?.seq
         let followUps = nextPickedFor == lastSeq ? next.indices.filter { nextPicks.contains($0) }.map { next[$0] } : []
         let message = !followUps.isEmpty ? AskAnswer.followUpMessage(followUps, extra: text)
             : answers.isEmpty ? text : AskAnswer.message(asks: asks, picks: picks, extra: text)
@@ -648,6 +842,7 @@ struct MessageView: View {
     var pinned: [MessageImage] = []
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.threadPictures) private var pictures
 
     var body: some View {
         switch message.role {
@@ -655,11 +850,21 @@ struct MessageView: View {
             AgentMessageCard(header: message.agentHeader!, seq: message.seq)
         case .user:
             VStack(alignment: .trailing, spacing: 4) {
-                userText
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(BubbleBackground().clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous)))
+                // The photos he sent, over his words as the Mac shows them,
+                // from the copies the runner put up for his website (Mike,
+                // 8 Nov: a bare "[2 pictures]" looked like they'd been lost).
+                ForEach(pictures.pasted(seq: message.seq)) { image in
+                    if let url = URL(string: image.url) {
+                        ReplyPicture(url: url, alt: "", width: image.width, height: image.height, tallest: 220, alignment: .trailing)
+                    }
+                }
+                if !shownText.isEmpty {
+                    userText
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(BubbleBackground().clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous)))
+                }
                 if message.origin == "phone" {
                     PhoneMark()
                 } else if let origin = originText {
@@ -670,7 +875,7 @@ struct MessageView: View {
             .padding(.leading, 40)
         case .assistant:
             VStack(alignment: .leading, spacing: 8) {
-                MarkdownText(message.text, seq: message.seq)
+                MarkdownText(message.text, seq: message.seq, buttons: message.buttons)
                     .textSelection(.enabled)
                 ForEach(pinned) { PinnedPicture(image: $0) }
             }
@@ -700,12 +905,15 @@ struct MessageView: View {
             }
         } else {
             // Its [Picture N] markers as chips, as the Mac draws them.
-            PhotoChip.text(message.text, font: .preferredFont(forTextStyle: .body), traits: UITraitCollection { traits in
+            PhotoChip.text(shownText, font: .preferredFont(forTextStyle: .body), traits: UITraitCollection { traits in
                 traits.userInterfaceStyle = colorScheme == .dark ? .dark : .light
                 traits.displayScale = displayScale
             })
         }
     }
+
+    /// Without the "[2 pictures]" line once the photos are over it.
+    private var shownText: String { pictures.words(of: message.text, seq: message.seq) }
 
     private var originText: String? {
         switch message.origin {
@@ -840,17 +1048,43 @@ struct MarkdownText: View {
     let blocks: [MarkdownBlock]
     /// The message's seq, which says which upload a picture's address means.
     var seq: Int?
+    /// The reply buttons the message links (backend API 59). Nil: its button
+    /// links are just their titles.
+    var buttons: [MessageButton]?
     @Environment(\.threadPictures) private var pictures
     @Environment(\.threadLink) private var threadLink
 
-    init(_ text: String, seq: Int? = nil) {
+    init(_ text: String, seq: Int? = nil, buttons: [MessageButton]? = nil) {
         blocks = MarkdownBlock.parse(text)
         self.seq = seq
+        self.buttons = buttons
     }
 
-    init(blocks: [MarkdownBlock], seq: Int? = nil) {
+    init(blocks: [MarkdownBlock], seq: Int? = nil, buttons: [MessageButton]? = nil) {
         self.blocks = blocks
         self.seq = seq
+        self.buttons = buttons
+    }
+
+    /// A line's words, then the buttons it ends with as real buttons. A
+    /// button link whose id the row doesn't carry is its title, as text.
+    @ViewBuilder private func line(_ written: String) -> some View {
+        let text = ReplyButtons.unlinking(written, except: Set((buttons ?? []).map(\.id)))
+        let split = ReplyButtons.trailing(in: text)
+        if split.links.isEmpty {
+            Text(Self.inline(text))
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                if !split.text.isEmpty { Text(Self.inline(split.text)) }
+                FlowLayout(spacing: 6) {
+                    ForEach(split.links, id: \.id) { link in
+                        if let button = buttons?.first(where: { $0.id == link.id }) {
+                            ReplyButtonPill(button: button)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     var body: some View {
@@ -865,7 +1099,7 @@ struct MarkdownText: View {
     @ViewBuilder private func view(for block: MarkdownBlock) -> some View {
         switch block {
         case let .paragraph(text):
-            Text(Self.inline(text))
+            line(text)
         case let .heading(level, text):
             Text(Self.inline(text)).font(level <= 2 ? .headline : .subheadline.weight(.semibold))
         case let .listItem(text, marker, depth, task):
@@ -875,7 +1109,7 @@ struct MarkdownText: View {
                 } else {
                     Text(marker).foregroundStyle(.secondary).monospacedDigit()
                 }
-                Text(Self.inline(text))
+                line(text)
             }
             .padding(.leading, CGFloat(depth) * 18)
         case let .code(text):
@@ -889,7 +1123,7 @@ struct MarkdownText: View {
         case let .draft(draft):
             DraftBlockView(draft: draft)
         case let .quote(inner):
-            MarkdownText(blocks: inner, seq: seq)
+            MarkdownText(blocks: inner, seq: seq, buttons: buttons)
                 .foregroundStyle(.secondary)
                 .padding(.leading, 12)
                 .overlay(alignment: .leading) {
@@ -981,10 +1215,12 @@ private struct StepLine: ViewModifier {
 extension EnvironmentValues {
     /// What a tap on a link in message `seq` does, set by the open thread.
     /// Outside one, the system opens it.
-    @Entry var threadLink: @MainActor (URL, Int?) -> OpenURLAction.Result = { _, _ in .systemAction }
+    @Entry var threadLink: @MainActor (URL, Int?) -> OpenURLAction.Result = { url, _ in LinkGate.shared.decide(url) }
     @Entry var litStep: Int?
     /// Opens a thread on top of this one, so Back comes back here.
     @Entry var pushThread: @MainActor (String) -> Void = { _ in }
+    /// The open thread, whose reply buttons a tap presses. Nil outside one.
+    @Entry var buttonThreadId: String?
 }
 
 extension ThreadLinks.Hit: Identifiable {

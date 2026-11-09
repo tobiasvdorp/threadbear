@@ -20,6 +20,10 @@ export type WorktreeRecord = {
   branch: string; // "thread/<id8>"
   base: string; // main's commit when it was made
   removedAt?: string; // cleaned up when the thread was archived
+  // Archived, and the cleanup hasn't had its say yet: it waits for the CLI and
+  // turn-end hooks, so a runner stopping or crashing can come first. The next
+  // runner does it (settleLostCleanups).
+  cleanupOwed?: boolean;
   // The patch's worktree.keep: the folder is set aside for another thread
   // when this one's done with it, rather than removed (see "spares").
   keep?: string[];
@@ -165,8 +169,7 @@ async function makeWorktreeNow(opts: { cwd: string; threadId: string; patch: Wor
 
   if (keep) {
     for (const spare of await spares(mainCheckout, threads)) {
-      // Unlocking is the claim: a second unlock of the same spare fails.
-      if (!(await git(mainCheckout, ['worktree', 'unlock', spare])).ok) continue;
+      if (!(await claimSpare(spare))) continue;
       if (await reuse(spare, branch, base, keep)) return done(spare);
       // Couldn't be put right: it stays unlocked, out of the pool, for
       // someone to look at, and the thread gets a new slot.
@@ -210,6 +213,25 @@ async function spares(mainCheckout: string, threads: string): Promise<string[]> 
     .filter((c) => c.locked === SPARE && path.dirname(realpath(c.path)) === dir && isDir(c.path))
     .map((c) => c.path)
     .sort();
+}
+
+// Takes a spare out of the pool, or says another got there first. Not
+// `git worktree unlock`: two at once both read the lock, and the second
+// one's unlink finding no file still counts as success, so both took the
+// spare (Codex, 8 Nov). A rename of git's lock file is atomic, so only
+// one claimer wins; borrow-worktree.sh claims the same way.
+async function claimSpare(spare: string): Promise<boolean> {
+  const admin = await gitOut(spare, ['rev-parse', '--absolute-git-dir']);
+  if (!admin) return false;
+  const lock = path.join(admin, 'locked');
+  const claimed = `${lock}.claimed-${process.pid}-${Date.now()}`;
+  try {
+    fs.renameSync(lock, claimed);
+  } catch {
+    return false;
+  }
+  fs.rmSync(claimed, { force: true });
+  return true;
 }
 
 // A claimed spare, made like new on `branch` at `base`. The kept folders
@@ -487,12 +509,30 @@ function runCheck(command: string, cwd: string, shell = ['/bin/sh', '-c']): Prom
 
 // For `tb land` outside a thread (or in a thread without one of its own):
 // the folder's checkout, if it's on a thread/ branch, and where main is.
-export async function landTargetFromGit(cwd: string): Promise<{ target?: Omit<LandTarget, 'check'>; reason?: string }> {
+// `threadId`, when tb runs in a thread: a branch made for another thread
+// (thread/<its id8>) is refused, as that's another thread's work. On 8 Nov
+// a borrowed worktree turned out to be shared with a thread brought back,
+// and the borrower committed on that thread's branch without noticing.
+export async function landTargetFromGit(cwd: string, threadId?: string): Promise<{ target?: Omit<LandTarget, 'check'>; reason?: string }> {
   const top = await gitOut(cwd, ['rev-parse', '--show-toplevel']);
   if (!top) return { reason: `${cwd} isn't in a git checkout. Run tb land in a thread's worktree.` };
   const branch = await gitOut(top, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (branch === 'HEAD') {
+    // A worktree borrowed before borrow-worktree.sh made a branch, or one
+    // detached by hand.
+    return { reason: `${top} is detached, not on a thread/ branch. tb land runs in a thread's own worktree; to land from this one, git checkout -b thread/<name> in it first.` };
+  }
   if (!branch?.startsWith('thread/')) {
     return { reason: `${top} is on ${branch ?? 'no branch'}, not a thread/ branch. tb land runs in a thread's own worktree.` };
+  }
+  const owner = /^thread\/([0-9a-f]{8})$/.exec(branch)?.[1];
+  if (threadId && owner && owner !== threadId.slice(0, 8)) {
+    return {
+      reason:
+        `${top} is on ${branch}, thread ${owner}'s branch, not this thread's. Another thread is working in this folder, so don't commit or land here: ` +
+        `move your own commits to a branch of your own (git branch <name> <commit>), put this one back as it was, and borrow a worktree of your own. ` +
+        `To land ${branch} anyway, run THREADBEAR_THREAD_ID= tb land.`,
+    };
   }
   const mainCheckout = await mainCheckoutOf(top);
   if (!mainCheckout) return { reason: `No checkout of this repo has ${MAIN} checked out, so there's nowhere to land.` };
@@ -504,7 +544,9 @@ export async function landTargetFromGit(cwd: string): Promise<{ target?: Omit<La
 // `taken`: the folder is another checkout's now (another thread's worktree,
 // a spare or a borrowed one), so it was left alone; only this thread's
 // landed branch, if it was still there, went.
-export type Cleanup = { removed: true; spare?: boolean; taken?: boolean } | { removed: false; reason: string };
+// `branchLeft`: the folder went but its branch couldn't be deleted. Still
+// removed, as the folder can be made again for someone else (Codex, 8 Nov).
+export type Cleanup = { removed: true; spare?: boolean; taken?: boolean; branchLeft?: string } | { removed: false; reason: string };
 
 // Whether a worktree the record still has is gone: its branch has, and its
 // folder either has too ('gone') or is another checkout's now ('taken', a
@@ -548,7 +590,8 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
       if (branchThere) {
         if (!stillOurs()) return LET_GO;
         const del = await git(w.mainCheckout, ['branch', '-D', w.branch]);
-        if (!del.ok) return { removed: false, reason: `deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
+        // The folder's someone else's either way, so it counts as removed.
+        if (!del.ok) return { removed: true, taken: true, branchLeft: `deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
       }
       return { removed: true, taken: true };
     }
@@ -582,7 +625,7 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
   if (branchThere) {
     if (!stillOurs()) return LET_GO;
     const del = await git(w.mainCheckout, ['branch', '-D', w.branch]);
-    if (!del.ok) return { removed: false, reason: `the worktree went, but deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
+    if (!del.ok) return { removed: true, branchLeft: `deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
   }
   // The <repo>-threads folder, once it's empty.
   try {

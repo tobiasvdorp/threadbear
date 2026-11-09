@@ -38,14 +38,19 @@ public struct StartRequest: Sendable, Hashable, Decodable {
     public var runners: [Runner]
     /// The runner's hash of the request as read, sent back with Start it.
     public var fingerprint: String?
+    /// The folder as filed, when it would start on this Mac and isn't a
+    /// folder here (the asking agent guessed this Mac's paths). Start it
+    /// then sends it back to the agent to ask again.
+    public var missingFolder: String?
     /// Set by the app when it couldn't read the request.
     public var error: String?
 
-    public init(request: Filed, target: Runner?, runners: [Runner], fingerprint: String? = nil, error: String? = nil) {
+    public init(request: Filed, target: Runner?, runners: [Runner], fingerprint: String? = nil, missingFolder: String? = nil, error: String? = nil) {
         self.request = request
         self.target = target
         self.runners = runners
         self.fingerprint = fingerprint
+        self.missingFolder = missingFolder
         self.error = error
     }
 

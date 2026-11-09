@@ -478,6 +478,24 @@ a.video-card:hover .video-play { scale: 1.06; }
 .docs-nav a:hover { background: rgba(31, 28, 24, .05); color: var(--ink); }
 .docs-nav a[aria-current="page"] { background: var(--well); color: var(--ink); font-weight: 500; }
 .docs-nav .docs-home { font-weight: 600; color: var(--ink); }
+/* Each docs page's icon (docs-icons.json): in the list down the left, the index and the title. */
+.docs-nav a { display: flex; align-items: center; gap: var(--s-100); }
+.docs-nav .icon { font-size: 16px; color: var(--ink-faint); }
+.docs-nav a[aria-current="page"] .icon, .docs-nav a:hover .icon { color: var(--honey); }
+.doc .doc-index a { display: flex; align-items: center; gap: var(--s-100); }
+.doc-index .icon { font-size: 20px; color: var(--honey); }
+.doc-title { display: flex; align-items: center; gap: var(--s-200); }
+.doc-title-icon { flex: none; display: grid; place-items: center; width: 48px; height: 48px; border-radius: 14px; background: var(--honey-tint); color: var(--honey-d); font-size: 26px; }
+/* A picture in a docs page (docs.mjs, "picture:" comments in the guide), with its caption. */
+.docs-shot { margin: var(--s-300) 0; }
+.docs-shot img, .docs-shot video { display: block; width: 100%; height: auto; border-radius: var(--r-lg); box-shadow: 0 1px 2px rgba(31, 28, 24, .08), 0 12px 32px rgba(60, 45, 20, .14); }
+.docs-shot.phone img { width: auto; max-height: 560px; margin: 0 auto; border-radius: 28px; }
+.docs-shot.tall img { width: auto; max-height: 600px; margin: 0 auto; }
+.docs-shot.bear img { width: auto; max-height: 240px; margin: 0 auto; border-radius: 0; box-shadow: none; }
+.docs-shot figcaption { margin-top: var(--s-100); font-size: 14px; line-height: 20px; color: var(--ink-soft); text-align: center; }
+/* A video in a docs page (docs.mjs, "video:" comments in the guide). */
+.docs-video { margin: var(--s-300) 0; }
+.docs-video video { display: block; width: 100%; height: auto; border-radius: var(--r-lg); background: #1a1511; }
 .doc h3 { font-size: 18px; line-height: 28px; font-weight: 600; margin-top: var(--s-300); }
 .doc > p, .doc-intro p { font-size: 16px; line-height: 24px; color: var(--body); margin-top: var(--s-100); }
 .doc h1 + p { margin-top: var(--s-200); }

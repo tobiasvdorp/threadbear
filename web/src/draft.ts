@@ -42,31 +42,31 @@ export function draftFrom(language: string | null | undefined, code: string): Dr
 // node's position in the exact text handed to Markdown) has its closing
 // fence, the way the Mac's MarkdownRenderer isClosed checks it. The node
 // starts at the fence itself, so what's before it on its line is the
-// container (a quote's ">", a list item's indent). The closing line must
-// start with as many characters, all spaces, tabs or ">", then at most 3
-// spaces, then the opening's fence character at least as wide, then only
-// whitespace. While a reply streams, an unclosed fence runs to the end of
+// container. While a reply streams, an unclosed fence runs to the end of
 // the text, and it stays plain code until it's done, as on the Mac and the
 // phone.
 export function fenceClosed(source: string, start: number, end: number): boolean {
   const openingStart = source.lastIndexOf('\n', start - 1) + 1;
   const closingStart = source.lastIndexOf('\n', end - 1) + 1;
   if (closingStart <= start) return false;
-  const container = start - openingStart;
-  const opening = source.slice(start, source.indexOf('\n', start) < 0 ? source.length : source.indexOf('\n', start));
+  const lineEnd = source.indexOf('\n', start);
+  const opening = source.slice(start, lineEnd < 0 ? source.length : lineEnd);
   const mark = opening[0];
   if (mark !== '`' && mark !== '~') return false;
   const width = /^(`+|~+)/.exec(opening)![1]!.length;
   if (width < 3) return false;
-  // The closing line has the same container in front: the quote's markers,
-  // or as many spaces as the list item's indent.
-  const closingLine = source.slice(closingStart, end).replace(/\r$/, '');
-  const prefix = closingLine.slice(0, container);
-  if (prefix.length !== container || !/^[ \t>]*$/.test(prefix)) return false;
-  const rest = closingLine.slice(container);
-  const indent = /^ */.exec(rest)![0].length;
-  if (indent > 3) return false;
-  const fence = rest.slice(indent).trim();
+  // The closing line has the same quote markers in front, then the fence
+  // and only whitespace. How far it's indented isn't checked: a list's
+  // indent is hard to read back from here, and the worst a wrong guess does
+  // is show the box a line early.
+  const quotes = source.slice(openingStart, start).split('>').length - 1;
+  let closing = source.slice(closingStart, end);
+  for (let q = 0; q < quotes; q++) {
+    closing = closing.replace(/^[ \t]*/, '');
+    if (!closing.startsWith('>')) return false;
+    closing = closing.slice(1);
+  }
+  const fence = closing.trim();
   return fence.length >= width && [...fence].every((c) => c === mark);
 }
 

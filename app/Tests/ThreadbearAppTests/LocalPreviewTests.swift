@@ -382,4 +382,56 @@ final class LocalPreviewTests: XCTestCase {
         }
     }
 
+
+    /// A request as WebKit hands one to the scheme handler, recording what
+    /// it's answered with and on which thread.
+    private final class FakeTask: NSObject, WKURLSchemeTask {
+        let request: URLRequest
+        var status: Int?
+        var bytes = 0
+        var finished = false
+        var calls = 0
+        var offMain = false
+        init(_ url: URL) { request = URLRequest(url: url) }
+        func didReceive(_ response: URLResponse) { note(); status = (response as? HTTPURLResponse)?.statusCode }
+        func didReceive(_ data: Data) { note(); bytes += data.count }
+        func didFinish() { note(); finished = true }
+        func didFailWithError(_ error: Error) { note(); finished = true }
+        private func note() { calls += 1; if !Thread.isMainThread { offMain = true } }
+    }
+
+    /// Daybreak, 7 Nov 2026: the handler read each file, and a page or
+    /// stylesheet for what it names, on the main thread as WebKit asked.
+    /// Now it's read off it and answered on it, and a request WebKit stopped
+    /// in the meantime is never answered (WebKit throws if it is).
+    func testFilesAreReadOffTheMainThreadAndAStoppedRequestIsNotAnswered() async throws {
+        try write("index.html", Data(("<img src=\"pic.png\">" + String(repeating: "<p>x</p>", count: 400_000)).utf8))
+        try write("pic.png", png)
+        let handler = LocalPreviewSchemeHandler()
+        let readOnMain = NSLock()
+        nonisolated(unsafe) var reads: [Bool] = []
+        LocalPreviewSchemeHandler.readHook = { readOnMain.withLock { reads.append(Thread.isMainThread) } }
+        defer { LocalPreviewSchemeHandler.readHook = nil }
+        let view = WKWebView(frame: .zero)
+        let page = try XCTUnwrap(handler.address(for: dir.appendingPathComponent("index.html")))
+        let first = FakeTask(page)
+        handler.webView(view, start: first)
+        XCTAssertEqual(first.calls, 0, "answered later, not while WebKit waits on the main thread")
+        for _ in 0..<100 where !first.finished { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(first.finished)
+        XCTAssertEqual(first.status, 200)
+        XCTAssertFalse(first.offMain, "answered on the main thread")
+
+        let pic = page.deletingLastPathComponent().appendingPathComponent("pic.png")
+        let stopped = FakeTask(pic)
+        handler.webView(view, start: stopped)
+        handler.webView(view, stop: stopped)
+        let after = FakeTask(pic)
+        handler.webView(view, start: after)
+        for _ in 0..<100 where !after.finished { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(after.status, 200)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(stopped.calls, 0, "a stopped request is never answered")
+        XCTAssertEqual(readOnMain.withLock { reads }, [false, false, false], "each file read off the main thread")
+    }
 }

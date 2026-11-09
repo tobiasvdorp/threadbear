@@ -34,6 +34,9 @@
 # `tb land` runs them (MicTapTests guards a crash the phone hit twice). On
 # main itself, with nothing changed, everything runs.
 #
+# A Swift step that prints nothing for 10 minutes, or runs for an hour, is
+# killed and fails, saying which test was running and where it was stuck.
+#
 # How long the app takes depends on its build cache: under a minute when
 # app/.build is warm, 5 to 10 minutes in a folder that has never built
 # (a new worktree), as SwiftPM's cache only works where it was made. Run
@@ -159,6 +162,17 @@ step() {
   fi
 }
 
+# The Swift steps run through this, as one frozen test holds the check host
+# and so every thread's landing (scripts/limit-step.mjs says how it tells, and
+# app/Tests/ModalGuard is the quicker catch for a modal). Each test prints when
+# it starts, so 10 minutes of nothing is plenty even on a loaded machine, and a
+# build from cold takes 5 to 10 minutes in all but keeps printing.
+# NSUnbufferedIO is what makes xctest print as it goes when it isn't on a
+# terminal: without it a frozen run's log doesn't say which test.
+export NSUnbufferedIO=YES
+LIMITED=("$NODE" "$ROOT/scripts/limit-step.mjs"
+  --silence "${THREADBEAR_CHECK_SILENCE_SECS:-600}" --total "${THREADBEAR_CHECK_TOTAL_SECS:-3600}" --)
+
 # The runner's unit tests, as `npm test` runs them (runner/package.json),
 # plus a reporter that writes the files with a failure. Two files at once
 # bounds the CPU, memory and disk used by the real runners they boot,
@@ -235,11 +249,11 @@ if [ "$QUICK" = 0 ]; then
   if [ ! -d "$ROOT/app/Tools/mock-runner/node_modules" ]; then
     step "mock runner packages" "$ROOT/app/Tools/mock-runner" npm ci --no-audit --no-fund
   fi
-  step "app build" "$ROOT/app" swift build
-  step "app tests" "$ROOT/app" env THREADBEAR_REQUIRE_MOCK=1 swift test
+  step "app build" "$ROOT/app" "${LIMITED[@]}" swift build --disable-keychain
+  step "app tests" "$ROOT/app" env THREADBEAR_REQUIRE_MOCK=1 "${LIMITED[@]}" swift test --disable-keychain
   # BearDock, the window's docking panels: its layout tests.
   if needed '^dock/'; then
-    step "dock tests" "$ROOT/dock" swift test
+    step "dock tests" "$ROOT/dock" "${LIMITED[@]}" swift test --disable-keychain
   else
     skip "dock tests" "nothing in dock/ changed"
   fi
@@ -247,7 +261,7 @@ fi
 # The iPhone app's logic and source checks (ios/ThreadbearKit), on the Mac.
 # The app itself only builds with Xcode; ios/scripts/sim-shots.sh does that.
 if needed '^ios/'; then
-  step "iphone kit tests" "$ROOT/ios/ThreadbearKit" swift test
+  step "iphone kit tests" "$ROOT/ios/ThreadbearKit" "${LIMITED[@]}" swift test --disable-keychain
 else
   skip "iphone kit tests" "nothing in ios/ changed"
 fi

@@ -802,3 +802,78 @@ test("schedules a runner key can't bring up stay on this Mac, running from its o
   assert.equal(s.list().length, 1, 'nothing lost');
   s.stop();
 });
+
+// Daybreak, 6 Nov 2026 ("Schedule refresh can run a secondary runner's job on
+// the primary"): the main Mac claims its schedule; while the claim or its
+// check is out, Mike deletes it and a runner key saves a schedule of its own
+// under the same id (same check, its own words, Full access). The main Mac's
+// subscription has every runner's rows, so the new row turns up under the
+// claimed id. Nothing is sent for it: what was claimed is gone.
+async function replaceUnderClaim(b: ReturnType<typeof fakeBackend>, id: string, how: 'secondary' | 'owner') {
+  const old = structuredClone(b.rows.get(id)!);
+  delete old.claim;
+  await b.for('phone', M5.id).remove(id);
+  const evil = { ...old, title: 'ATTACKER JOB', text: 'ATTACKER INSTRUCTIONS', permissionMode: 'full' as const };
+  if (how === 'secondary') await b.for('bruce', BRUCE.id).save({ ...evil, runnerId: BRUCE.id });
+  // Mike making a new one under the old id (his own key may): a new
+  // schedule all the same, not the one claimed.
+  else await b.for('phone', M5.id).save({ ...evil, createdAt: iso(Date.parse(old.createdAt) + 1) });
+}
+
+for (const how of ['secondary', 'owner'] as const) {
+  test(`a schedule replaced under its id while its check runs isn't sent as the claimed one (${how})`, async () => {
+    const h = makeHarness();
+    const b = fakeBackend(h.clock, [M5, BRUCE]);
+    let finish: ((r: { ok: true; output: string }) => void) | undefined;
+    const s = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, zone: () => 'UTC', self: M5, syncOn: true, checksOn: () => true, runCheck: () => new Promise((r) => (finish = r)) });
+    s.start();
+    await s.attach(b.for('m5', M5.id));
+    const sc = await s.create({ text: 'Benign', title: 'BENIGN JOB', cron: '*/5 * * * *', check: 'news-check', permissionMode: 'ask' });
+    await tick();
+    h.clock.advance(5 * MIN);
+    for (let i = 0; i < 5; i++) await tick();
+    assert.ok(finish, 'its check is running, under the claim');
+    await replaceUnderClaim(b, sc.id, how);
+    for (let i = 0; i < 5; i++) await tick();
+    finish!({ ok: true, output: 'news' });
+    for (let i = 0; i < 10; i++) await tick();
+    const made = h.runner.list(['inbox', 'snoozed', 'archived']);
+    assert.equal(made.filter((t) => t.title === 'ATTACKER JOB').length, 0, 'the replacement is not sent');
+    assert.ok(!made.some((t) => h.events(t.id).some((e) => e.type === 'user.message' && /ATTACKER/.test(e.text))));
+    assert.ok(!made.some((t) => t.permissionMode === 'full' && t.schedule?.id === sc.id), 'nothing in Full access from it');
+    if (how === 'secondary') assert.equal(b.rows.get(sc.id)?.lastRun, undefined, "and nothing recorded on the other runner's row");
+    s.stop();
+  });
+
+  test(`a requested run whose schedule is replaced while the claim is out isn't sent (${how})`, async () => {
+    const h = makeHarness();
+    const b = fakeBackend(h.clock, [M5, BRUCE]);
+    const s = backendScheduler(h);
+    const real = b.for('m5', M5.id);
+    let letGo: (() => void) | undefined;
+    // The claim lands at once; only its answer is slow to come back.
+    const slow: ScheduleBackend = {
+      ...real,
+      claim: (id, kind, expect) => {
+        const landed = real.claim(id, kind, expect);
+        return kind === 'request' ? new Promise((r) => (letGo = () => void landed.then(r))) : landed;
+      },
+    };
+    await s.attach(slow);
+    const sc = await s.create({ text: 'Benign', title: 'BENIGN JOB', cron: '0 0 1 1 *', permissionMode: 'ask' });
+    await tick();
+    // Run now from another Mac: a request the M5 claims.
+    await b.for('bruce', BRUCE.id).requestRun(sc.id, iso(h.clock.now()));
+    for (let i = 0; i < 5; i++) await tick();
+    assert.ok(letGo, 'claiming the request');
+    await replaceUnderClaim(b, sc.id, how);
+    // The replacement asks for a run too, so the old request's claim could
+    // be taken for it.
+    for (let i = 0; i < 5; i++) await tick();
+    letGo!();
+    for (let i = 0; i < 10; i++) await tick();
+    const made = h.runner.list(['inbox', 'snoozed', 'archived']);
+    assert.equal(made.filter((t) => t.title === 'ATTACKER JOB' || t.title === 'BENIGN JOB').length, 0, 'nothing is sent for it');
+    s.stop();
+  });
+}

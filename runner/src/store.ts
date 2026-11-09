@@ -1,7 +1,7 @@
 import type { HighlightState } from './highlights.ts';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { WaitingForRoom, Ask, AskAnswer, NeedsWho, DesignReview, ReviewDraft, EffortLevel, MessageOrigin, PanelRequest, PermissionMode, ThreadShare, PersistedEvent, Provider, ArchivedBy, ArchiveVerdict, Subagent, ThreadProject, ThreadSchedule, ThreadStartedBy, ThreadStatus, ImageRef } from './protocol.ts';
+import type { WaitingForRoom, Ask, AskAnswer, NeedsWho, DesignReview, ReplyButton, ReviewDraft, EffortLevel, MessageOrigin, PanelRequest, PermissionMode, ThreadShare, PersistedEvent, Provider, ArchivedBy, ArchiveVerdict, Subagent, ThreadProject, ThreadSchedule, ThreadStartedBy, ThreadStatus, ImageRef, LooseEnd } from './protocol.ts';
 import { atomicWriteFileSync, readJsonSync } from './fsutil.ts';
 import { paths } from './config.ts';
 import type { WorktreeRecord } from './worktrees.ts';
@@ -50,6 +50,13 @@ export type ThreadRecord = {
   modelInUse?: string; // full id the CLI ran the last turn on
   effortInUse?: EffortLevel; // the level the CLI reported for the last turn
   permissionMode: PermissionMode;
+  // Its CLI runs in a sandbox (sandbox.ts) and must stay in one: set when it
+  // starts in a sandbox folder or a sandboxed thread's agent starts it
+  // there, and taken off only by a move Mike made or allowed. A thread with
+  // it never starts outside a sandbox, whatever its folder has become
+  // (Daybreak, 7 Nov 2026), and its agent counts as restricted
+  // (threadbear-mcp.ts, "Raising access").
+  confined?: true;
   // "Plan first": the mode approving the plan goes back to, and the plan
   // waiting for Mike (its plan.proposed itemId).
   modeBeforePlan?: PermissionMode;
@@ -91,6 +98,9 @@ export type ThreadRecord = {
   // bring a thread back needn't clear them.
   archivedBy?: ArchivedBy;
   archiveVerdict?: ArchiveVerdict;
+  // A schedule's message brought it out of the archive (Runner.sendTo), and
+  // who had archived it: a run that ends with nothing for Mike puts it back.
+  unarchivedBySchedule?: { by?: ArchivedBy };
   starredAt?: string; // Mike starred it: the Starred section, oldest star first
   preview: string;
   lastSeq: number;
@@ -101,6 +111,7 @@ export type ThreadRecord = {
   costUsd?: number;
   reviews?: DesignReview[];
   reviewDeliveries?: string[]; // review IDs whose reply reached session.send
+  buttons?: ReplyButton[]; // its reply buttons, oldest first (runner/buttons.ts)
   // Internal.
   // The version of the CLI that ran the thread's last session, so a new
   // session on another version can say so ("Codex 0.165.0 from this turn
@@ -140,6 +151,10 @@ export type ThreadRecord = {
   // The projects the native session has been told about (the brief, or a
   // line when it joined one), so it hears about each once.
   projectsTold?: string[];
+  // The hash of Mike's standing instructions the native session was last
+  // told, so it hears each change once; 'cleared' or 'rewound' (instructions.ts).
+  // Absent while it has never held any.
+  instructionsTold?: string;
   // Highlights (highlights.ts): what's been found and pinned, and the
   // event it had read up to. Brought up to date when a client asks.
   highlights?: HighlightState;
@@ -147,6 +162,8 @@ export type ThreadRecord = {
   brief?: { text: string; at: string }; // the librarian's line on where the thread is up to
   // The thread's own git worktree (worktrees.ts), once it's made.
   worktree?: WorktreeRecord;
+  // The done card's loose ends (runner/loose-ends.ts), for the card at seq.
+  looseEnds?: { seq: number; ends: LooseEnd[]; at: string };
   // Made in a repo that asks for worktrees and not told otherwise: the
   // first turn makes one (and runs its setup) before the CLI starts.
   worktreePending?: boolean;

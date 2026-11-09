@@ -405,6 +405,26 @@ import UniformTypeIdentifiers
         #expect(Pairing.parse(pairing.link) == pairing)
     }
 
+    /// A self-hosted backend on the tailnet (docs/self-hosting.md): its port
+    /// is kept, and anything else in the URL turns the link down.
+    @Test func pairsWithATailnetBackend() throws {
+        let url = URL(string: "threadbear://pair?url=https%3A%2F%2FMac.tail9ef766.ts.net%3A3210&token=tb_abc")!
+        let pairing = try #require(Pairing.parse(url))
+        #expect(pairing.deploymentURL.absoluteString == "https://mac.tail9ef766.ts.net:3210")
+        #expect(Pairing.parse(pairing.link) == pairing)
+        for bad in ["http://mac.tail9ef766.ts.net:3210", "https://user@mac.tail9ef766.ts.net:3210", "https://mac.tail9ef766.ts.net:3210/api", "https://mac.tail9ef766.ts.net:3210?x=1", "https://ts.net", "https://evil.ts.net.example.com", "https://tail9ef766.ts.net"] {
+            let link = URL(string: "threadbear://pair?url=\(bad.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!)&token=t")!
+            #expect(Pairing.parse(link) == nil, "\(bad)")
+        }
+    }
+
+    /// An older backend leaves pushOff out, and that means it can send.
+    @Test func onlyABackendThatSaysSoCantNotify() {
+        #expect(PhoneIdentity(name: "p", expiresAt: nil).sendsNotifications)
+        #expect(PhoneIdentity(name: "p", expiresAt: nil, pushOff: false).sendsNotifications)
+        #expect(!PhoneIdentity(name: "p", expiresAt: nil, pushOff: true).sendsNotifications)
+    }
+
     @Test func siteURLBecomesCloud() throws {
         let url = URL(string: "threadbear://pair?url=https://happy-bear-123.convex.site&token=t")!
         #expect(try #require(Pairing.parse(url)).deploymentURL.host() == "happy-bear-123.convex.cloud")
@@ -435,7 +455,13 @@ import UniformTypeIdentifiers
     @Test(.timeLimit(.minutes(1))) func sendRunsATurnAndReplies() async throws {
         let backend = FakeBackend(turnDelay: .milliseconds(10))
         _ = try await backend.send(threadId: "a3", text: "thanks")
-        let detail = try #require(try await backend.thread("a3").first { $0?.thread.status == .idle } ?? nil)
+        try await eventually {
+            var it = backend.thread("a3").makeAsyncIterator()
+            guard let d = try await it.next() ?? nil else { return false }
+            return d.messages.suffix(2).map(\.role) == [.user, .assistant] && d.thread.status == .idle
+        }
+        var iterator = backend.thread("a3").makeAsyncIterator()
+        let detail = try #require(try await iterator.next() ?? nil)
         #expect(detail.messages.suffix(2).map(\.role) == [.user, .assistant])
         #expect(detail.thread.status == .idle)
         #expect(detail.thread.unread)
@@ -447,7 +473,7 @@ import UniformTypeIdentifiers
     @Test func sampleDataHasNothingPersonal() throws {
         let sample = FakeBackend.sample(now: .now)
         let encoder = JSONEncoder()
-        let text = (String(decoding: try encoder.encode(sample.threads), as: UTF8.self)
+        let text = (String(decoding: try encoder.encode(sample.threads + FakeBackend.manyThreads(now: .now)), as: UTF8.self)
             + String(decoding: try encoder.encode(sample.messages), as: UTF8.self)
             + String(decoding: try encoder.encode(FakeBackend.sampleProjects), as: UTF8.self)).lowercased()
         for word in ["poddle", "walkies", "quick ask", "stash it", "cannvas", "bruce", "tinker", "backblaze",
@@ -533,7 +559,12 @@ struct FailingTransport: ConvexTransport {
     @Test(.timeLimit(.minutes(1))) func fakeLoadEarlierPrependsOlderMessages() async throws {
         let backend = FakeBackend(turnDelay: .milliseconds(20))
         _ = try await backend.loadEarlier(threadId: "a3", beforeSeq: 120)
-        let detail = try #require(try await backend.thread("a3").first { $0?.messages.first?.seq == 70 } ?? nil)
+        try await eventually {
+            var it = backend.thread("a3").makeAsyncIterator()
+            return try await it.next()??.messages.first?.seq == 70
+        }
+        var iterator = backend.thread("a3").makeAsyncIterator()
+        let detail = try #require(try await iterator.next() ?? nil)
         #expect(detail.messages.first?.seq == 70)
         #expect(detail.messages.map(\.seq) == detail.messages.map(\.seq).sorted())
         #expect(detail.thread.hasEarlier(than: detail.messages.first?.seq))

@@ -24,6 +24,7 @@ export type Highlight = {
   path?: string;
   how: HighlightHow;
   note?: string;
+  // No longer set (pin's show is a panel request now); older records keep it.
   show?: true;
   sha?: string;
   branch?: string;
@@ -168,7 +169,6 @@ export function upsert(state: HighlightState, h: Highlight): boolean {
   if (h.how === 'pinned') {
     old.how = 'pinned';
     if (h.note) old.note = h.note;
-    if (h.show) old.show = true;
     // A pin names it as the agent wants it called.
     if (h.title) old.title = h.title;
     old.seq = h.seq;
@@ -212,7 +212,6 @@ export function pinItem(target: { path?: string; url?: string; title?: string; n
   const h: Highlight = { ...base, how: 'pinned', seq, lastSeq: seq, at };
   if (target.title?.trim()) h.title = target.title.trim().slice(0, 200);
   if (target.note?.trim()) h.note = target.note.trim().slice(0, 500);
-  if (target.show) h.show = true;
   return h;
 }
 

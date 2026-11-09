@@ -8,6 +8,7 @@
 import type { Hunk, PersistedEvent } from './protocol.ts';
 import { scrubEveryString } from './redaction.ts';
 import { outputOfJob, withholdPath, withholdReason } from './withhold.ts';
+import { safeEnd } from './safe-cut.ts';
 
 // The most of each that goes up. Larger than almost anything real: on 5 Nov the
 // biggest input in 120 threads was 18 KB, and a result is already cut at 64 KB.
@@ -195,7 +196,7 @@ export class BodyCollector {
       case 'reasoning': {
         if (!e.text) return [];
         if (!t.reasoning) t.reasoning = { seq: e.seq, text: '' };
-        if (t.reasoning.text.length < REASONING_HELD_CHARS) t.reasoning.text += (t.reasoning.text ? '\n\n' : '') + e.text.slice(0, REASONING_HELD_CHARS);
+        if (t.reasoning.text.length < REASONING_HELD_CHARS) t.reasoning.text += (t.reasoning.text ? '\n\n' : '') + e.text.slice(0, safeEnd(e.text, REASONING_HELD_CHARS));
         return [];
       }
       case 'tool.call': {
@@ -237,7 +238,7 @@ export class BodyCollector {
             t.safeJobs.add(id);
           }
         }
-        return [this.finish(threadId, o, { text: (e.text ?? '').slice(0, RAW_TEXT_CHARS), ok: e.ok !== false, truncated: e.truncated === true, images: e.images?.length ?? 0 })];
+        return [this.finish(threadId, o, { text: (e.text ?? '').slice(0, safeEnd(e.text ?? '', RAW_TEXT_CHARS)), ok: e.ok !== false, truncated: e.truncated === true, images: e.images?.length ?? 0 })];
       }
       case 'assistant.text': {
         // What it thought just before saying this, with no tool to go with.

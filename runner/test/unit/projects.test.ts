@@ -290,6 +290,23 @@ test('a session hears about a project once: a live one at its next message, a fr
   assert.doesNotMatch(h.adapter.last.sent.at(-1)!.text, /Threadbear project/);
 });
 
+test("New Thread on a project's page: the thread starts in the project, pinned, and its first session has the brief", async () => {
+  const { h, repo, projects } = setup();
+  const app = repo('dev/app');
+  const p = projects.create({ title: 'Poddle', folders: [app], goals: 'A podcast player for Mike', by: 'mike' });
+  const { thread } = h.runner.create({ text: 'Start on the player', cwd: app, accountId: 'claude-3', projectIds: [p.id] });
+  assert.deepEqual(thread.projects?.map((m) => [m.title, m.pinned]), [['Poddle', true]]);
+  checkSummary(thread);
+  assert.deepEqual(projects.get(p.id).threadIds, [thread.id]);
+  await tick();
+  assert.match(h.adapter.last.opts.instructions ?? '', /## Poddle \(p_[0-9a-f]+\)\nFolders: ~\/dev\/app\nGoals: A podcast player for Mike/);
+  assert.equal(h.adapter.last.sent.at(-1)!.text, 'Start on the player');
+  // A project that isn't there makes no thread at all.
+  const before = h.runner.list().length;
+  assert.throws(() => h.runner.create({ text: 'x', cwd: app, accountId: 'claude-3', projectIds: ['p_nope'] }));
+  assert.equal(h.runner.list().length, before);
+});
+
 test('the brief stays short however many projects there are', () => {
   const { projects, create, h } = setup();
   const { thread } = create();
@@ -646,6 +663,13 @@ test('the librarian keeps its line on where the thread is up to as the thread\'s
 test('a quiet catch-up is skipped with no model call, and what it said counts towards the next', async () => {
   const s = setup({ models: () => reply({ projects: [], why: 'A one-off' }) });
   const { h, create, finish, librarian, asked } = s;
+  // From local noon: the day's counts roll over at local midnight, and the
+  // fake clock's 12:00 UTC start is 23:00 in Sydney, an hour from it.
+  const noon = new Date(h.clock.now());
+  noon.setHours(12, 0, 0, 0);
+  if (noon.getTime() < h.clock.now()) noon.setDate(noon.getDate() + 1);
+  h.clock.advance(noon.getTime() - h.clock.now());
+  await tick(8);
   const { thread } = create('Work on the app');
   h.clock.advance(FIRST_MESSAGE_MS);
   await tick(8);

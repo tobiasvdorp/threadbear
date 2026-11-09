@@ -58,9 +58,11 @@ import { LIMITS } from './protocol.ts';
 import { imageRefFor } from './media.ts';
 import { FolderCache } from './folder-cache.ts';
 import { hasLineBreak, stripEnvComment } from './linear-text.ts';
-import { automaticCommand, liveCommandProblem, TRUST_ALL, unhashedFiles, worktreeOf, type PatchGate } from './patch-trust.ts';
+import { actionCommandProblem, automaticCommand, liveCommandProblem, TRUST_ALL, worktreeOf, type PatchGate } from './patch-trust.ts';
 import { verifiedUrl } from './verified-imports.ts';
 import { inBackground } from './background.ts';
+import { CUT_LOOKAHEAD, safeEnd, safeEndOfPartial } from './safe-cut.ts';
+import { groupAlive, killGroup } from './proc.ts';
 
 export const CONVEX_DASHBOARD = 'https://dashboard.convex.dev';
 // `npx convex dev` on an anonymous (no account) deployment serves the
@@ -204,7 +206,7 @@ function placeTool(loaded: LoadedPatch, cwd: string, home: string, roots: Projec
 // thread in a worktree, a project folder in that repo's main checkout is
 // read from the worktree's copy: the main checkout is the same repo on
 // another branch, and loading both showed every chip twice (30 Oct).
-function projectRoots(cwd: string, projectFolders: ProjectFolder[]): ProjectFolder[] {
+export function projectRoots(cwd: string, projectFolders: ProjectFolder[]): ProjectFolder[] {
   const own = path.resolve(cwd);
   const worktree = projectFolders.length > 0 ? worktreeOf(own) : undefined;
   const out: ProjectFolder[] = [];
@@ -434,11 +436,47 @@ export function automaticTrust(run: string): { file: string; hash: string } | un
 type LiveBinding = { folder: string; files: string[]; blocked?: Record<string, string>; hash: string; tool: boolean };
 const liveBindings = new Map<string, LiveBinding>();
 
+// The patch version a trusted-by-hash patch's command action was approved
+// by. On the action itself, as an action outlives its patch's next look (a
+// thread's patch set is cached), and that look can drop what's kept by file.
+// A symbol, as this is the runner's and not the protocol's: copying an
+// action keeps it (`{...a}`), and JSON leaves it out. runAction refuses a
+// project patch's command without one (actionRunProblem).
+const ACTION_TRUST = Symbol('actionTrust');
+type BoundAction = Action & { [ACTION_TRUST]?: { file: string; hash: string } };
+
+// Why an action of a trusted-by-hash patch mustn't run now, or undefined
+// when it may: what the hash covered may have changed since the patch was
+// last looked at, and an action runs from the folder, not from the bytes
+// that were hashed, so the patch is hashed afresh as the action starts, as
+// for a hook (Daybreak, 7 Nov). `loadsUnhashed`: whether this patch runs
+// whatever it holds (home's, Threadbear's own), which has no hash to check.
+export function actionRunProblem(action: Action, info: PatchInfo | undefined, verify: (file: string, hash: string) => boolean, loadsUnhashed: (patchesDir: string) => boolean): string | undefined {
+  if (action.kind !== 'command') return undefined;
+  const by = (action as BoundAction)[ACTION_TRUST];
+  if (!by) {
+    const open = !info?.file || info.source !== 'project' || loadsUnhashed(path.dirname(info.file));
+    return open ? undefined : "patch trust has no version of its patch to check it against.";
+  }
+  const bound = liveBindings.get(by.file);
+  if (!bound || bound.hash !== by.hash || !verify(by.file, by.hash)) return 'its patch, or a file it runs, changed since it was trusted.';
+  // A tool patch runs in the folder it applies in, and is checked from both,
+  // as a live command is (liveSh).
+  const command = action.command ?? '';
+  for (const dir of new Set([action.folder ?? bound.folder, bound.folder])) {
+    const problem = actionCommandProblem(command, dir, bound.files, bound.blocked);
+    if (problem) return problem;
+  }
+  return undefined;
+}
+
 // A trusted-by-hash patch's commands that run by themselves (its hooks and
 // worktree setup) as they'll run: each must be one hashed script and plain
 // words (automaticCommand), or the whole patch is refused with why, as a
 // patch whose code can't all be checked is. A copy, as `loaded` is cached.
-// Actions aren't held to it: one runs only when it's pressed.
+// Actions aren't held to it, as one runs only when it's pressed, but what
+// each runs must be followable and hashed (actionCommandProblem), checked
+// again when it's pressed (actionRunProblem).
 function bindAutomatic(loaded: LoadedPatch, file: string, files: string[], blocked?: Record<string, string>, hash?: string): LoadedPatch {
   liveBindings.delete(file);
   if (loaded.info.error) return loaded;
@@ -458,16 +496,15 @@ function bindAutomatic(loaded: LoadedPatch, file: string, files: string[], block
     hooks.push({ ...hook, exec: note(bound.run) });
   }
   // Actions run from the folder holding .threadbear/, where their commands
-  // were followed for the hash from, and one worked out in code mustn't
-  // reach a file the hash didn't cover.
-  const actions: Action[] = [];
+  // were followed for the hash from. One whose command reaches a file the
+  // hash didn't cover (it's worked out in code), or that can't be followed
+  // all the way, can't be vouched for, so it refuses the patch as a hook does.
+  const actions: BoundAction[] = [];
   for (const action of loaded.actions) {
     if (action.kind === 'command' && action.command) {
-      const missed = unhashedFiles(action.command, folder, [file, ...files]);
-      if (missed.length) {
-        return refuse(`action "${action.title}"`, `runs ${missed[0]}, which patch trust didn't hash: write the command in the patch as plain text, so trusting the patch covers what it runs.`);
-      }
-      actions.push({ ...action, folder: action.folder ?? fs.realpathSync(folder) });
+      const problem = actionCommandProblem(action.command, folder, [file, fs.realpathSync(file), ...files], blocked);
+      if (problem) return refuse(`action "${action.title}"`, problem);
+      actions.push({ ...action, folder: action.folder ?? fs.realpathSync(folder), ...(hash ? { [ACTION_TRUST]: { file, hash } } : {}) });
     } else actions.push(action);
   }
   let worktree = loaded.worktree;
@@ -504,18 +541,18 @@ export function readPatchModule(id: string, source: 'home' | 'project', file: st
     }
     appliesTo = list.map((g: string) => g.trim());
   }
-  // The when, badge and summary functions of the file's actions and panels,
-  // kept aside (see liveFunctions) once the whole file has passed. Only
-  // panels have a summary.
+  // The when, badge, label and summary functions of the file's actions and
+  // panels, kept aside (see liveFunctions) once the whole file has passed.
+  // Only actions have a label and only panels a summary.
   const live: [string, LiveFunctions][] = [];
-  const liveOf = (kind: string, i: number, title: string, raw: { when?: unknown; badge?: unknown; summary?: unknown }, itemId: string): string | undefined => {
+  const liveOf = (kind: string, i: number, title: string, raw: { when?: unknown; badge?: unknown; label?: unknown; summary?: unknown }, itemId: string): string | undefined => {
     const fns: LiveFunctions = {};
-    for (const key of kind === 'panels' ? (['when', 'badge', 'summary'] as const) : (['when', 'badge'] as const)) {
+    for (const key of kind === 'panels' ? (['when', 'badge', 'summary'] as const) : (['when', 'badge', 'label'] as const)) {
       if (raw[key] === undefined) continue;
       if (typeof raw[key] !== 'function') return `${kind}[${i}] ("${title}") has a ${key} that isn't a function.`;
       fns[key] = raw[key] as LiveFunction;
     }
-    if (fns.when || fns.badge || fns.summary) live.push([itemId.slice(id.length), fns]);
+    if (fns.when || fns.badge || fns.label || fns.summary) live.push([itemId.slice(id.length), fns]);
     return undefined;
   };
   let worktree: WorktreeConfig | undefined;
@@ -543,7 +580,7 @@ export function readPatchModule(id: string, source: 'home' | 'project', file: st
   if (v.actions !== undefined) {
     if (!Array.isArray(v.actions)) return problem('actions should be an array.');
     for (const [i, raw] of v.actions.entries()) {
-      const a = raw as { title?: unknown; run?: unknown; prompt?: unknown; url?: unknown; note?: unknown; icon?: unknown; when?: unknown; badge?: unknown };
+      const a = raw as { title?: unknown; run?: unknown; prompt?: unknown; url?: unknown; note?: unknown; icon?: unknown; when?: unknown; badge?: unknown; label?: unknown };
       if (!a || typeof a !== 'object' || typeof a.title !== 'string' || !a.title.trim()) return problem(`actions[${i}] needs a title.`);
       const run = typeof a.run === 'string' && a.run.trim() ? a.run : undefined;
       const prompt = typeof a.prompt === 'string' && a.prompt.trim() ? a.prompt : undefined;
@@ -1023,7 +1060,7 @@ export async function renderListPanel(
 // ------------------------------------------------------------ live state
 
 type LiveFunction = (ctx: ItemsContext) => unknown;
-type LiveFunctions = { when?: LiveFunction; badge?: LiveFunction; summary?: LiveFunction };
+type LiveFunctions = { when?: LiveFunction; badge?: LiveFunction; label?: LiveFunction; summary?: LiveFunction };
 
 // The when and badge functions of loaded patch files' actions and panels,
 // keyed like listFunctions. Kept off the items, which go over the wire.
@@ -1085,16 +1122,18 @@ export async function applyLive(set: PatchSet, ctx: LiveContext): Promise<PatchS
       shIn.close();
     }
   };
-  const settle = async <T extends { id: string; patch: string; badge?: number; summary?: string }>(item: T): Promise<T | undefined> => {
+  const settle = async <T extends { id: string; patch: string; title: string; badge?: number; summary?: string }>(item: T): Promise<T | undefined> => {
     const fns = liveFor(set, item);
     if (!fns) return item;
-    const [shown, badge, summary] = await Promise.all([
+    const [shown, badge, label, summary] = await Promise.all([
       fns.when ? call(item.patch, fns.when).then((v) => Boolean(v), () => false) : true,
       fns.badge ? call(item.patch, fns.badge).then(badgeCount, () => undefined) : undefined,
+      fns.label ? call(item.patch, fns.label).then(labelText, () => undefined) : undefined,
       fns.summary ? call(item.patch, fns.summary).then(summaryText, () => undefined) : undefined,
     ]);
     if (!shown) return undefined;
     const out = { ...item };
+    if (label !== undefined) out.title = label;
     delete out.badge;
     delete out.summary;
     if (badge !== undefined) out.badge = badge;
@@ -1120,6 +1159,14 @@ function summaryText(v: unknown): string | undefined {
     .filter(Boolean)
     .slice(0, SUMMARY_LINES);
   return lines.length ? lines.join('\n') : undefined;
+}
+
+// A label function's answer as the chip's title for now: a string, or
+// nothing to keep the title the patch gave.
+function labelText(v: unknown): string | undefined {
+  // One line: a chip is one line tall, and newlines would stack it.
+  const s = typeof v === 'string' ? v.replace(/\s+/g, ' ').trim() : '';
+  return s ? s.slice(0, 60).trim() : undefined;
 }
 
 // A badge function's answer as a count: a number, a numeric string or a
@@ -1187,6 +1234,9 @@ export type CommandOutcome = { ok: boolean; exitCode?: number; text: string; tru
 // How long a command action may run. Long enough for a test suite, short
 // enough that a dev server started by mistake doesn't hold on for ever.
 export const ACTION_TIMEOUT_MS = 10 * 60_000;
+// How long what a live command left running gets after SIGTERM before
+// SIGKILL (runCommand's `killGroup`).
+export const KILL_GRACE_MS = 2000;
 
 // Runs a command action's command in the thread's folder through a login
 // shell (so Mike's PATH, nvm and the like apply, as in a terminal), with the
@@ -1196,7 +1246,13 @@ export function runCommand(
   command: string,
   // `background`: builds and tests (a worktree's setup, turn hooks) run at
   // background priority (background.ts). Buttons Mike presses don't.
-  opts: { cwd: string; env: Record<string, string | undefined>; shell?: string[]; timeoutMs?: number; background?: boolean },
+  // `killGroup`: when the shell exits (or times out), end what it left
+  // running too: SIGTERM to its whole process group, then SIGKILL to
+  // whatever's still there after `killGraceMs`, so a live command's `&`
+  // can't outlive it (shell-allowlist.ts). A program that leaves the group
+  // (setsid, setpgid, a daemon that forks away) isn't reached; none on the
+  // live list does.
+  opts: { cwd: string; env: Record<string, string | undefined>; shell?: string[]; timeoutMs?: number; background?: boolean; killGroup?: boolean; killGraceMs?: number },
 ): Promise<CommandOutcome> {
   const started = Date.now();
   const [shellBin, ...shellArgs] = opts.shell ?? loginShell();
@@ -1205,7 +1261,10 @@ export function runCommand(
     const chunks: Buffer[] = [];
     let size = 0;
     let truncated = false;
-    const limit = LIMITS.toolResultText;
+    // A little past the limit is read, so the cut back to it can be placed
+    // where no secret is split (safe-cut.ts): what's kept goes to Convex in a
+    // hook's message.
+    const limit = LIMITS.toolResultText + CUT_LOOKAHEAD;
     const take = (chunk: Buffer) => {
       if (size >= limit) {
         truncated = true;
@@ -1230,8 +1289,36 @@ export function runCommand(
     }
     const timeoutMs = opts.timeoutMs ?? ACTION_TIMEOUT_MS;
     let timedOut = false;
+    let ending = false;
+    // SIGTERM to the group, then SIGKILL once the grace is up if any of it
+    // is still there (checked as it goes, so a group that's gone isn't
+    // signalled again).
+    const endGroup = () => {
+      if (ending) return;
+      ending = true;
+      const pgid = child.pid!;
+      // A program that left the group can hold our pipes open for as long
+      // as it lives, and the command's answer would wait on it.
+      const letGo = () => {
+        setTimeout(() => {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }, 500).unref();
+      };
+      if (!killGroup(pgid, 'SIGTERM')) return letGo();
+      const deadline = Date.now() + (opts.killGraceMs ?? KILL_GRACE_MS);
+      const tick = setInterval(() => {
+        const alive = groupAlive(pgid);
+        if (alive && Date.now() < deadline) return;
+        clearInterval(tick);
+        if (alive) killGroup(pgid, 'SIGKILL');
+        letGo();
+      }, 50);
+      tick.unref();
+    };
     const timer = setTimeout(() => {
       timedOut = true;
+      if (opts.killGroup) return endGroup();
       // The whole process group: a shell's children too.
       try {
         process.kill(-child.pid!, 'SIGTERM');
@@ -1244,6 +1331,14 @@ export function runCommand(
     const finish = (code: number | null, error?: string) => {
       clearTimeout(timer);
       let text = Buffer.concat(chunks).toString('utf8');
+      // What fits in the limit, cut where no secret is split; stopped reading
+      // part way, never in the run reading stopped in either (safe-cut.ts).
+      const fits = Buffer.byteLength(text, 'utf8') > LIMITS.toolResultText ? Buffer.from(text, 'utf8').subarray(0, LIMITS.toolResultText).toString('utf8').replace(/\uFFFD$/, '').length : text.length;
+      if (truncated) text = text.slice(0, safeEndOfPartial(text, fits));
+      else if (fits < text.length) {
+        truncated = true;
+        text = text.slice(0, safeEnd(text, fits));
+      }
       if (error) text = text ? `${text}\n${error}` : error;
       if (timedOut) {
         const seconds = timeoutMs >= 10_000 ? String(Math.round(timeoutMs / 1000)) : String(timeoutMs / 1000);
@@ -1259,6 +1354,7 @@ export function runCommand(
       });
     };
     child.on('error', (e) => finish(null, e.message));
+    if (opts.killGroup) child.on('exit', endGroup);
     child.on('close', (code) => finish(code));
   });
 }

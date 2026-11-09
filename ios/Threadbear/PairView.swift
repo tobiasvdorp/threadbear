@@ -84,7 +84,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("Paired with") {
-                LabeledContent("Server", value: model.pairing?.deploymentURL.host() ?? (model.isFake ? "Sample data" : "None"))
+                LabeledContent("Server", value: model.pairing.map { Pairing.serverName($0.deploymentURL) } ?? (model.isFake ? "Sample data" : "None"))
                 if let identity {
                     LabeledContent("Phone", value: identity.name)
                     if let expires = identity.expiresAt {
@@ -109,7 +109,15 @@ struct SettingsView: View {
                     Text("New threads start on the first one that's online.")
                 }
             }
-            if model.canChooseNotifications {
+            if identity?.pushOff == true {
+                // A self-hosted backend: the push relay only reaches Convex
+                // cloud, so say why nothing comes rather than offer a picker
+                // that does nothing (docs/self-hosting.md).
+                Section("Notifications") {
+                    Label("Your Threadbear backend is self-hosted, so it can't send notifications. Open the app to see what needs you.", systemImage: "bell.slash")
+                        .foregroundStyle(.secondary)
+                }
+            } else if model.canChooseNotifications {
                 Section("Notify me") {
                     Picker("Notify me", selection: Binding(get: { model.notifyMode }, set: { model.setNotifyMode($0) })) {
                         ForEach(NotifyMode.allCases, id: \.self) { Text($0.label).tag($0) }

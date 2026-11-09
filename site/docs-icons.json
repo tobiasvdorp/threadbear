@@ -1,0 +1,23 @@
+{
+  "threads": "chats-circle",
+  "full-access": "shield-check",
+  "first-thread": "paper-plane-tilt",
+  "hibernate-and-archive": "archive",
+  "panels": "columns",
+  "highlights": "push-pin",
+  "projects": "stack",
+  "librarian": "books",
+  "schedules": "clock",
+  "accounts": "users-three",
+  "keyboard": "keyboard",
+  "experiments": "flask",
+  "connectors": "plugs-connected",
+  "macos-prompts": "warning-circle",
+  "phone-and-browser": "device-mobile",
+  "self-hosting": "hard-drives",
+  "patches": "bandaids",
+  "changing-threadbear": "wrench",
+  "privacy": "lock",
+  "getting-help": "lifebuoy",
+  "finish-setting-up": "compass"
+}

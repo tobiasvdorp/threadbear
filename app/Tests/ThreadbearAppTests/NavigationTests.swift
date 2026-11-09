@@ -52,6 +52,29 @@ final class NavigationTests: XCTestCase {
         XCTAssertFalse(app.canGoForward)
     }
 
+    /// A thread started from the new-thread screen takes that screen's
+    /// place, so Back goes to the thread before it, not the empty composer.
+    func testStartedThreadReplacesTheNewThreadScreen() async {
+        let app = app()
+        app.select("a")
+        await settle()
+        app.newThread()
+        await settle()
+        XCTAssertTrue(app.place.isNewThreadScreen)
+        app.showStartedThread("c")
+        await settle()
+        XCTAssertEqual(app.history.entries.map(\.threadId), ["a", "c"])
+        app.goBack()
+        XCTAssertEqual(app.place, NavigationPlace(mode: .inbox, threadId: "a"))
+        app.goForward()
+        XCTAssertEqual(app.selection, "c")
+
+        // Somewhere else by the time it's made, it's just a step on.
+        app.showStartedThread("b")
+        await settle()
+        XCTAssertEqual(app.history.entries.map(\.threadId), ["a", "c", "b"])
+    }
+
     /// Projects opens the page of cards; a card, a thread, or another view
     /// closes it, and Back comes back to it.
     func testProjectsOpensItsPageOfCards() async {
@@ -250,5 +273,24 @@ final class NavigationTests: XCTestCase {
         app.threads["b"] = nil
         app.goBack()
         XCTAssertEqual(app.selection, "a")
+    }
+
+    /// A swipe's card names where it goes: the thread and its place line,
+    /// or the page.
+    func testASwipesCardNamesWhereItGoes() async {
+        let app = app()
+        app.select("a")
+        await settle()
+        app.showProjects()
+        await settle()
+        app.select("b")
+        await settle()
+        XCTAssertEqual(app.destination(back: true)?.title, "Projects")
+        XCTAssertNil(app.destination(back: false))
+        app.goBack()
+        XCTAssertEqual(app.destination(back: true)?.title, "a")
+        XCTAssertEqual(app.destination(back: false)?.title, "b")
+        app.threads["a"] = nil
+        XCTAssertNil(app.destination(back: true), "a deleted thread is skipped")
     }
 }

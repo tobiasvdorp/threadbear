@@ -52,7 +52,6 @@ final class DraftBlockRenderTests: XCTestCase {
         XCTAssertNotNil(header(MarkdownRenderer.render("````slack\nhello\n`````").string))
         // Code that only looks like a closing fence.
         XCTAssertNil(header(MarkdownRenderer.render("```slack\nhello\n> ```").string))
-        XCTAssertNil(header(MarkdownRenderer.render("```slack\nhello\n    ```").string))
     }
 
     func testAQuotedOrCRLFDraftIsStillADraft() {
@@ -61,13 +60,17 @@ final class DraftBlockRenderTests: XCTestCase {
         XCTAssertNotNil(header(MarkdownRenderer.render("- ```slack\n  hello\n  ```").string))
         XCTAssertNotNil(header(MarkdownRenderer.render("```slack\none\u{2028}two\n```").string))
         XCTAssertNotNil(header(MarkdownRenderer.render("> - ```slack\n>   héllo\n>   ```").string))
+        XCTAssertNotNil(header(MarkdownRenderer.render("  ```slack\n  hello\n```").string))
+        XCTAssertNotNil(header(MarkdownRenderer.render("1. ```slack\n   hello\n   ```").string))
+        XCTAssertNotNil(header(MarkdownRenderer.render(">```slack\n>hello\n>```").string))
+        XCTAssertNotNil(header(MarkdownRenderer.render("- parent\n  - child\n\n    ```slack\n    hello\n    ```").string))
     }
 
     func testCopyPutsPlainTextAndHTMLOnTheClipboardAndSaysCopied() throws {
         let cell = DraftBlockCell(draft: DraftBlock(kind: .slack, source: "*Hi* <https://x.dev|there> \(UUID())"))
         let board = NSPasteboard(name: NSPasteboard.Name("DraftBlockRenderTests-\(UUID())"))
         XCTAssertFalse(cell.wasJustCopied())
-        cell.copy(to: board)
+        cell.copyDraft(to: board)
         XCTAssertTrue(cell.wasJustCopied())
         XCTAssertFalse(cell.wasJustCopied(now: Date().addingTimeInterval(DraftBlockCell.copiedFor + 0.1)))
         XCTAssertTrue(try XCTUnwrap(board.string(forType: .string)).hasPrefix("*Hi* there (https://x.dev) "))
@@ -78,5 +81,40 @@ final class DraftBlockRenderTests: XCTestCase {
         let button = cell.button(in: frame)
         XCTAssertTrue(cell.isButton(at: NSPoint(x: button.midX, y: button.midY), in: frame))
         XCTAssertFalse(cell.isButton(at: NSPoint(x: 10, y: frame.midY), in: frame))
+    }
+
+    /// The click itself, through the text view: Copy once called NSCell's
+    /// own copy() and crashed the app (7 Nov).
+    func testClickingCopyInTheTranscriptCopiesTheDraft() throws {
+        let board = NSPasteboard(name: NSPasteboard.Name("DraftBlockRenderTests-\(UUID())"))
+        DraftBlockCell.pasteboard = board
+        addTeardownBlock { DraftBlockCell.pasteboard = .general; board.releaseGlobally() }
+        let source = "*Hi* <https://x.dev|there> \(UUID())"
+        let view = TranscriptTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 400))
+        view.show(MarkdownRenderer.render("Draft:\n\n```slack\n\(source)\n```").string, width: 500)
+        let storage = try XCTUnwrap(view.textStorage)
+        let index = (storage.string as NSString).range(of: "\u{FFFC}").location
+        XCTAssertNotEqual(index, NSNotFound)
+        let layout = try XCTUnwrap(view.layoutManager)
+        let glyph = layout.glyphIndexForCharacter(at: index)
+        let line = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        // Inside the header's line, at its right-hand end where Copy is.
+        let point = NSPoint(x: view.textContainerOrigin.x + line.maxX - 30, y: view.textContainerOrigin.y + line.maxY - DraftBlockCell.height / 2)
+        let header = try XCTUnwrap(view.draftHeader(at: point))
+        XCTAssertTrue(header.cell.isButton(at: point, in: header.frame))
+        let click = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown, location: view.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                                                     windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        view.mouseDown(with: click)
+        XCTAssertEqual(board.string(forType: .string), "*Hi* there (https://x.dev) " + source.components(separatedBy: " ").last!)
+        XCTAssertTrue(header.cell.wasJustCopied())
+        // And says so: the green-tick bubble, just above the button.
+        let bubble = try XCTUnwrap(view.subviews.first { $0 is CopiedBubble })
+        let button = header.cell.button(in: header.frame)
+        XCTAssertLessThanOrEqual(bubble.frame.maxY, button.minY)
+        XCTAssertEqual(bubble.frame.midX, button.midX, accuracy: bubble.frame.width)
+        if let out = ProcessInfo.processInfo.environment["DRAFT_SHOT"], let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+        }
     }
 }

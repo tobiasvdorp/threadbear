@@ -26,6 +26,11 @@ extension AppModel {
     func receive(remote: RemoteThreads) {
         remoteIndex = remote
         if remoteRunners != remote.runners { remoteRunners = remote.runners }
+        if let pending = pendingRunnerOrder {
+            if remote.order == pending { pendingRunnerOrder = nil }
+        } else if runnerOrder != remote.order {
+            runnerOrder = remote.order
+        }
         applyRemoteIndex()
         applyDefaultRunner()
     }
@@ -47,6 +52,7 @@ extension AppModel {
         let gone = next.values.filter { $0.isRemote && !listed.contains($0.id) && !liveRemote.contains($0.id) && !madeRemote.contains($0.id) }.map(\.id)
         if next != threads { threads = next }
         for id in gone { forget(id) }
+        threadCountMayHaveChanged()
     }
 
     /// A thread read through Convex has the table's row for a summary,
@@ -68,6 +74,76 @@ extension AppModel {
         guard viaRelay(threadId), let thread = threads[threadId] else { return }
         let next = withRelayCard(thread)
         if next != thread { threads[threadId] = next }
+    }
+
+    // MARK: The order
+
+    /// Every runner as Settings > Runners lists them: in Mike's order, then
+    /// any he hasn't placed, this Mac first and the rest as the runner has
+    /// them (the phone's list does the same, convex/phone.ts orderedRunners).
+    var orderedRunnerIds: [String] {
+        let selfId = runners.first(where: \.isSelf)?.id
+        let all = (selfId.map { [$0] } ?? []) + remoteRunners.map(\.id)
+        let order = runnerOrder ?? []
+        let rank = { (id: String) in order.firstIndex(of: id) ?? order.count }
+        return all.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map(\.element)
+    }
+
+    /// `runners.list` in the same order, for the Runners panel.
+    var orderedRunners: [RunnerInfo] {
+        let order = runnerOrder ?? []
+        // Unplaced ones after, this Mac first, as runners.list has them.
+        let rank = { (r: RunnerInfo) in order.firstIndex(of: r.id) ?? order.count + (r.isSelf ? 0 : 1) }
+        return runners.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map(\.element)
+    }
+
+    /// The order can be changed once the backend has one (API 58) and this
+    /// Mac's own runner is known: without it a move would save an order
+    /// that leaves this Mac out.
+    var canOrderRunners: Bool {
+        runnerOrder != nil && !remoteRunners.isEmpty && runners.contains(where: \.isSelf)
+    }
+
+    /// A drop in a list of only some runners (the panel lists runners.list's):
+    /// they swap places among themselves, and the rest of the order stays.
+    func setRunnerOrder(part ids: [String]) {
+        let full = orderedRunnerIds + ids.filter { !orderedRunnerIds.contains($0) }
+        setRunnerOrder(ReorderDrag.merged(ids, into: full))
+    }
+
+    /// One place up or down, for VoiceOver's actions on a runner's row (a
+    /// drag saves the whole order itself).
+    func moveRunner(_ id: String, by offset: Int) {
+        let ids = orderedRunnerIds
+        guard let from = ids.firstIndex(of: id), ids.indices.contains(from + offset) else { return }
+        setRunnerOrder(ReorderDrag.moving(ids, from: from, to: from + offset))
+    }
+
+    /// Saves the order through this Mac's runner, here at once.
+    func setRunnerOrder(_ ids: [String]) {
+        guard let client else { return }
+        pendingRunnerOrder = ids
+        runnerOrder = ids
+        Task {
+            do {
+                try await client.setRunnerOrder(ids)
+                // Saved. Normally the list comes back in it at once; if
+                // something else (the phone) moved it again before that, the
+                // backend's order wins after a moment rather than this one
+                // staying on screen for good.
+                try? await Task.sleep(for: .seconds(5))
+                if pendingRunnerOrder == ids {
+                    pendingRunnerOrder = nil
+                    runnerOrder = remoteIndex.order
+                }
+            } catch {
+                if pendingRunnerOrder == ids {
+                    pendingRunnerOrder = nil
+                    runnerOrder = remoteIndex.order
+                }
+                errorMessage = "Couldn't save the runner order. \(error.localizedDescription)"
+            }
+        }
     }
 
     func isRemote(_ threadId: String) -> Bool { threads[threadId]?.isRemote == true }
@@ -106,6 +182,18 @@ extension AppModel {
     /// The SF Symbol for the runner a thread lives on, as the schedule
     /// editor draws runners.
     func runnerIcon(of thread: ThreadSummary) -> String { RunnerIcon.symbol(remoteRunner(of: thread)?.icon) }
+
+    /// Why pictures can't go in a message for `thread` (a new thread's
+    /// runner when nil), or nil when they can. A picture is a file this
+    /// Mac's runner imported, so another runner hasn't got it: through
+    /// Convex this Mac's runner uploads it with the message (docs/protocol.md,
+    /// "Other runners' threads through the backend", Pictures), but the
+    /// direct link would hand that runner a path on this Mac. Mike pasted
+    /// one for Hetzner Cloud on 8 Nov and every remote runner refused them.
+    func picturesRefusal(for thread: ThreadSummary?) -> String? {
+        guard directRemoteLink, let name = thread.flatMap(runnerName(of:)) ?? (thread == nil ? newThreadRunner?.name : nil) else { return nil }
+        return "Pictures can't go to \(name) over the direct link yet. Turn off Connect to other machines directly in Settings > Runners to send them through Convex."
+    }
 
     /// "On bruce", and whether it's offline, for a remote row's tooltip.
     func runnerPlace(of thread: ThreadSummary) -> String? {
@@ -220,6 +308,9 @@ extension AppModel {
         newThreadRunnerId = runnerId
         newThreadRunnerProblem = nil
         newThreadCwd = nil
+        // Projects are this Mac's: another Mac's thread starts outside one,
+        // so the In chip goes rather than promising what won't happen.
+        if runnerId != nil { newThreadProjectId = nil }
         newThreadAccount = nil
         newThreadPool = nil
         newThreadProvider = nil
@@ -280,11 +371,8 @@ extension AppModel {
     /// reached the draft stays and the banner says why.
     func sendNewThread(on runnerId: String, text: String, draft: Draft) {
         let name = remoteRunners.first { $0.id == runnerId }?.name ?? "that Mac"
-        guard draft.images.isEmpty else {
-            errorMessage = "Pictures can't go to \(name) from this Mac yet."
-            return
-        }
-        ActivityRecorder.shared.sent(threadId: nil, images: 0, answers: 0)
+        let images = draft.normalized.images
+        ActivityRecorder.shared.sent(threadId: nil, images: images.count, answers: 0)
         creatingThread = true
         Task {
             defer { creatingThread = false }
@@ -292,7 +380,9 @@ extension AppModel {
                 guard let runner = remoteRunners.first(where: { $0.id == runnerId }) else {
                     throw RemoteUnreachable(runnerId: runnerId, runnerName: name, online: false, reason: .unknownRunner)
                 }
-                var request = newThreadRequest(text: text, images: [])
+                // Through Convex this Mac's runner uploads the pictures; the
+                // direct link never gets here with any (picturesRefusal).
+                var request = newThreadRequest(text: text, images: images)
                 let made0: ThreadSummary
                 if directRemoteLink {
                     made0 = try await remoteClients.client(for: runner).createThread(request)
@@ -320,7 +410,7 @@ extension AppModel {
                 // relayed one waits for the sidebar table's row.
                 if directRemoteLink { liveRemote.insert(made.id) } else { madeRemote.insert(made.id) }
                 threads[made.id] = made
-                select(made.id)
+                showStartedThread(made.id)
                 applyDefaultRunner()
             } catch let unreachable as RemoteUnreachable {
                 // The draft never left the box.
@@ -441,6 +531,9 @@ extension AppModel {
                     next[thread.id] = thread
                 }
                 if next != threads { threads = next }
+                // The table's row has no panelRequest, so one waiting on the
+                // thread he already has open only turns up here.
+                if let selection, threads[selection]?.runnerId == runnerId, threads[selection]?.panelRequest != nil { servePanelRequest() }
             }
             // A transcript still loaded from before picks up where it was.
             for session in openSessions where session.state == .loaded && threads[session.threadId]?.runnerId == runnerId {

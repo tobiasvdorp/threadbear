@@ -1,4 +1,5 @@
 import AppKit
+import ThreadbearCore
 
 /// A Chrome profile with a window open, for "Open in Chrome: convex.dev"
 /// in a web link's menu. Mike runs a Chrome window per account (personal,
@@ -78,14 +79,20 @@ enum ChromeProfiles {
     /// with `--profile-directory` hands the page to the running one and
     /// quits, which is the only way in: Chrome has no AppleScript or URL
     /// scheme for picking a profile.
-    static func open(_ url: URL, in profile: ChromeProfile) {
+    /// Only a web address: it goes to Chrome as an argument, so anything
+    /// else (`--some-flag`, a `file:` URL) would be Chrome's to act on.
+    @MainActor static func open(_ url: URL, in profile: ChromeProfile) {
+        guard let web = LinkPolicy.web(url) else {
+            OpenGate.openWeb(url)
+            return
+        }
         guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else {
-            NSWorkspace.shared.open(url)
+            OpenGate.openWeb(web)
             return
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-na", app.path, "--args", "--profile-directory=\(profile.directory)", url.absoluteString]
-        do { try process.run() } catch { NSWorkspace.shared.open(url) }
+        process.arguments = ["-na", app.path, "--args", "--profile-directory=\(profile.directory)", web.absoluteString]
+        do { try process.run() } catch { OpenGate.openWeb(web) }
     }
 }

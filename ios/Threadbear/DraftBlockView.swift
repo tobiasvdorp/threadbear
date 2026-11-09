@@ -41,11 +41,14 @@ struct DraftBlockView: View {
             Text(draft.label).font(.caption).foregroundStyle(.secondary)
             Spacer(minLength: 0)
             Button(action: copy) {
-                Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                    .font(.caption)
+                Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
+                    .font(.caption.weight(copied ? .semibold : .regular))
+                    .contentTransition(.symbolEffect(.replace))
             }
             .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
+            // Green with a tick for a moment after a tap, as on the Mac.
+            .foregroundStyle(copied ? AnyShapeStyle(Color.green) : AnyShapeStyle(.secondary))
+            .sensoryFeedback(.success, trigger: copies)
             .accessibilityLabel(copied ? "Copied" : "Copy the \(draft.label.lowercased())")
         }
         .padding(.horizontal, 10)

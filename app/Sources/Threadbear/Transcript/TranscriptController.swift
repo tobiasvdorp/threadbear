@@ -7,8 +7,9 @@ import ThreadbearCore
 
 /// The transcript table. Owns Quick Look control for image clicks and the
 /// row context menu.
-final class TranscriptTableView: NSTableView {
+final class TranscriptTableView: NSTableView, TranscriptThreadHost {
     weak var controller: TranscriptController?
+    var hostedThreadId: String? { controller?.session?.threadId }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
@@ -42,6 +43,17 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
         return app.remoteImages(for: thread)
     }
 
+    var linkThreadId: String? { session?.threadId }
+
+    /// Pictures in the words are read from this Mac only for this Mac's
+    /// own thread (MarkdownRenderer.localPictures). A thread the app
+    /// doesn't list as another runner's is this Mac's: its events come
+    /// from this Mac's runner.
+    var localPictures: Bool {
+        guard let session, let app = session.app else { return true }
+        return !app.isRemote(session.threadId)
+    }
+
     nonisolated static let renders = RenderCache()
 
     /// Overlay scrollers whatever the system setting, so the reading
@@ -53,6 +65,9 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// The box drops on this transcript go to (ComposerDropView).
     weak var composerHandle: ComposerHandle?
     private(set) weak var session: ThreadSession?
+    /// The last message that rose: a batch that moves it doesn't lift it
+    /// again, and the real row that replaces it carries on from here.
+    private var lifting: (rowId: String, text: String, begun: CFTimeInterval)?
     private(set) var width: CGFloat = 0
     private var deferred = Set<String>()
     private var deferredTimer: Timer?
@@ -111,6 +126,7 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
         NotificationCenter.default.addObserver(self, selector: #selector(frameChanged), name: NSView.frameDidChangeNotification, object: scrollView.contentView)
         NotificationCenter.default.addObserver(self, selector: #selector(zoomChanged), name: TextZoom.didChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(richChanged), name: RichBlocks.changed, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(buttonsChanged), name: ReplyButtons.changed, object: nil)
     }
 
     /// A ```mermaid or ```html box was drawn, or flipped between its
@@ -121,12 +137,28 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
     @objc private func richChanged() {
         guard !richPending else { return }
         richPending = true
+        rerender { [weak self] in self?.richPending = false } where: { RenderCache.holdsRich($0) }
+    }
+
+    /// A reply button was made, pressed or failed, or a press set off or
+    /// came back (ReplyButtons): the replies linking one draw again, as
+    /// for rich blocks. Several together are done once.
+    private var buttonsPending = false
+    @objc private func buttonsChanged() {
+        guard !buttonsPending else { return }
+        buttonsPending = true
+        rerender { [weak self] in self?.buttonsPending = false } where: { RenderCache.holdsButtons($0) }
+    }
+
+    /// Renders the rows `holds` picks again on the next turn of the main
+    /// loop, keeping what's on screen where it is.
+    private func rerender(_ done: @escaping @MainActor () -> Void, where holds: @escaping (TranscriptRow) -> Bool) {
         DispatchQueue.main.async { [weak self] in
             MainActor.assumeIsolated {
+                done()
                 guard let self else { return }
-                self.richPending = false
                 guard let session = self.session else { return }
-                let indices = IndexSet((0..<session.displayCount).filter { RenderCache.holdsRich(session.displayRow($0)) })
+                let indices = IndexSet((0..<session.displayCount).filter { holds(session.displayRow($0)) })
                 guard !indices.isEmpty else { return }
                 let wasPinned = self.isAtBottom
                 let anchor = wasPinned ? nil : self.captureMemory()
@@ -267,7 +299,7 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
         // Only diff rows have more lines to show; skipping the lookup keeps
         // a full reload's height pass free of a string per row.
         let showAll = row.kind == .diff && session?.expanded.contains(DiffPreview.allKey(row.id)) == true
-        return Self.renders.render(row, expanded: isExpanded(row), showAll: showAll, width: width)
+        return Self.renders.render(row, expanded: isExpanded(row), showAll: showAll, width: width, localPictures: localPictures)
     }
 
     /// Item rows keep their open state in the session; groups and changes
@@ -294,6 +326,15 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
+
+    func claimWakeUp(rowId: String) -> Bool {
+        guard let session, session.wakeUpPending else { return false }
+        // An older thread's older wake note can come on screen first.
+        let newest = (0..<session.displayCount).reversed().lazy.map { session.displayRow($0) }.first { $0.content.isWakeNote }
+        guard newest?.id == rowId else { return false }
+        session.wakeUpPending = false
+        return true
+    }
 
     func tableView(_ tableView: NSTableView, didRemove rowView: NSTableRowView, forRow row: Int) {
         for case let cell as RowCellView in rowView.subviews { cell.releaseContent() }
@@ -401,6 +442,34 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
             // Rows above the anchor can change height (a tool result landing);
             // keep what the user is reading where it was.
             scroll(toRow: index, offset: anchor.offset)
+        }
+        if wasPinned { liftSent(inserted) }
+    }
+
+    /// A message Mike's just sent rises the last of the way from the
+    /// composer's edge (`SendLift`), rather than appearing above it. Only
+    /// when the table was at the bottom, where it's seen and where it isn't
+    /// about to be scrolled to. Goes on the cell's layer once, so the render
+    /// server runs it, and never touches the scroll: that's already pinned.
+    ///
+    /// A runner that answers quickly replaces the faded row with the real
+    /// one while it's still rising, often in the same frame, in a cell of
+    /// its own. That cell picks the rise up from where it had got to, or a
+    /// quick runner would mean no lift at all.
+    private func liftSent(_ inserted: IndexSet) {
+        for index in inserted {
+            guard let row = row(at: index), case .user(let message) = row.content else { continue }
+            let begun: CFTimeInterval?
+            if SendLift.rises(row), row.id != lifting?.rowId {
+                begun = nil
+                lifting = (row.id, message.text, CACurrentMediaTime())
+            } else if message.pending == nil, let lifting, lifting.text == message.text, CACurrentMediaTime() - lifting.begun < SendLift.firstFrame + SendLift.duration {
+                begun = lifting.begun
+            } else {
+                continue
+            }
+            guard let cell = tableView.view(atColumn: 0, row: index, makeIfNecessary: true) else { continue }
+            SendLift.lift(cell, begun: begun)
         }
     }
 
@@ -715,7 +784,7 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
             let margin = 60
             measured = max(0, visibleRange.lowerBound - margin)..<min(count, visibleRange.upperBound + margin)
         }
-        Self.renders.prepare(measured.map { session.displayRow($0) }, expanded: session.expanded, width: width)
+        Self.renders.prepare(measured.map { session.displayRow($0) }, expanded: session.expanded, width: width, localPictures: localPictures)
         tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: measured))
         for index in visibleRange {
             if let row = row(at: index) { refreshCell(at: index, row: row) }
@@ -742,7 +811,7 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
         let measured = count <= Self.syncRemeasureLimit
             ? 0..<count
             : max(0, visible.location - margin)..<min(count, visible.location + visible.length + margin)
-        Self.renders.prepare(measured.map { session.displayRow($0) }, expanded: session.expanded, width: width)
+        Self.renders.prepare(measured.map { session.displayRow($0) }, expanded: session.expanded, width: width, localPictures: localPictures)
         NSAnimationContext.beginGrouping()
         NSAnimationContext.current.duration = 0
         tableView.reloadData()
@@ -760,8 +829,9 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
             let zoom = TypeScale.percent
             let rows = (0..<session.displayCount).map { session.displayRow($0) }
             let expanded = session.expanded
+            let localPictures = self.localPictures
             await Task.detached(priority: .userInitiated) {
-                TranscriptController.renders.prepare(rows, expanded: expanded, width: width)
+                TranscriptController.renders.prepare(rows, expanded: expanded, width: width, localPictures: localPictures)
             }.value
             guard !Task.isCancelled, self.session === session, self.width == width, TypeScale.percent == zoom else { return }
             let memory = self.captureMemory()
@@ -841,10 +911,16 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
 
     func isAnswering(_ approvalId: String) -> Bool { session?.answering.contains(approvalId) == true }
 
+    func untickedCalls(_ approvalId: String) -> Set<String> { session?.untickedCalls[approvalId] ?? [] }
+
+    func toggleQueuedCall(approvalId: String, itemId: String) {
+        session?.toggleQueuedCall(approvalId: approvalId, itemId: itemId)
+    }
+
     /// Lays out an approval or question card again as its answer goes
     /// (ThreadSession.answering). Its height doesn't change.
     func refreshCard(_ approvalId: String) {
-        for id in ["ap:" + approvalId, "q:" + approvalId] {
+        for id in ["ap:" + approvalId, "q:" + approvalId, "pl:" + approvalId] {
             if let index = session?.displayIndex(of: id), let row = row(at: index) { refreshCell(at: index, row: row) }
         }
     }
@@ -908,10 +984,8 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
 
     func askPicturesAllowed(_ card: AsksCard) -> Bool {
         guard let session, let app = session.app, let thread = app.threads[session.threadId], thread.asksSeq == card.seq else { return false }
-        // A picture this Mac's runner keeps would be a path another
-        // runner hasn't got (as in the composer).
-        if let name = app.runnerName(of: thread) {
-            app.errorMessage = "Pictures can't go to \(name) from this Mac yet."
+        if let why = app.picturesRefusal(for: thread) {
+            app.errorMessage = why
             return false
         }
         return true
@@ -921,11 +995,49 @@ final class TranscriptController: NSObject, NSTableViewDataSource, NSTableViewDe
         await session?.app?.importImages([url]).first
     }
 
-    /// Return in a Something else box sends, as it does in the composer:
-    /// the picks, every box and whatever's in the composer, as one message.
+    /// Sends the picks, every box and whatever's in the composer, as one
+    /// message.
     func sendAnswers(_ card: AsksCard) {
         guard let session, let app = session.app else { return }
         app.send(threadId: session.threadId)
+    }
+
+    /// Return in ask `ask`'s Something else box goes on to the next ask
+    /// still unanswered, and sends only once there's none: Return on ask 7
+    /// of 10, meant as a new line or just early, sent the card with 8 to 10
+    /// unanswered (Mike, 7 Nov). Its own box counts too, last: Return in an
+    /// empty one beeps. ⌘Return sends whatever's answered.
+    func answerBoxReturn(_ card: AsksCard, ask: Int, command: Bool) {
+        if command || !showUnanswered(after: ask, orThis: true) { sendAnswers(card) }
+    }
+
+    /// Return in the empty composer with picks on the card: the same rule
+    /// as a Something else box, from the ask the card is showing. False
+    /// when every ask's answered, so Return sends as before.
+    func returnWithUnanswered() -> Bool {
+        showUnanswered(after: composerCard?.page ?? 0, orThis: true)
+    }
+
+    /// Puts the next ask after `ask` with nothing picked in front: its page
+    /// on a paged card, with the cursor back in the composer (the box it
+    /// was in has gone with its page). On a card showing every ask, it's in
+    /// sight already, so a beep says Return didn't send. False if there's
+    /// none, or no open card.
+    private func showUnanswered(after ask: Int, orThis: Bool) -> Bool {
+        guard let session, let app = session.app, let thread = app.threads[session.threadId],
+              let card = session.openCard.flatMap({ row -> AsksCard? in
+                  if case .asks(let card) = row.content { return card } else { return nil }
+              }),
+              card.isOpen, thread.asksSeq == card.seq,
+              let next = Decisions.nextUnanswered(after: ask, count: card.asks.count, picks: Decisions.filled(picks: app.picks(for: thread), notes: app.notes(for: thread)), orThis: orThis)
+        else { return false }
+        // Already showing (the composer's Return on an unanswered ask): the beep.
+        if composerCard?.page != next, composerCard?.showAsk(next) == true {
+            app.focusComposer(thread.id)
+        } else {
+            NSSound.beep()
+        }
+        return true
     }
 
     /// Puts the cursor in ask `ask`'s Something else box on the card from `seq`.

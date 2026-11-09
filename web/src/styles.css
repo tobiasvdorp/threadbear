@@ -121,6 +121,7 @@ code, pre { font-family: var(--mono); font-size: 13px; }
 .md .draft { background: var(--code); border-radius: 8px; margin: 0 0 10px; }
 .md .draft-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 4px 12px; border-bottom: 1px solid var(--line); font-size: 13px; color: var(--muted); }
 .md .draft-head .btn { padding: 3px 8px; font-size: 13px; }
+.md .draft-head .btn.copied { color: #2fb350; font-weight: 600; }
 .md .draft-body { padding: 10px 12px; white-space: pre-wrap; }
 .md .draft-body code { background: var(--line); }
 .md .draft-quote { padding-left: 10px; border-left: 3px solid var(--line-strong); color: var(--muted); }
@@ -485,3 +486,20 @@ button.fold:hover > svg:last-child, button.fold:focus-visible > svg:last-child {
   .dock { padding: 6px 10px max(10px, env(safe-area-inset-bottom)); }
   .share-panel { width: min(370px, calc(100vw - 24px)); }
 }
+
+/* Reply buttons (reply-button.tsx): blue starts a thread, purple sends a
+   message, green once pressed. */
+.reply-button-wrap { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; vertical-align: middle; }
+.reply-button { display: inline-flex; align-items: center; gap: 5px; padding: 1px 10px; border-radius: 999px; border: 1px solid transparent; font: inherit; font-size: 0.9em; line-height: 1.6; cursor: pointer; color: #fff; background: var(--accent); }
+.reply-button.rb-send { background: #8e44d6; }
+.reply-button:hover:not(:disabled) { filter: brightness(1.08); }
+.reply-button.rb-pressed { background: rgba(48, 164, 88, 0.14); color: #23863f; border-color: rgba(48, 164, 88, 0.45); }
+.reply-button.rb-pressing { opacity: 0.75; cursor: progress; }
+.reply-button:disabled { cursor: default; }
+.reply-button.rb-failed { outline: 2px solid rgba(214, 60, 60, 0.5); outline-offset: 1px; }
+.reply-button svg { width: 12px; height: 12px; flex: none; }
+.reply-button .spinner { width: 9px; height: 9px; border-color: rgba(255, 255, 255, 0.4); border-top-color: #fff; }
+.reply-button-error { color: #d63c3c; font-size: 0.85em; }
+@media (prefers-color-scheme: dark) { .reply-button.rb-pressed { color: #5fd17f; } }
+:root[data-theme='dark'] .reply-button.rb-pressed { color: #5fd17f; }
+:root[data-theme='light'] .reply-button.rb-pressed { color: #23863f; }

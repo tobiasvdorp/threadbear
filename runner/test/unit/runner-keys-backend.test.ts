@@ -12,6 +12,7 @@ const BRUCE = 'cb921b2447ea';
 
 const { sha256 } = load('lib') as { sha256: (s: string) => Promise<string> };
 const sync = load('sync');
+const relay = load('relay');
 const phone = load('phone');
 
 async function setup() {
@@ -227,7 +228,9 @@ test("Bruce's key attaches and deletes only files it uploaded; a phone's photo i
   await s.bruce.upsert(thread('B', BRUCE));
   // A phone photo on its way to the M5, and one with no row at all.
   const photo = s.file('phone-photo');
-  await s.ctx.db.insert('commands', { runnerId: M5, kind: 'send', args: { text: 'x', images: [{ storageId: photo, url: 'u' }] }, state: 'pending', createdAt: 1 });
+  // As phone.ts queue writes them: the command, and the record of its photos.
+  const toM5 = await s.ctx.db.insert('commands', { runnerId: M5, kind: 'send', args: { text: 'x', images: [{ storageId: photo, url: 'u' }] }, state: 'pending', createdAt: 1 });
+  await s.ctx.db.insert('commandFiles', { storageId: photo, commandId: toM5 });
   const stray = s.file('stray');
   assert.equal(await outcome(s.bruce.shareImage('B', photo)), 'forbidden');
   assert.equal(await outcome(s.bruce.replyImage('NOROW', photo)), 'forbidden');
@@ -239,6 +242,7 @@ test("Bruce's key attaches and deletes only files it uploaded; a phone's photo i
   assert.equal(s.rows('shareImages').length, 1);
   // The same photo sent to Bruce and the M5: Bruce finishing its command leaves the M5's copy.
   const forBruce = await s.ctx.db.insert('commands', { runnerId: BRUCE, kind: 'send', args: { text: 'x', images: [{ storageId: photo, url: 'u' }] }, state: 'pending', createdAt: 2 });
+  await s.ctx.db.insert('commandFiles', { storageId: photo, commandId: forBruce });
   await call(s.ctx, sync.finishCommand, { key: BRUCE_KEY, commandId: forBruce, ok: true });
   assert.equal(s.hasFile(photo), true);
   // A picture row naming a file keeps it through a command finishing too.
@@ -262,8 +266,9 @@ test('upload URLs for a runner key are limited, and uploads never attached are c
   await upload(s2, BRUCE_KEY, 'orphan');
   const realNow = Date.now;
   Date.now = () => realNow() + 2 * 24 * 60 * 60_000;
+  await s2.ctx.db.insert('backendMarks', { name: 'limits-2026-11-07-done' });
   try {
-    await call(s2.ctx, sync.pruneOld, {});
+    await call(s2.ctx, sync.pruneFiles, {});
   } finally {
     Date.now = realNow;
   }
@@ -703,6 +708,23 @@ test("a waiting question keeps exactly what its answer is matched on; one too bi
   }
 });
 
+test("an open card's answer notes reach another runner's relay, and go before the card when the row is too big", async () => {
+  // A Mac reading Bruce's thread through the relay draws its card from this
+  // row: without the notes it fell back to plain buttons (Mike, 8 Nov, on a
+  // Hetzner thread).
+  const s = await setup();
+  const asks = [{ action: 'Same thread or new?', options: ['Same thread', 'New thread'], optionNotes: ['One thread that moves.', 'The old one is archived.'], suggested: 0 }];
+  await s.bruce.upsert(thread('N1', BRUCE, { needs: 'you', asks, asksSeq: 50 }));
+  const read = (await call(s.ctx, relay.remoteThread, { key: OWNER, threadId: 'N1' })) as { asks: unknown };
+  assert.deepEqual(read.asks, asks);
+  // Notes too long for the row's cap: they go, the card stays and still works as buttons.
+  const long = [{ action: 'Ship it?', options: ['Yes', 'No'], optionNotes: ['y'.repeat(5_000), 'n'.repeat(5_000)] }];
+  await s.bruce.upsert(thread('N2', BRUCE, { needs: 'you', asks: long, asksSeq: 7 }));
+  const t = s.rows('threads').find((r) => r.threadId === 'N2')!;
+  assert.ok(bytes(t) <= 8_192, String(bytes(t)));
+  assert.deepEqual(t.asks, [{ action: 'Ship it?', options: ['Yes', 'No'] }]);
+});
+
 test('pruneOld finds old finished commands by when they finished, not when they were made', async () => {
   const s = await setup();
   const now = Date.now();
@@ -818,7 +840,8 @@ test("past the message budget a runner key's oldest messages anywhere give way, 
   const { RUNNER_KEY_CAPS: CAP } = sync as { RUNNER_KEY_CAPS: { messageBytes: number } };
   assert.ok(CAP.messageBytes >= 2 * 21 * 1024 * 1024, "at least twice the M5's whole history (about 21 MB)");
   await s.bruce.upsert(thread('OLD', BRUCE));
-  await s.bruce.append('OLD', 'oldest', 1);
+  // Longer than the new one, so taking it out alone makes room.
+  await s.bruce.append('OLD', 'oldest '.padEnd(60, '.'), 1);
   await s.bruce.append('OLD', 'next', 2);
   const usage = s.rows('runnerStorage').find((r) => r.runnerId === BRUCE)!;
   await s.ctx.db.patch(usage._id, { messageBytes: CAP.messageBytes });
@@ -876,10 +899,18 @@ test("a runner key's threads and messages are bounded in all: past the budget ne
   const t = await setup();
   await t.bruce.upsert(thread('OLD', BRUCE));
   await t.bruce.append('OLD', 'old one', 1);
+  // The budget just what's stored (a real count, not a made-up one, which
+  // eviction now puts right once there's nothing left to take).
   const usage = t.rows('runnerStorage').find((x) => x.runnerId === BRUCE)!;
-  await t.ctx.db.patch(usage._id, { messageBytes: CAP.messageBytes });
+  const cap = CAP.messageBytes;
+  CAP.messageBytes = usage.messageBytes;
   await t.bruce.upsert(thread('NEW', BRUCE));
-  const res = await call(t.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: [1, 2, 3].map((seq) => ({ threadId: 'NEW', seq, role: 'user', text: `m${seq}`, at: 'a' })) });
+  let res: { skipped: string[] };
+  try {
+    res = await call(t.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: [1, 2, 3].map((seq) => ({ threadId: 'NEW', seq, role: 'user', text: `m${seq}`, at: 'a' })) });
+  } finally {
+    CAP.messageBytes = cap;
+  }
   assert.deepEqual(textsOf(t.rows('messages'), 'OLD'), [], 'the old one went');
   assert.deepEqual(textsOf(t.rows('messages'), 'NEW'), ['m1'], 'one in for the one out');
   assert.deepEqual(res.skipped, ['NEW:2', 'NEW:3'], 'the rest said, to be sent again');
@@ -922,4 +953,184 @@ test('audit cards and pruneOld read few rows at a time, for old rows that could 
   const before = s.reads();
   await call(s.ctx, sync.pruneOld, {});
   assert.ok(s.reads() - before <= 60, String(s.reads() - before));
+});
+
+// Daybreak, 6 Nov 2026: Mike deletes one of the M5's schedules while the M5
+// has a run of it claimed, and Bruce's key saves one of its own under the
+// gone id, which the M5's subscription (every runner's rows) then has under
+// the id it claimed. While the id's tombstone lasts it stays the M5's.
+test("a schedule id gone from the M5 lately isn't Bruce's to take, nor to adopt", async () => {
+  const s = await setup();
+  await call(s.ctx, sync.saveSchedule, { key: OWNER, schedule: sched(UUID(31), M5, { check: 'news-check' }) });
+  assert.equal(await call(s.ctx, sync.deleteSchedule, { key: OWNER, scheduleId: UUID(31) }), true);
+  const evil = sched(UUID(31), BRUCE, { title: 'ATTACKER JOB', text: 'ATTACKER INSTRUCTIONS', check: 'news-check', permissionMode: 'full' });
+  assert.equal(await outcome(call(s.ctx, sync.saveSchedule, { key: BRUCE_KEY, schedule: evil })), 'forbidden');
+  const adopted = (await call(s.ctx, sync.adoptSchedules, { key: BRUCE_KEY, runnerId: BRUCE, schedules: [evil] })) as { held: { why: string }[] };
+  assert.equal(adopted.held.length, 1);
+  assert.equal(s.rows('schedules').length, 0);
+  // Bruce's own gone ids are still its own to use again, and one moved to
+  // Bruce by Mike is Bruce's to change, the M5's tombstone for it or not.
+  await call(s.ctx, sync.saveSchedule, { key: BRUCE_KEY, schedule: sched(UUID(32), BRUCE) });
+  await call(s.ctx, sync.deleteSchedule, { key: BRUCE_KEY, scheduleId: UUID(32) });
+  await call(s.ctx, sync.saveSchedule, { key: BRUCE_KEY, schedule: sched(UUID(32), BRUCE) });
+  await call(s.ctx, sync.saveSchedule, { key: OWNER, schedule: sched(UUID(33), M5) });
+  await call(s.ctx, sync.saveSchedule, { key: OWNER, schedule: sched(UUID(33), BRUCE) });
+  await call(s.ctx, sync.saveSchedule, { key: BRUCE_KEY, schedule: sched(UUID(33), BRUCE, { title: 'renamed' }) });
+  assert.equal(s.rows('schedules').find((r) => r.id === UUID(33))?.title, 'renamed');
+});
+
+test("sync:sharedThreads lists a runner's link-shared rows only, and a runner key only its own", async () => {
+  const s = await setup();
+  await s.owner.upsert(thread('ON', M5, { share: { access: 'link', slug: 'on-slug' } }), thread('OFF', M5, { share: { access: 'off', slug: 'off-slug' } }), thread('NEVER', M5));
+  await s.bruce.upsert(thread('BRUCE-ON', BRUCE, { share: { access: 'link', slug: 'b-slug' } }));
+  assert.deepEqual(await call(s.ctx, sync.sharedThreads, { key: OWNER, runnerId: M5 }), ['ON']);
+  assert.deepEqual(await call(s.ctx, sync.sharedThreads, { key: BRUCE_KEY, runnerId: BRUCE }), ['BRUCE-ON']);
+  assert.equal(await outcome(call(s.ctx, sync.sharedThreads, { key: BRUCE_KEY, runnerId: M5 })), 'forbidden');
+});
+
+// ------------------------------------------------------------ Daybreak, 8 Nov
+
+// "Reply-button updates bypass scoped-runner storage quotas": a row sent again
+// with bigger buttons grew the stored message without counting the bytes, so
+// a runner key could put small rows in and then fill them past its budget.
+const bigButtons = (n = 20) => Array.from({ length: n }, (_, i) => ({ id: `b${i}`.padEnd(16, 'x'), title: 'T'.repeat(200), kind: 'send', target: 'G'.repeat(200) }));
+const storedOf = (row: Record<string, unknown>) => {
+  const { _id, _creationTime, ...rest } = row;
+  return Buffer.byteLength(JSON.stringify(rest), 'utf8');
+};
+
+test("a runner key's row sent again with bigger buttons is counted against its budget, and shrinking gives it back", async () => {
+  const s = await setup();
+  await s.bruce.upsert(thread('B', BRUCE));
+  const send = (seq: number, buttons?: unknown[]) => call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: [{ threadId: 'B', seq, role: 'assistant', text: `m${seq}`, at: 'a', ...(buttons ? { buttons } : {}) }] });
+  for (const seq of [1, 2, 3]) await send(seq);
+  for (const seq of [1, 2, 3]) await send(seq, bigButtons());
+  const counted = () => s.rows('runnerStorage').find((r) => r.runnerId === BRUCE)!.messageBytes;
+  const stored = () => s.rows('messages').filter((m) => m.runnerId === BRUCE).reduce((n, m) => n + storedOf(m), 0);
+  assert.ok(s.rows('messages').every((m) => m.buttons?.length === 20), 'the buttons went on');
+  assert.ok(stored() > 20_000);
+  assert.equal(counted(), stored(), 'every byte stored is counted');
+  await send(2, bigButtons(1));
+  assert.equal(counted(), stored(), 'and a smaller row gives them back');
+});
+
+test("a runner key at its budget can't grow a row with buttons: it waits, and the bytes stored stay within the budget", async () => {
+  const s = await setup();
+  const { RUNNER_KEY_CAPS: CAP } = sync as { RUNNER_KEY_CAPS: { messageBytes: number } };
+  await s.bruce.upsert(thread('B', BRUCE));
+  const msgs = (buttons?: unknown[]) => [1, 2, 3].map((seq) => ({ threadId: 'B', seq, role: 'assistant', text: `m${seq}`, at: 'a', ...(buttons ? { buttons } : {}) }));
+  await call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: msgs() });
+  const usage = s.rows('runnerStorage').find((r) => r.runnerId === BRUCE)!;
+  // Nearly full: the budget just above what's stored.
+  const cap = CAP.messageBytes;
+  CAP.messageBytes = usage.messageBytes + 100;
+  let r: { skipped: string[] };
+  try {
+    r = await call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: msgs(bigButtons()) });
+  } finally {
+    CAP.messageBytes = cap;
+  }
+  const left = s.rows('messages').filter((m) => m.threadId === 'B');
+  // The row being grown is never the one evicted to make room for itself; the
+  // others may go, and whatever's still there has no room for the buttons.
+  assert.ok(left.every((m) => !m.buttons?.length), JSON.stringify(left.map((m) => m.buttons?.length)));
+  assert.ok(r.skipped.length >= 1, 'said, to be sent again');
+  assert.ok(s.rows('runnerStorage').find((x) => x.runnerId === BRUCE)!.messageBytes <= usage.messageBytes + 100);
+});
+
+test("the owner's rows sent again with buttons still just take them", async () => {
+  const s = await setup();
+  await s.owner.upsert(thread('O', M5));
+  await call(s.ctx, sync.appendMessages, { key: OWNER, messages: [{ threadId: 'O', seq: 1, role: 'assistant', text: 'hi', at: 'a' }] });
+  await call(s.ctx, sync.appendMessages, { key: OWNER, messages: [{ threadId: 'O', seq: 1, role: 'assistant', text: 'hi', at: 'a', buttons: bigButtons(3) }] });
+  assert.equal(s.rows('messages')[0]!.buttons.length, 3);
+});
+
+test("codex 8 Nov: growing a runner key's oldest row at its budget evicts the next oldest instead", async () => {
+  const s = await setup();
+  const { RUNNER_KEY_CAPS: CAP } = sync as { RUNNER_KEY_CAPS: { messageBytes: number } };
+  await s.bruce.upsert(thread('B', BRUCE));
+  const row = (seq: number, buttons?: unknown[]) => ({ threadId: 'B', seq, role: 'assistant', text: `m${seq}`.padEnd(200, '.'), at: 'a', ...(buttons ? { buttons } : {}) });
+  await call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: [1, 2, 3].map((seq) => row(seq)) });
+  const usage = s.rows('runnerStorage').find((r) => r.runnerId === BRUCE)!;
+  await s.ctx.db.patch(usage._id, { messageBytes: CAP.messageBytes - 10 });
+  const r = await call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: [row(1, bigButtons(1))] });
+  assert.deepEqual(r.skipped, []);
+  const left = s.rows('messages').filter((m) => m.threadId === 'B');
+  assert.equal(left.find((m) => m.seq === 1)?.buttons?.length, 1, 'the oldest grew');
+  assert.ok(!left.some((m) => m.seq === 2), 'the next oldest made room');
+});
+
+test("codex 8 Nov: a runner key's message count left short is put right once, from its heartbeat, and never lowered", async () => {
+  const s = await setup();
+  await s.bruce.upsert(thread('B', BRUCE));
+  for (const seq of [1, 2, 3]) await s.bruce.append('B', `m${seq}`, seq);
+  // As the old backend left it: rows grown without counting.
+  for (const m of s.rows('messages')) await s.ctx.db.patch(m._id, { buttons: bigButtons() });
+  const usage = () => s.rows('runnerStorage').find((r) => r.runnerId === BRUCE)!;
+  const stored = () => s.rows('messages').filter((m) => m.runnerId === BRUCE).reduce((n, m) => n + storedOf(m), 0);
+  assert.ok(usage().messageBytes < stored());
+  const drain = async () => {
+    const runs = s.scheduled.splice(0) as { fn: string; args: Record<string, unknown> }[];
+    while (runs.length) {
+      const j = runs.shift()!;
+      if (!j.fn.includes('recountMessageBytes')) continue;
+      await call(s.ctx, sync.recountMessageBytes, j.args);
+      runs.push(...(s.scheduled.splice(0) as { fn: string; args: Record<string, unknown> }[]));
+    }
+  };
+  const hb = () => call(s.ctx, sync.heartbeat, { key: BRUCE_KEY, runner: { runnerId: BRUCE, name: 'bruce', version: 'v', startedAt: 'x', draining: false, threadCount: 1 } });
+  await hb();
+  await drain();
+  assert.equal(usage().messageBytes, stored(), 'raised to what is stored');
+  assert.equal(usage().messagesRecounted, true);
+  // Once: the next heartbeat starts nothing.
+  await hb();
+  assert.ok(!(s.scheduled as { fn: string }[]).some((j) => j.fn.includes('recountMessageBytes')));
+  // A sum gone stale (a row grown while the pages were read) never lowers a right count.
+  await s.ctx.db.patch(usage()._id, { messageBytes: stored() + 5_000 });
+  await call(s.ctx, sync.recountMessageBytes, { runnerId: BRUCE, cursor: null, sum: 0 });
+  assert.equal(usage().messageBytes, stored() + 5_000);
+});
+
+test("codex 8 Nov: a row sent again can't end up over a row's cap, its old text with new buttons", async () => {
+  const s = await setup();
+  await s.bruce.upsert(thread('B', BRUCE));
+  await call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: [{ threadId: 'B', seq: 1, role: 'assistant', text: 'x'.repeat(10_000), at: 'a' }] });
+  const r = await call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: [{ threadId: 'B', seq: 1, role: 'assistant', text: 'short', at: 'a', buttons: bigButtons() }] });
+  assert.deepEqual(r.skipped, ['B:1']);
+  const row = s.rows('messages').find((m) => m.threadId === 'B')!;
+  assert.ok(!row.buttons?.length);
+  assert.ok(storedOf(row) <= 12_288 + 64);
+});
+
+test('codex 8 Nov: growing many old rows at the budget reads about as many rows as it evicts', async () => {
+  const s = await setup();
+  const { RUNNER_KEY_CAPS: CAP } = sync as { RUNNER_KEY_CAPS: { messageBytes: number } };
+  await s.bruce.upsert(thread('B', BRUCE));
+  const row = (seq: number, buttons?: unknown[]) => ({ threadId: 'B', seq, role: 'assistant', text: `m${seq}`.padEnd(1_000, '.'), at: 'a', ...(buttons ? { buttons } : {}) });
+  for (let i = 0; i < 300; i += 50) await call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: Array.from({ length: 50 }, (_, j) => row(i + j + 1)) });
+  const usage = s.rows('runnerStorage').find((r) => r.runnerId === BRUCE)!;
+  await s.ctx.db.patch(usage._id, { messageBytes: CAP.messageBytes });
+  const before = s.reads();
+  await call(s.ctx, sync.appendMessages, { key: BRUCE_KEY, messages: Array.from({ length: 50 }, (_, j) => row(j + 1, bigButtons())) });
+  const read = s.reads() - before;
+  // Each grown row: its own lookup, the storage row, and a row or two per
+  // eviction; passing over every grown row again for each eviction read 453.
+  assert.ok(read < 350, `read ${read} rows`);
+});
+
+test("codex 8 Nov: a count left above what a runner key's rows hold is put back once there's nothing left to evict", async () => {
+  const s = await setup();
+  const { RUNNER_KEY_CAPS: CAP } = sync as { RUNNER_KEY_CAPS: { messageBytes: number } };
+  await s.bruce.upsert(thread('B', BRUCE));
+  await s.bruce.append('B', 'only one', 1);
+  const usage = s.rows('runnerStorage').find((r) => r.runnerId === BRUCE)!;
+  // Phantom bytes, as a stale recount could leave.
+  await s.ctx.db.patch(usage._id, { messageBytes: CAP.messageBytes + 5_000_000 });
+  const r = await s.bruce.append('B', 'next', 2);
+  assert.deepEqual(r.skipped, []);
+  assert.deepEqual(textsOf(s.rows('messages'), 'B'), ['next']);
+  const after = s.rows('runnerStorage').find((x) => x.runnerId === BRUCE)!.messageBytes;
+  assert.ok(after < 10_000, `count back to what's stored, not ${after}`);
 });

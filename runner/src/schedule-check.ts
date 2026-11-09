@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { atomicWriteFileSync } from './fsutil.ts';
+import { safeStart, safeStartOfPartial } from './safe-cut.ts';
 
 // How long a check may run unless its schedule says (checkTimeoutSecs),
 // and the most it can say: a Slack read through `codex exec` took 77 s by
@@ -82,8 +83,32 @@ export function dropKeptCheck(home: string, scheduleId: string, check?: string):
   } catch {
     return;
   }
-  for (const n of names) if (n.startsWith(`${scheduleId}.`) && n.endsWith('.kept.json')) fs.rmSync(path.join(dir, n), { force: true });
+  for (const n of names) if (n.startsWith(`${scheduleId}.`) && (n.endsWith('.kept.json') || n.endsWith('.held'))) fs.rmSync(path.join(dir, n), { force: true });
 }
+
+// A check whose approval no longer holds (schedules.ts, `held`): the digest
+// of what it'd run that a thread has been told about, so that's said once
+// and later runs are skipped until it's approved again, rather than an agent
+// starting every five minutes to hear the same thing.
+function heldCheckFile(home: string, scheduleId: string): string {
+  return path.join(home, 'schedule-checks', `${scheduleId}.held`);
+}
+
+export function heldToldAbout(home: string, scheduleId: string): string | undefined {
+  try {
+    return fs.readFileSync(heldCheckFile(home, scheduleId), 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+export function noteHeldTold(home: string, scheduleId: string, hash: string): void {
+  fs.mkdirSync(path.join(home, 'schedule-checks'), { recursive: true });
+  atomicWriteFileSync(heldCheckFile(home, scheduleId), hash);
+}
+
+export const HELD_EXTRA = "\n\nIts check wasn't run, as what it runs has changed since it was approved (or it was never approved on this runner). So this run went ahead without it, and later runs are skipped until it's approved again. Look at what it runs, and if that's fine, call update_schedule with the same check to approve it as it is now.";
+export const HELD_SKIP = "Its check is waiting to be approved again, as what it runs has changed: update_schedule with the same check approves it.";
 
 // A check under way in some runner process, so another one (the next
 // release, in a handover) waits for it rather than running it again: the
@@ -153,9 +178,15 @@ export function runCheck(p: { command: string; cwd: string; home: string; schedu
       // Its own process group, so a timeout stops whatever it started too.
       detached: true,
     });
+    // Whether what's kept has lost its start, maybe in a secret whose start is gone.
+    let cutFront = false;
     const take = (b: Buffer) => {
       // Keep the end: the last lines of a long output say the most.
-      out = (out + b.toString('utf8')).slice(-CHECK_OUTPUT_CHARS * 2);
+      out += b.toString('utf8');
+      if (out.length > CHECK_OUTPUT_CHARS * 2) {
+        out = out.slice(-CHECK_OUTPUT_CHARS * 2);
+        cutFront = true;
+      }
     };
     child.stdout?.on('data', take);
     child.stderr?.on('data', take);
@@ -166,19 +197,26 @@ export function runCheck(p: { command: string; cwd: string; home: string; schedu
         child.kill('SIGKILL');
       }
       // Says how to give it longer, for the agent that reads it.
-      finish({ ok: false, output: clip(out), why: `it took longer than ${Math.round((p.timeoutMs ?? CHECK_TIMEOUT_MS) / 1000)} seconds; the schedule's checkTimeoutSecs can give it up to ${MAX_CHECK_TIMEOUT_SECS}` });
+      finish({ ok: false, output: clip(out, cutFront), why: `it took longer than ${Math.round((p.timeoutMs ?? CHECK_TIMEOUT_MS) / 1000)} seconds; the schedule's checkTimeoutSecs can give it up to ${MAX_CHECK_TIMEOUT_SECS}` });
     }, p.timeoutMs ?? CHECK_TIMEOUT_MS);
-    child.on('error', (e) => finish({ ok: false, output: clip(out), why: e.message }));
+    child.on('error', (e) => finish({ ok: false, output: clip(out, cutFront), why: e.message }));
     child.on('close', (code, signal) => {
-      if (code === 0) finish({ ok: true, output: clip(out) });
-      else finish({ ok: false, output: clip(out), why: signal ? `it was stopped by ${signal}` : `it exited with ${code}` });
+      if (code === 0) finish({ ok: true, output: clip(out, cutFront) });
+      else finish({ ok: false, output: clip(out, cutFront), why: signal ? `it was stopped by ${signal}` : `it exited with ${code}` });
     });
   });
 }
 
-function clip(s: string): string {
+// Its last part, begun where no secret is cut in two (safe-cut.ts). One whose
+// start was let go of (cutFront) is never begun in the run it was let go in,
+// and the place is found in the buffer as kept, before anything's trimmed:
+// it's always CHECK_OUTPUT_CHARS in, so that much before it is looked at.
+// Trimmed first, spaces at the end pulled a password's middle to the front
+// with its start gone (Codex's review, 8 Nov).
+function clip(s: string, cutFront: boolean): string {
+  if (cutFront) return '…' + s.slice(safeStartOfPartial(s, Math.max(0, s.length - CHECK_OUTPUT_CHARS))).trim();
   const t = s.trim();
-  return t.length > CHECK_OUTPUT_CHARS ? '…' + t.slice(-CHECK_OUTPUT_CHARS) : t;
+  return t.length > CHECK_OUTPUT_CHARS ? '…' + t.slice(safeStart(t, t.length - CHECK_OUTPUT_CHARS)) : t;
 }
 
 // What goes under the scheduled message, or that the run is skipped.

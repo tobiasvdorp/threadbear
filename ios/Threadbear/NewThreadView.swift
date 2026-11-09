@@ -6,31 +6,41 @@ import ThreadbearKit
 /// and effort can be picked, and the runner picks a login with room for them.
 /// The runner starts on the first one online in Mike's order (Settings), so
 /// the Mac asleep doesn't leave the phone nowhere to start one (6 Nov).
+/// It closes as soon as the backend has the request (7 Nov, Mike: waiting on
+/// the runner's answer left the spinner up for ages); a row in the inbox
+/// stands in for the thread until the runner's made it (AppModel.starting).
 struct NewThreadView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-    var onCreated: (String) -> Void
+    /// With the create command's id, as the sheet closes.
+    var onStarted: (String) -> Void
     @State private var text: String
 
-    init(text: String = "", onCreated: @escaping (String) -> Void) {
-        _text = State(initialValue: text)
-        self.onCreated = onCreated
+    init(text: String = "", onStarted: @escaping (String) -> Void) {
+        self.init(draft: NewThreadDraft(text: text, photos: []), onStarted: onStarted)
+    }
+
+    /// A failed start's sheet again, as it was.
+    init(draft: NewThreadDraft, onStarted: @escaping (String) -> Void) {
+        _text = State(initialValue: draft.text)
+        _photos = State(initialValue: draft.photos)
+        _runnerId = State(initialValue: draft.runnerId)
+        _modelId = State(initialValue: draft.modelId)
+        _effort = State(initialValue: draft.effort)
+        self.onStarted = onStarted
     }
     /// Nil until the runners are in, then the first online in Mike's order.
     @State private var runnerId: String?
     @State private var modelId: String?
     @State private var effort: String?
-    @State private var commandId: String?
-    /// From the tap on Start until the command's queued. A separate job from
-    /// waiting on the runner, and without it Start looks dead (and can be
-    /// tapped again, for a second thread) while the photos finish going up.
+    /// From the tap on Start until the command's queued. Without it Start
+    /// looks dead (and can be tapped again, for a second thread) while the
+    /// photos finish going up.
     @State private var starting: Task<Void, Never>?
-    @State private var photos: [PickedPhoto] = []
+    @State private var photos: [PickedPhoto]
     @State private var adding = 0
     @State private var cursor = TextCursor()
     @State private var dictation = Dictation()
-    @State private var askEngine = false
-    private var whisperModel: WhisperModel { .shared }
 
     /// Each photo a chip in the words where it was put in, as on the Mac.
     private var words: PhotoWords { PhotoWords(text: $text, photos: $photos, adding: $adding, cursor: cursor) }
@@ -41,7 +51,7 @@ struct NewThreadView: View {
                 Section {
                     PastableTextField(text: $text, placeholder: "What should it do?", lines: 4...12,
                                       onPasteImages: model.canSendPhotos ? { words.addPasted($0, model: model) } : nil,
-                                      photos: $photos, cursor: cursor)
+                                      photos: $photos, cursor: cursor, threadReference: { model.threadReference(pasted: $0) })
                     HStack {
                         if model.canSendPhotos {
                             PhotoMenu(words: words) {
@@ -49,32 +59,20 @@ struct NewThreadView: View {
                             }
                         }
                         Spacer()
-                        if dictation.isTranscribing {
-                            ProgressView()
-                        } else {
-                            Button(action: toggleDictation) {
-                                if dictation.isListening {
-                                    ListeningLabel(dictation: dictation)
-                                } else {
-                                    Label("Dictate", systemImage: "mic")
-                                }
-                            }
-                            .tint(dictation.isListening ? .red : nil)
+                        DictateButton(text: $text, dictation: dictation) {
+                            Label("Dictate", systemImage: "mic")
                         }
                     }
                     // Two buttons in one Form row: without this a tap anywhere
                     // in the row fires both.
                     .buttonStyle(.borderless)
-                    if let problem = dictation.problem {
-                        Text(problem).font(.footnote).foregroundStyle(.secondary)
-                    }
-                    if DictationEngine.chosen == .whisper, let progress = whisperModel.progress {
-                        ProgressView(value: progress) {
-                            Text("Downloading Whisper. Apple's dictation until then.").font(.footnote).foregroundStyle(.secondary)
-                        }
-                    }
+                    DictationNotes(dictation: dictation)
                     if model.canSendPhotos, !photos.isEmpty || adding > 0 { PhotoStrip(words: words) }
                 }
+                // The words are taken as Start is tapped: anything typed or
+                // added while it goes would be lost (Mike, 7 Nov). The pickers
+                // below stay live, as start() reads them once the photos are up.
+                .disabled(starting != nil)
                 if model.canChooseRunner || !models.isEmpty {
                     Section {
                         if model.canChooseRunner {
@@ -117,7 +115,7 @@ struct NewThreadView: View {
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    if commandId != nil || starting != nil { ProgressView() } else {
+                    if starting != nil { ProgressView() } else {
                         // Not with a photo still on its way, which would be left behind.
                         // Nor with Whisper still to type out what was said.
                         Button("Start", action: start).disabled((words.message.isEmpty && photos.isEmpty) || adding > 0
@@ -126,13 +124,6 @@ struct NewThreadView: View {
                 }
             }
             .onDisappear { dictation.close() }
-            .confirmationDialog("Dictate with", isPresented: $askEngine, titleVisibility: .visible) {
-                Button("Whisper, \(WhisperModel.sizeText) download") { choose(.whisper) }
-                Button("Apple's dictation") { choose(.apple) }
-            } message: {
-                Text("Whisper's more accurate and runs on this phone. Change it in Settings.")
-            }
-            .task(id: "\(commandId ?? ""):\(model.connection)") { await waitForThread() }
             .task {
                 if photos.isEmpty, let load = model.loadSamplePhoto { words.add([load], model: model) }
             }
@@ -175,30 +166,11 @@ struct NewThreadView: View {
     }
     private var chosenModel: PhoneModelChoice? { models.first { $0.id == modelId } }
 
-    /// Adds to what's typed, after a space. The first time, asks which engine.
-    private func toggleDictation() {
-        if dictation.isListening { dictation.finish(); return }
-        guard let engine = DictationEngine.chosen else { askEngine = true; return }
-        // A download stopped by the app being swiped away picks up again.
-        if engine == .whisper, !whisperModel.installed, whisperModel.progress == nil { whisperModel.download() }
-        listen()
-    }
-
-    private func choose(_ engine: DictationEngine) {
-        DictationEngine.chosen = engine
-        if engine == .whisper { whisperModel.download() }
-        listen()
-    }
-
-    private func listen() {
-        let before = text.isEmpty || text.hasSuffix(" ") || text.hasSuffix("\n") ? text : text + " "
-        Task { await dictation.start { text = before + $0 } }
-    }
-
     private func start() {
         guard let backend = model.backend else { return }
         dictation.stop()
         let message = words.message
+        let typed = text
         let photos = photos
         starting = Task {
             defer { starting = nil }
@@ -209,68 +181,18 @@ struct NewThreadView: View {
                 // Picked now if the sheet never got to (the runners or the
                 // API version came in as Start was tapped).
                 if model.canChooseRunner, runnerId == nil { pickRunner() }
-                commandId = try await backend.create(text: message, runnerId: model.canChooseRunner ? runnerId : nil, cwd: nil, images: images,
-                                                     settings: NewThreadSettings(model: modelId, effort: effort))
+                // Taken once: the pickers can still change while the request goes.
+                let draft = NewThreadDraft(text: typed, photos: photos, runnerId: model.canChooseRunner ? runnerId : nil, modelId: modelId, effort: effort)
+                let commandId = try await backend.create(text: message, runnerId: draft.runnerId, cwd: nil, images: images,
+                                                         settings: NewThreadSettings(model: draft.modelId, effort: draft.effort))
                 model.sent(photos)
+                model.started(commandId: commandId, message: message, draft: draft)
+                onStarted(commandId)
+                dismiss()
             } catch is CancellationError {
             } catch {
                 model.report(error)
             }
         }
-    }
-
-    /// The thread id arrives once the runner's made it. With the Mac asleep
-    /// that's later, so the sheet closes and the thread turns up in the
-    /// inbox when it starts.
-    private func waitForThread() async {
-        guard let commandId, let backend = model.backend else { return }
-        if offlineText != nil { dismiss(); return }
-        do {
-            for try await status in backend.command(commandId) {
-                if let threadId = status?.threadId {
-                    onCreated(threadId)
-                    dismiss()
-                    return
-                }
-                if status?.state == .failed {
-                    model.report(TransportError.server(status?.note ?? "The runner couldn't start it."))
-                    // The backend deleted the copies with the failed command,
-                    // so trying again needs new ones.
-                    for photo in photos { photo.upload = nil }
-                    self.commandId = nil
-                    return
-                }
-            }
-        } catch {
-            model.report(error)
-        }
-    }
-}
-
-/// The mic button while it's listening: the waveform, the time so far and a
-/// small stop square, so it's plain the phone's hearing.
-private struct ListeningLabel: View {
-    let dictation: Dictation
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 1.0 / 15)) { context in
-            HStack(spacing: 8) {
-                HStack(alignment: .center, spacing: 2) {
-                    ForEach(Array(dictation.level.history.enumerated()), id: \.offset) { _, value in
-                        Capsule().frame(width: 2, height: 3 + CGFloat(value) * 15)
-                    }
-                }
-                .frame(height: 18)
-                .animation(.linear(duration: 1.0 / 15), value: dictation.level.history)
-                Text(elapsed(at: context.date)).monospacedDigit()
-                Image(systemName: "stop.fill").imageScale(.small)
-            }
-        }
-        .accessibilityLabel("Stop dictating")
-    }
-
-    private func elapsed(at now: Date) -> String {
-        let seconds = Int(now.timeIntervalSince(dictation.startedAt ?? now))
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }

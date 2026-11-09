@@ -256,4 +256,37 @@
 // 57: phone:waiting, a thread's sends its runner hasn't applied yet, and
 //    phone:cancel, which takes back one still pending. An older phone
 //    never asks for either.
-export const API_VERSION = 57;
+// 58: sync:runnerOrder and sync:setRunnerOrder, the main Mac's key only:
+//    the same runner order the phone sets (API 56), for the Mac's Settings >
+//    Runners. An older runner sends the Mac no order, and its Settings list
+//    the runners as before.
+// 59: reply buttons (docs/protocol.md, "Reply buttons"). A message row can
+//    carry `buttons`, the state of the buttons its text links ([title](button:<id>)),
+//    which the runner sends again when one is pressed (appendMessages patches
+//    just them); phone:messages returns them, and phone:press queues a `press`
+//    command with { buttonId }. An older runner sends none and fails a press
+//    as unknown; an older phone shows the link as text.
+// 60: sync:sharedThreads, the ids of a runner's rows shared by link, which a
+//    runner checks against its own threads on every start and every hour,
+//    removing ones it deleted and rewriting ones it stopped sharing. And a
+//    runner key can't save a schedule under an id gone from another runner
+//    within the day (scheduleGone). An older runner never asks, and does
+//    as before.
+// 61: an open card's asks can carry `optionNotes`, what each answer does,
+//    so a Mac reading another runner's thread through the relay draws the
+//    card as its own runner's (rows with a line under each answer), not
+//    plain buttons (Mike, 8 Nov, on a Hetzner thread). An older runner sends
+//    none, and an older backend gets the asks without them.
+// 62: phone:slashCommands, which asks a thread's runner for the slash
+//    commands it can run (a `slashCommands` command, answered with its
+//    threads.commands list), and phone:command returns that list as
+//    `result`. An older runner fails it as unknown, and the phone shows no
+//    palette; an older phone never asks.
+// 63: relay:queueCommand takes `images` (storage ids the main Mac's runner
+//    uploaded through relay:pictureUploadUrl and /relay/upload, recorded in
+//    relayUploads) on a send or a create, and gives the command a URL for
+//    each, as a phone's photos have; relay:discardPictures deletes ones that
+//    weren't queued, and sync:pruneFiles any left after a day. A runner
+//    sends pictures to another runner only from 63: an older backend would
+//    drop them and send the words alone.
+export const API_VERSION = 63;

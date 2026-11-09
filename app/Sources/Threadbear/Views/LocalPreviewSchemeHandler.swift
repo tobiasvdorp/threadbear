@@ -159,8 +159,21 @@ final class LocalPreviewSchemeHandler: NSObject, WKURLSchemeHandler {
 
     /// For tests: answers a request the way WebKit would see it answered.
     func respond(to url: URL) -> (response: HTTPURLResponse, data: Data) {
-        guard url.scheme == Self.scheme, let token = url.host, let site = sites[token],
-              let served = site.serve(url.path) else {
+        Self.answer(url, site: site(for: url))
+    }
+
+    private func site(for url: URL) -> LocalPreviewSite? {
+        guard url.scheme == Self.scheme, let token = url.host else { return nil }
+        return sites[token]
+    }
+
+    /// The answer for `url` from `site`. Reads the file and what it names
+    /// (LocalPreviewSite.serve), so it's run off the main thread: a page of
+    /// many megabytes held the app while it was read for names (Daybreak,
+    /// 7 Nov 2026).
+    private static func answer(_ url: URL, site: LocalPreviewSite?) -> (response: HTTPURLResponse, data: Data) {
+        readHook?()
+        guard let site, let served = site.serve(url.path) else {
             let refused = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1",
                                           headerFields: ["Content-Type": "text/plain", "Content-Security-Policy": Self.scriptsPolicy])!
             return (refused, Data("Not available to this preview.".utf8))
@@ -171,6 +184,15 @@ final class LocalPreviewSchemeHandler: NSObject, WKURLSchemeHandler {
         return (ok, served.data)
     }
 
+    /// For tests: called where each file is read, on the thread it's read on.
+    static var readHook: (() -> Void)?
+
+    /// Tasks WebKit has started and not stopped (main thread only): an
+    /// answer for one it stopped is dropped, as WebKit throws if a stopped
+    /// task is answered.
+    private var running = Set<ObjectIdentifier>()
+    private static let serving = DispatchQueue(label: "threadbear.preview.serve", qos: .userInitiated, attributes: .concurrent)
+
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         guard let url = task.request.url else {
             task.didFailWithError(URLError(.badURL))
@@ -180,12 +202,26 @@ final class LocalPreviewSchemeHandler: NSObject, WKURLSchemeHandler {
             task.didFailWithError(URLError(.noPermissionsToReadFile))
             return
         }
-        let (response, data) = respond(to: url)
-        task.didReceive(response)
-        task.didReceive(data)
-        task.didFinish()
+        // The site is looked up here, on the main thread, where `sites`
+        // lives; the site itself is safe to use from any thread (its lock).
+        let site = site(for: url)
+        let key = ObjectIdentifier(task)
+        running.insert(key)
+        Self.serving.async { [weak self] in
+            let (response, data) = Self.answer(url, site: site)
+            DispatchQueue.main.async {
+                // The task is held by this block until here, so its
+                // identifier can't be another task's.
+                guard let self, self.running.remove(key) != nil else { return }
+                task.didReceive(response)
+                task.didReceive(data)
+                task.didFinish()
+            }
+        }
     }
 
-    // Answers are whole and immediate, so there's nothing to stop.
-    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+    // An answer still being read is dropped when it's ready.
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {
+        running.remove(ObjectIdentifier(task))
+    }
 }

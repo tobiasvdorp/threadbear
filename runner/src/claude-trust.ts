@@ -24,6 +24,7 @@ import path from 'node:path';
 import { followOptions } from './patch-trust.ts';
 import type { PermissionMode } from './protocol.ts';
 import { looksRunnable, reachOf, reachOfCommand, Reads } from './script-trust.ts';
+import { allowCommand } from './shell-allowlist.ts';
 
 // The id the folder's entry has in a thread's `patches`.
 export const CLAUDE_PATCH_ID = 'claude-settings';
@@ -545,10 +546,15 @@ function reachedFiles(parts: Record<string, unknown>, dir: string, sources: stri
     for (const f of files) if (isInside(f, opts.top)) out.add(f);
     if (why) problem ??= `${label ? `${label} ` : ''}${why}`;
   };
+  // Each held to the short list of shell (shell-allowlist.ts), as a live
+  // patch command is, and followed by the pattern follower too for the
+  // files it reaches: both must pass.
   const command = (cmd: string, label: string) => {
     const shown = `\`${cmd.length > 120 ? `${cmd.slice(0, 120)}...` : cmd}\``;
+    const a = allowCommand(cmd, label, opts, vars);
     const r = reachOfCommand(cmd, label, opts, vars);
-    take(r.files, r.problem && (r.problem.startsWith(label) ? `${label} (${shown})${r.problem.slice(label.length)}` : `${label} (${shown}) ${r.problem}`));
+    const why = a.problem ?? r.problem;
+    take([...a.files, ...r.files], why && (why.startsWith(label) ? `${label} (${shown})${why.slice(label.length)}` : `${label} (${shown}) ${why}`));
   };
   const word = (raw: string, inEnv: boolean) => {
     if (!raw || raw.startsWith('~')) return;
@@ -623,6 +629,9 @@ function reachedFiles(parts: Record<string, unknown>, dir: string, sources: stri
       for (const [name, s] of Object.entries(part.mcpServers)) {
         if (!isObject(s) || typeof s.command !== 'string') continue;
         const args = Array.isArray(s.args) ? s.args.filter((a): a is string => typeof a === 'string') : [];
+        // Its files are followed from the folder; one that starts somewhere
+        // else would load others of the same names.
+        if (s.cwd !== undefined) problem ??= `MCP server ${name} in ${rel} sets its own cwd, so Threadbear can't tell which files its command and args name.`;
         command([s.command, ...args].map(shellQuote).join(' '), `MCP server ${name} in ${rel}`);
       }
     }
@@ -632,6 +641,7 @@ function reachedFiles(parts: Record<string, unknown>, dir: string, sources: stri
         if (typeof block !== 'string' || !FRONTMATTER_RUNS.has(name)) continue;
         // An MCP server's command runs with its args, not through a shell.
         const cmds = name === 'mcpservers' ? yamlServers(block) : yamlCommands(block);
+        if (name === 'mcpservers' && /^\s*cwd\s*:/m.test(block)) problem ??= `${rel} has an MCP server that sets its own cwd, so Threadbear can't tell which files its command and args name.`;
         if (!cmds) problem ??= `${rel} has ${key} whose commands Threadbear can't read: write each as \`command: ...\` on its own line${name === 'mcpservers' ? ', and its args as a plain list' : ''}.`;
         for (const c of cmds ?? []) command(c, `A ${key} command in ${rel}`);
         // An MCP server's env, as a settings file's.

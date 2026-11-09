@@ -142,9 +142,9 @@ extension Automation {
 
     /// A key event the text box with the cursor gets, as a real key press
     /// would reach it, without the app coming to the front.
-    static func pressAtCursor(_ window: NSWindow?, characters: String, keyCode: UInt16) -> String {
+    static func pressAtCursor(_ window: NSWindow?, characters: String, keyCode: UInt16, modifiers: NSEvent.ModifierFlags = []) -> String {
         guard let field = window?.firstResponder as? NSTextView else { return "error the cursor isn't in a text box" }
-        guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+        guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: ProcessInfo.processInfo.systemUptime,
                                            windowNumber: window?.windowNumber ?? 0, context: nil, characters: characters,
                                            charactersIgnoringModifiers: characters, isARepeat: false, keyCode: keyCode)
         else { return "error no event" }
@@ -355,33 +355,31 @@ extension Automation {
         return "ok \(along), let go: \(app.threads[id]?.isArchived == true ? "archived" : "not archived")"
     }
 
-    /// Two fingers across the middle of the window (`{"dx": 150}`, right
-    /// positive, so Back), through the handler SwipeNavigation's monitor
-    /// calls. A made-up event has no window of its own, so, as for
-    /// `mouse-button`, it's handed the main one. `"lift": false` leaves the fingers down, for a shot of
-    /// the arrow. Says how far along it got and where the window is after.
+    /// Two fingers across the middle of the window (`{"dx": 150, "dy": 0}`,
+    /// the content's way, right and down positive; right is Back), through the handler
+    /// SwipeNavigation's monitor calls. A made-up event has no window of its
+    /// own, so, as for `mouse-button`, it's handed the main one. `"lift":
+    /// false` leaves the fingers down, for a shot of the arrow; a later
+    /// page-swipe carries on. Says how far it got and where the window is after.
     static func pageSwipe(_ c: [String: Any], app: AppModel) async -> String {
-        let dx = number(c["dx"]) ?? 0
+        guard let window = MainWindowFrame.window else { return "error no window" }
+        let dx = number(c["dx"]) ?? 0, dy = number(c["dy"]) ?? 0
         let steps = max(1, Int(number(c["steps"]) ?? 8))
-        let fresh = SwipeNavigation.shared.swipe.phase == .idle
-        if fresh { page(RowSwipeEvents.event(dx: 0, phase: .began, middle: true)) }
+        func page(_ x: Double, _ y: Double, _ phase: RowSwipeEvents.Phase) {
+            guard let event = RowSwipeEvents.event(dx: x, dy: y, phase: phase, middle: true, content: true) else { return }
+            _ = SwipeNavigation.shared.handle(event, in: window)
+        }
+        if SwipeNavigation.shared.swipe.phase == .idle { page(0, 0, .began) }
         for _ in 0..<steps {
-            page(RowSwipeEvents.event(dx: dx / Double(steps), phase: .changed, middle: true))
+            page(dx / Double(steps), dy / Double(steps), .changed)
             try? await Task.sleep(for: .milliseconds(16))
         }
-        try? await Task.sleep(for: .milliseconds(50))
         let swipe = SwipeNavigation.shared.swipe
         let along = "\(swipe.direction.map { "\($0)" } ?? "no swipe") progress \(String(format: "%.2f", swipe.progress)) armed \(swipe.armed)"
         guard c["lift"] as? Bool ?? true else { return "ok \(along)" }
-        page(RowSwipeEvents.event(dx: 0, phase: .ended, middle: true))
+        page(0, 0, .ended)
         try? await Task.sleep(for: .milliseconds(300))
         return "ok \(along), let go: \(app.selection ?? "new") back=\(app.canGoBack) forward=\(app.canGoForward)"
-    }
-
-    /// A page swipe's event, to the main window's handler.
-    private static func page(_ event: NSEvent?) {
-        guard let event else { return }
-        _ = SwipeNavigation.shared.handle(event, in: MainWindowFrame.window)
     }
 
     static func post(_ event: NSEvent?) {

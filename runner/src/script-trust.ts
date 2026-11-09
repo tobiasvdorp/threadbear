@@ -34,8 +34,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isBuiltin } from 'node:module';
+import { bareImport, inNodeModules, linkedPackages, packageFiles } from './tracked-packages.ts';
 
-export type ScriptReach = { files: string[]; missing: string[]; problem?: string };
+// `outside`: with FollowOptions.outside, the scripts it runs or loads that
+// aren't the repo's, which a schedule's check binds too (patch-trust.ts).
+// Each with the folders it runs from, as its own relative paths are those.
+export type ScriptReach = { files: string[]; missing: string[]; problem?: string; outside?: { file: string; dirs: string[] }[] };
 
 // The most of one file patch trust reads (a patch, a helper, a script, a
 // config file); it reads one bigger than this not at all, and fails closed.
@@ -80,6 +85,17 @@ export class Reads {
     const t = b.toString('utf8');
     this.texts.set(real, t);
     return t;
+  }
+
+  // A file the hash depends on without reading it (git's index, which says
+  // what the repo tracks under node_modules: tracked-packages.ts), so a
+  // cached hash looks again once it changes.
+  watch(p: string): void {
+    try {
+      this.prints.set(p, fingerprint(p));
+    } catch {
+      this.links.set(p, '');
+    }
   }
 
   // Files over MAX_READ_BYTES, not read: a hash that needed one can't
@@ -143,7 +159,9 @@ export type FollowOptions = {
   top: string; // the repo's top; only files inside it are the repo's to change
   home?: string;
   // From patch-trust.ts, passed in so the two don't import each other.
-  scanJs: (src: string, file: string) => { specifiers: string[]; strings: string[]; problem?: string };
+  // `packages`: its bare imports, followed when the repo commits them
+  // (tracked-packages.ts).
+  scanJs: (src: string, file: string) => { specifiers: string[]; packages?: string[]; strings: string[]; problem?: string };
   resolveImport: (dir: string, spec: string) => string;
   namedPaths: (src: string) => string[];
   // Shared with the caller's hash, so it hashes the bytes followed here.
@@ -157,6 +175,10 @@ export type FollowOptions = {
   // from the folder (a formatter, a test runner or a build tool loads its
   // config and plugins from there by its own rules).
   strict?: boolean;
+  // Note the scripts it reaches outside the repo (ScriptReach.outside),
+  // which are nobody's to change but yours and otherwise aren't looked at:
+  // a schedule's check runs them unattended, by a path as often as not.
+  outside?: boolean;
 };
 
 // Bounds: a script reaching more than this can't be checked.
@@ -182,7 +204,7 @@ const UNFOLLOWABLE: Record<string, string> = {
   fc: 'runs commands from history (`fc`)',
 };
 // Environment that makes a shell, Node or the loader run other code.
-const RISKY_ENV = new Set([
+export const RISKY_ENV = new Set([
   'BASH_ENV', 'ENV', 'ZDOTDIR', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
   'DYLD_LIBRARY_PATH', 'DYLD_FRAMEWORK_PATH', 'PYTHONPATH', 'PYTHONSTARTUP', 'RUBYOPT', 'PERL5OPT',
   'PERL5LIB', 'PROMPT_COMMAND', 'npm_config_script_shell', 'NPM_CONFIG_SCRIPT_SHELL', 'npm_config_node_options',
@@ -626,7 +648,11 @@ type Ctx = {
 class Reach {
   files = new Set<string>();
   missing = new Set<string>();
+  outside = new Map<string, Set<string>>();
   problem?: string;
+  // The package folders whose node_modules/.bin a package script has first
+  // on PATH, while one is being followed.
+  private binDirs: string[] = [];
   private visits = new Set<string>();
   private wraps = 0;
   // Each function a script defines, by the line it's defined on.
@@ -675,7 +701,7 @@ class Reach {
   follow(file: string, how: 'run' | 'source' | 'load' | 'named', ctx: Ctx | undefined, line?: number): void {
     if (this.problem) return;
     const abs = path.resolve(file);
-    if (!this.inRepo(abs)) return;
+    if (!this.inRepo(abs)) return this.noteOutside(abs, how, ctx, line);
     if (how === 'named' && !looksRunnable(abs)) return;
     const passive = how === 'named' || how === 'load';
     const found = this.reads.real(abs);
@@ -738,6 +764,191 @@ class Reach {
     this.shell(text, { label, file: abs, argv0: [abs], dirs: startDirs, vars: new Map(), depth });
   }
 
+  // A script outside the repo this reaches (FollowOptions.outside). A
+  // program (/usr/bin/git, a brew binary) isn't one: its bytes change with
+  // every upgrade, and programs aren't followed anyway.
+  private noteOutside(abs: string, how: 'run' | 'source' | 'load' | 'named', ctx: Ctx | undefined, line: number | undefined): void {
+    if (!this.o.outside || this.outside.size >= MAX_SCRIPT_FILES) return;
+    if (how === 'named' && !looksRunnable(abs)) return;
+    const real = this.reads.real(abs);
+    if (real === undefined || !isFile(real) || isBinary(real)) return;
+    // It keeps the folder it was run from, so its `. ./helper.sh` is there,
+    // not beside it (Codex's review, 7 Nov).
+    if (ctx?.lost) return this.fail(ctx, line, `runs ${abs} after a cd patch trust couldn't follow (${ctx.lost}), so it can't tell what that script's relative paths are.`);
+    const dirs = this.outside.get(real) ?? new Set<string>();
+    for (const d of ctx ? ctx.dirs : [this.o.folder]) dirs.add(d);
+    this.outside.set(real, dirs);
+    // It's followed as a process of its own, later, but a sourced one can
+    // change this shell's folder and variables, so what's run after it here
+    // can't be told (hashed all the same, above).
+    if (how === 'source') this.fail(ctx, line, `sources ${abs}, outside the repo, whose changes to this shell patch trust can't follow.`);
+  }
+
+  // Bare imports and `node --import x`: what the repo commits under
+  // node_modules (tracked-packages.ts), and a package that's a link to a
+  // folder of the repo's. A workspace or `file:` package is what npm links
+  // like that, and Node follows the link, so its files are the repo's to
+  // change, though nothing under node_modules is (Daybreak, 7 Nov). A
+  // package npm installed is neither, and isn't hashed (Mike's call, 7 Nov).
+  private barePackage(fromDir: string, spec: string, ctx: Ctx, label: string): void {
+    if (isBuiltin(spec) || spec.startsWith('node:')) return;
+    // Node's self-reference needs neither git nor a node_modules.
+    const own = this.ownPackage(fromDir, spec);
+    if (own) return this.fail(undefined, undefined, `${label} imports ${spec}, its own package by name, which ${own}'s \`exports\` send to a file by rules patch trust doesn't follow. Import the file by a plain path.`);
+    const bare = bareImport(fromDir, spec, this.o.top, this.reads);
+    if (bare && 'problem' in bare) return this.fail(undefined, undefined, `${label} imports ${spec}, and ${bare.problem}`);
+    for (const f of bare?.files ?? []) this.follow(f, 'load', ctx);
+    if (this.problem) return;
+    // All of them, not only the one it names, as an installed package may
+    // import one too (Codex's review, 7 Nov), as for what's committed.
+    const links = linkedPackages(fromDir, this.o.top, this.reads);
+    for (const linked of links) {
+      const code = packageFiles(linked, MAX_SCRIPT_FILES);
+      if ('problem' in code) return this.fail(undefined, undefined, `${label} imports ${spec}, and ${this.rel(linked)}, a package the repo links into node_modules: ${code.problem}`);
+      // Whatever they look like, as its manifest can export any of them.
+      for (const f of code.files) this.follow(f, 'load', ctx);
+      if (this.problem) return;
+    }
+    // What decides which of those files runs as code: a file Node would run
+    // that the follower reads as data was hashed, but what it loads wasn't.
+    const manifests = [...links, ...(bare?.files ?? []).filter((f) => path.basename(f) === 'package.json').map((f) => path.dirname(f))];
+    for (const dir of manifests) {
+      const odd = this.exportedOddly(dir);
+      if (odd) return this.fail(undefined, undefined, `${label} imports ${spec}, and ${this.rel(dir)}'s package.json points at ${odd}, which isn't JavaScript patch trust can follow, though Node would run it.`);
+    }
+    const sub = this.oddSubpath(fromDir, spec);
+    if (sub) this.fail(undefined, undefined, `${label} imports ${spec}, ${this.rel(sub)}, which isn't JavaScript patch trust can follow, though Node would run it.`);
+  }
+
+  // The file a bare import names directly in a node_modules (`wsp/payload`,
+  // or `payload` for a file there of that name), when it's the repo's and
+  // not JavaScript: require() runs any file it's given by its exact name as
+  // CommonJS.
+  private oddSubpath(fromDir: string, spec: string): string | undefined {
+    for (let d = fromDir; this.inRepo(d); d = path.dirname(d)) {
+      const real = this.reads.real(path.join(d, 'node_modules', spec));
+      if (real !== undefined && isFile(real) && this.inRepo(real)) {
+        if (path.extname(real) === '.json' || JS_EXT.includes(path.extname(real))) return undefined;
+        // Installed packages stay as they are: only the repo's own.
+        const t = bareImport(fromDir, spec, this.o.top, this.reads);
+        const committed = t && !('problem' in t) && t.files.includes(real);
+        return committed || !inNodeModules(path.relative(this.o.top, real)) ? real : undefined;
+      }
+      if (d === this.o.top || path.dirname(d) === d) break;
+    }
+    return undefined;
+  }
+
+  // The package.json a bare import is its own package's by name, when Node
+  // would resolve it through that: the nearest one up has this `name` and an
+  // `exports` (Node's self-reference), so it loads a file of the repo's no
+  // lookup in node_modules finds, as a pull renaming a package can arrange
+  // (patches' own imports are refused the same way, verified-imports.ts).
+  // Read and noticed, not hashed: an install writes package.json too.
+  private ownPackage(fromDir: string, spec: string): string | undefined {
+    if (inNodeModules(path.relative(this.o.top, fromDir))) return undefined;
+    const parts = spec.split('/');
+    const name = (spec.startsWith('@') ? parts.slice(0, 2) : parts.slice(0, 1)).join('/');
+    for (let d = fromDir; this.inRepo(d); d = path.dirname(d)) {
+      const real = this.reads.real(path.join(d, 'package.json'));
+      if (real !== undefined && isFile(real)) {
+        try {
+          const pkg = JSON.parse(this.reads.text(real) ?? '') as { name?: unknown; exports?: unknown };
+          return pkg?.name === name && pkg.exports !== undefined && pkg.exports !== null ? this.rel(real) : undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      if (d === this.o.top || path.dirname(d) === d) break;
+    }
+    return undefined;
+  }
+
+  // A file a linked package's manifest names as what loads (`exports`,
+  // `main`, `module`, `bin`) that isn't one the follower reads as
+  // JavaScript: a CommonJS file with no extension runs all the same.
+  private exportedOddly(pkgDir: string): string | undefined {
+    const real = this.reads.real(path.join(pkgDir, 'package.json'));
+    if (real === undefined || !isFile(real)) return undefined;
+    let pkg: Record<string, unknown>;
+    try {
+      pkg = JSON.parse(this.reads.text(real) ?? '') as Record<string, unknown>;
+    } catch {
+      return this.rel(real);
+    }
+    const out: string[] = [];
+    const walk = (v: unknown): void => {
+      if (typeof v === 'string') out.push(v);
+      else if (Array.isArray(v)) v.forEach(walk);
+      else if (v && typeof v === 'object') Object.values(v).forEach(walk);
+    };
+    for (const k of ['exports', 'main', 'module', 'bin']) walk(pkg?.[k]);
+    for (const v of out) {
+      // A pattern: only one that says it ends in JavaScript can be told apart.
+      if (v.includes('*')) {
+        if (!JS_EXT.includes(path.extname(v)) && path.extname(v) !== '.json') return v;
+        continue;
+      }
+      const p = path.resolve(pkgDir, v);
+      if (isFile(p) && !JS_EXT.includes(path.extname(p)) && path.extname(p) !== '.json') return v;
+    }
+    return undefined;
+  }
+
+  // Everything the repo commits under node_modules, once a package manager
+  // runs: its scripts' programs come from node_modules/.bin, an install runs
+  // the lifecycle scripts of what's there, and `npx x` what x's bin says, so
+  // a committed package's bytes run without any import naming them.
+  private committedPackages(fromDir: string, ctx: Ctx, line: number): void {
+    const bare = bareImport(fromDir, ANY_PACKAGE, this.o.top, this.reads);
+    if (!bare) return;
+    if ('problem' in bare) {
+      // git can't say, which only matters with a node_modules on the way up
+      // for a package manager to use: an import has to be refused anyway.
+      for (let d = fromDir; this.inRepo(d); d = path.dirname(d)) {
+        if (this.reads.real(path.join(d, 'node_modules')) !== undefined) return this.fail(ctx, line, `runs a package manager, and ${bare.problem}`);
+        if (d === this.o.top || path.dirname(d) === d) break;
+      }
+      return;
+    }
+    // Those a shell would run by name are what they'd be run as: a committed
+    // .bin file with no #! runs as a shell script, though it reads as data.
+    for (const f of bare.files) this.follow(f, path.basename(path.dirname(f)) === '.bin' ? 'run' : 'load', ctx, line);
+  }
+
+  // What the repo commits under node_modules, with a lifecycle script of its
+  // own: `npm rebuild` or an install runs those from that package's folder,
+  // and one may run a file of the repo's that isn't under node_modules at all.
+  private committedLifecycle(fromDir: string, ctx: Ctx, line: number): void {
+    const bare = bareImport(fromDir, ANY_PACKAGE, this.o.top, this.reads);
+    if (!bare || 'problem' in bare) return;
+    for (const f of bare.files) {
+      if (path.basename(f) !== 'package.json') continue;
+      try {
+        this.runScripts(path.dirname(f), JSON.parse(this.text(f) ?? '') as Record<string, any>, LIFECYCLE, ctx);
+      } catch {
+        this.fail(ctx, line, `installs ${this.rel(f)}, which can't be read, so patch trust can't tell what it runs.`);
+      }
+      if (this.problem) return;
+    }
+  }
+
+  // The file a program name is in a package's node_modules/.bin, when it's
+  // a link to a file of the repo's outside node_modules (a workspace
+  // package's bin). A committed one is hashed with the rest
+  // (committedPackages), and an installed one isn't, by design.
+  private repoBin(name: string, dirs: Iterable<string>): string | undefined {
+    if (!/^[\w@.+-]+$/.test(name)) return undefined;
+    for (const dir of dirs) {
+      for (let d = dir; this.inRepo(d); d = path.dirname(d)) {
+        const real = this.reads.real(path.join(d, 'node_modules', '.bin', name));
+        if (real !== undefined) return this.inRepo(real) && !inNodeModules(path.relative(this.o.top, real)) ? real : undefined;
+        if (d === this.o.top || path.dirname(d) === d) break;
+      }
+    }
+    return undefined;
+  }
+
   private js(file: string, text: string, dirs: Set<string>, depth: number): void {
     const scan = this.o.scanJs(text, file);
     const label = this.rel(file);
@@ -750,7 +961,20 @@ class Reach {
       return this.fail(undefined, undefined, `${label} runs other commands or native code itself, which a hash can't follow. Run them from a shell script instead.`);
     }
     const ctx: Ctx = { label, file, argv0: [file], dirs, vars: new Map(), depth };
-    for (const spec of scan.specifiers) this.follow(this.o.resolveImport(path.dirname(file), spec), 'load', ctx);
+    for (const spec of scan.specifiers) {
+      const target = this.o.resolveImport(path.dirname(file), spec);
+      // require() runs a file it's given by its exact name as CommonJS,
+      // whatever it's called, but read as data what it loads isn't followed.
+      const ext = path.extname(target);
+      if (this.inRepo(target) && isFile(target) && !JS_EXT.includes(ext) && ext !== '.json') return this.fail(undefined, undefined, `${label} loads ${this.rel(target)}, which isn't JavaScript patch trust can follow, though Node would run it.`);
+      this.follow(target, 'load', ctx);
+    }
+    // A package inside the repo: what the repo commits under node_modules
+    // is its own code, hashed and followed; an installed one isn't.
+    for (const spec of scan.packages ?? []) {
+      this.barePackage(path.dirname(file), spec, ctx, label);
+      if (this.problem) return;
+    }
     this.namedIn(text, file, ctx);
     // A string naming a file of the repo's (`spawnSync('bash', ['scripts/x.sh'])`).
     for (const s of scan.strings) {
@@ -934,9 +1158,26 @@ class Reach {
     if (RISKY_ENV.has(name)) return this.fail(ctx, line, `sets ${name}, which makes other code load, so patch trust can't follow what runs.`);
     if (name === 'NODE_OPTIONS' && (!vals || vals.some((v) => LOADING_FLAG.test(v)))) return this.fail(ctx, line, 'sets NODE_OPTIONS to load other code, which patch trust can\'t follow.');
     if (name === 'PATH' || name === 'path') {
-      const entries = vals?.flatMap((v) => v.split(/[: ]/)).filter(Boolean);
+      // An empty entry is the current folder (a leading or trailing `:`, or
+      // `::`), so it's left in to be refused, as `.` is (Codex's review, 7 Nov).
+      const entries = vals?.flatMap((v) => (name === 'PATH' ? v.split(':') : v.split(' ')));
       const ok = entries?.every((e) => e === PATH_SENTINEL || /\/node_modules\/\.bin\/?$/.test(e) || (path.isAbsolute(e) && !this.inRepo(e)));
       if (!ok || append) return this.fail(ctx, line, "puts a folder on PATH that patch trust can't vouch for, so it can't tell what a command name runs.");
+      // A package's bin folder, as a package script has first on PATH:
+      // a name after this may be a program of the repo's, committed or a
+      // workspace's, not an installed one (Codex's review, 7 Nov).
+      for (const e of entries ?? []) {
+        if (e === PATH_SENTINEL || !/\/node_modules\/\.bin\/?$/.test(e)) continue;
+        const bins = this.abs(e, ctx);
+        if (!bins) return this.fail(ctx, line, "puts a package's bin folder on PATH after a cd patch trust couldn't follow, so it can't tell what a command name runs.");
+        for (const bin of bins) {
+          if (!this.inRepo(bin)) continue;
+          const pkg = path.dirname(path.dirname(bin));
+          this.committedPackages(pkg, ctx, line);
+          if (this.problem) return;
+          this.binDirs = [...this.binDirs, pkg];
+        }
+      }
     }
     ctx.vars.set(name, append ? undefined : vals);
   }
@@ -1069,7 +1310,14 @@ class Reach {
       }
       // /dev/fd/3 after `exec 3< ./x.sh` is x.sh.
       if (targets.some(readsInput)) return this.fail(ctx, line, `runs ${name}, which is a file it has open, so patch trust can't tell what runs.`);
+      for (const t of targets) this.noteOutside(t, 'run', ctx, line);
       return this.program(path.basename(name), args, ctx, line, extra);
+    }
+    // In a package script, node_modules/.bin comes first on PATH.
+    // (A hook's are refused below, or by the short list: nothing more to add.)
+    if (!this.o.strict && this.binDirs.length) {
+      const bin = this.repoBin(name, this.binDirs);
+      if (bin) return this.follow(bin, 'run', ctx, line);
     }
     this.program(name, args, ctx, line, extra);
   }
@@ -1388,7 +1636,15 @@ class Reach {
         const v = load[2] ?? this.str(args[++i], ctx);
         if (v === undefined) return this.fail(ctx, line, `runs ${name} loading a module worked out as it runs, which patch trust can't follow.`);
         if (/^\.{0,2}\//.test(v) || v.startsWith('file:')) this.runFile(v.replace(/^file:\/\//, ''), ctx, line);
-        else if (this.o.strict && /^(data|https?|blob):/i.test(v)) return this.fail(ctx, line, `runs ${name} loading code from a URL (${v.slice(0, 40)}), which a hash can't follow.`);
+        // As a module's own import of them is refused (scanModule): a `#`
+        // maps through package.json to a file this doesn't follow, and a
+        // URL's code isn't a file at all.
+        else if (v.startsWith('#') || (/^[a-z]+:/i.test(v) && !v.startsWith('node:'))) return this.fail(ctx, line, `runs ${name} loading ${v.slice(0, 40)}, which a hash can't follow.`);
+        // A package, loaded before the script: as a bare import is.
+        else {
+          for (const d of ctx.lost ? [] : ctx.dirs) this.barePackage(d, v, ctx, ctx.label);
+          if (this.problem) return;
+        }
         continue;
       }
       // Symlinks kept as named change which files a module's imports are.
@@ -1428,6 +1684,8 @@ class Reach {
     }
     const out: { dir: string; pkg: Record<string, any> }[] = [];
     for (const start of ctx.dirs) {
+      this.committedPackages(start, ctx, line);
+      if (this.problem) return undefined;
       for (let d = start; this.inRepo(d); d = path.dirname(d)) {
         for (const rc of ['.npmrc', '.yarnrc', '.yarnrc.yml', 'bunfig.toml', '.pnpmfile.cjs', 'pnpm-workspace.yaml']) {
           const f = path.join(d, rc);
@@ -1503,14 +1761,21 @@ class Reach {
       const key = `script ${dir} ${n}`;
       if (typeof text !== 'string' || this.visits.has(key)) continue;
       this.visits.add(key);
-      // A package script runs through sh in the package's folder.
-      this.shell(text, { label: `${this.rel(path.join(dir, 'package.json'))}'s "${n}" script`, file: path.join(dir, 'package.json'), argv0: [], dirs: new Set([dir]), vars: new Map(), depth: ctx.depth + 1 });
+      // A package script runs through sh in the package's folder, with its
+      // node_modules/.bin (and those of the folders above) first on PATH.
+      const outer = this.binDirs;
+      this.binDirs = [dir];
+      try {
+        this.shell(text, { label: `${this.rel(path.join(dir, 'package.json'))}'s "${n}" script`, file: path.join(dir, 'package.json'), argv0: [], dirs: new Set([dir]), vars: new Map(), depth: ctx.depth + 1 });
+      } finally {
+        this.binDirs = outer;
+      }
     }
   }
 
   // `npm run x`, `yarn x`, `bun x`: the script by that name, and what runs
-  // before and after it. Without one, it's a package's bin, which the
-  // package.json's versions pin.
+  // before and after it. Without one, it's a package's bin: installed, as
+  // the package.json's versions pin, or one of the repo's (repoBin).
   private packageScript(name: string, ctx: Ctx, line: number): void {
     const pkgs = this.packages(ctx, line);
     if (!pkgs) return;
@@ -1518,6 +1783,10 @@ class Reach {
     // server.js; pnpm and yarn a package's bin of that name).
     if (this.o.strict && !pkgs.some(({ pkg }) => typeof pkg?.scripts?.[name] === 'string')) {
       return this.fail(ctx, line, `runs the package script ${name}, which isn't in package.json, so what runs instead is worked out by the package manager.`);
+    }
+    if (!pkgs.some(({ pkg }) => typeof pkg?.scripts?.[name] === 'string')) {
+      const bin = this.repoBin(name, ctx.dirs);
+      if (bin) return this.follow(bin, 'run', ctx, line);
     }
     for (const { dir, pkg } of pkgs) this.runScripts(dir, pkg, [`pre${name}`, name, `post${name}`], ctx);
   }
@@ -1529,6 +1798,7 @@ class Reach {
     if (!pkgs) return;
     for (const { dir, pkg } of pkgs) {
       this.runScripts(dir, pkg, LIFECYCLE, ctx);
+      this.committedLifecycle(dir, ctx, line);
       for (const sub of this.localPackages(dir, pkg)) {
         const f = path.join(sub, 'package.json');
         if (!isFile(f) || !this.inRepo(f)) continue;
@@ -1622,10 +1892,23 @@ class Reach {
     for (let i = 0; i < args.length; i++) {
       const s = this.str(args[i], ctx);
       if (s === undefined) return this.fail(ctx, line, "runs a package worked out as it runs, which patch trust can't follow.");
-      if (s === '-c' || s === '--call') {
-        const code = args[i + 1] ? litOf(args[i + 1]!) : undefined;
+      // However npm reads it: it takes a shortened name, and `=`.
+      const call = /^(-c|--(?:c|ca|cal|call))(=|$)/.exec(s);
+      if (call) {
+        const whole = litOf(args[i]!);
+        const code = call[2] === '=' ? whole?.slice(call[1]!.length + 1) : args[i + 1] ? litOf(args[i + 1]!) : undefined;
         if (code === undefined) return this.fail(ctx, line, "runs `npx -c` with code worked out as it runs, which patch trust can't follow.");
-        return this.shell(code, { ...ctx, argv0: [], vars: new Map(), dirs: new Set(ctx.dirs) }, line);
+        // Run as a package script is: with what the repo commits hashed,
+        // and its node_modules/.bin first on PATH.
+        this.packages(ctx, line);
+        if (this.problem) return;
+        const outer = this.binDirs;
+        this.binDirs = [...outer, ...ctx.dirs];
+        try {
+          return this.shell(code, { ...ctx, argv0: [], vars: new Map(), dirs: new Set(ctx.dirs) }, line);
+        } finally {
+          this.binDirs = outer;
+        }
       }
       if (s === '-p' || s === '--package') {
         i++;
@@ -1634,8 +1917,12 @@ class Reach {
       if (s.startsWith('-')) continue;
       if (/^\.{0,2}\//.test(s)) return this.runFile(s, ctx, line);
       if (this.o.strict) return this.fail(ctx, line, `runs the package ${s} by name (npx or the like), which runs whatever that name resolves to then, so a hash can't cover it.`);
-      // A package: its version is the package.json's.
+      // A package: its version is the package.json's, what the repo commits
+      // is hashed (packages), and a bin of the repo's own runs as a script.
       this.packages(ctx, line);
+      if (this.problem || ctx.lost) return;
+      const bin = this.repoBin(s, ctx.dirs);
+      if (bin) this.follow(bin, 'run', ctx, line);
       return;
     }
   }
@@ -1823,7 +2110,7 @@ export function rcConfig(base: string, text: string): { paths: string[]; problem
 
 // An .npmrc line's key as npm's ini reader takes it (quotes off), in one
 // spelling (lower case, `-` for `_`), or '' for a comment.
-function npmKey(line: string): string {
+export function npmKey(line: string): string {
   if (line.startsWith('#') || line.startsWith(';')) return '';
   const eq = line.indexOf('=');
   let key = (eq < 0 ? line : line.slice(0, eq)).trim();
@@ -1958,7 +2245,7 @@ const INPUT_PATH = /^\/(dev\/(stdin|tty|fd\/\d+)|proc\/(self|thread-self|\d+)\/f
 // Whether running or sourcing `p` reads what to run from the process's
 // input: one of those paths, or anything there that isn't a plain file
 // (a link to one, in the repo or not, a fifo, a device).
-function readsInput(p: string): boolean {
+export function readsInput(p: string): boolean {
   if (INPUT_PATH.test(path.normalize(p))) return true;
   try {
     if (INPUT_PATH.test(fs.realpathSync(p))) return true;
@@ -1976,7 +2263,7 @@ function readsInput(p: string): boolean {
 
 // Whether a shell script's #! passes the shell a flag that has it read
 // commands from somewhere other than the script.
-function shebangReadsElsewhere(text: string): boolean {
+export function shebangReadsElsewhere(text: string): boolean {
   const m = /^#![ \t]*(\S+)([^\n]*)/.exec(text);
   if (!m) return false;
   const words = m[2]!.trim().split(/[ \t]+/).filter(Boolean);
@@ -2014,9 +2301,27 @@ function isFile(p: string): boolean {
   }
 }
 
+// A name no package has, for "any bare import" (bareImport's answer doesn't
+// depend on which, only that it isn't a builtin).
+const ANY_PACKAGE = 'any-package';
+
+// Whether a file's start has a NUL: a program, not a script.
+export function isBinary(file: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const buf = Buffer.alloc(512);
+    return buf.subarray(0, fs.readSync(fd, buf, 0, 512, 0)).includes(0);
+  } catch {
+    return true;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 // How a file runs: by its #! line, else its extension. A file run with no
 // #! goes to sh, so it's a shell script then.
-function kindOf(file: string, text: string, running: boolean): 'shell' | 'js' | 'binary' | 'other' {
+export function kindOf(file: string, text: string, running: boolean): 'shell' | 'js' | 'binary' | 'other' {
   if (text.slice(0, 512).includes('\0')) return 'binary';
   const shebang = /^#!\s*(\S+)(?:\s+(.*))?/.exec(text);
   if (shebang) {
@@ -2042,7 +2347,7 @@ export function reachOf(file: string, opts: FollowOptions): ScriptReach {
     // A bug here mustn't let the script through: it fails closed.
     r.problem ??= `couldn't be followed (${(e as Error).message}).`;
   }
-  return { files: [...r.files], missing: [...r.missing], ...(r.problem ? { problem: r.problem } : {}) };
+  return { files: [...r.files], missing: [...r.missing], ...(r.problem ? { problem: r.problem } : {}), ...outsideOf(r) };
 }
 
 // The same for a command a patch writes (an action's `run`, a live
@@ -2057,5 +2362,9 @@ export function reachOfCommand(command: string, label: string, opts: FollowOptio
   } catch (e) {
     r.problem ??= `couldn't be followed (${(e as Error).message}).`;
   }
-  return { files: [...r.files], missing: [...r.missing], ...(r.problem ? { problem: r.problem } : {}) };
+  return { files: [...r.files], missing: [...r.missing], ...(r.problem ? { problem: r.problem } : {}), ...outsideOf(r) };
+}
+
+function outsideOf(r: Reach): { outside?: { file: string; dirs: string[] }[] } {
+  return r.outside.size ? { outside: [...r.outside].map(([file, dirs]) => ({ file, dirs: [...dirs] })) } : {};
 }

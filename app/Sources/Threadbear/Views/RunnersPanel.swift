@@ -45,10 +45,11 @@ struct RunnersPanel: View {
                         .font(.system(size: zoomed(11), weight: .medium))
                         .foregroundStyle(.tertiary)
                     Spacer(minLength: 0)
-                    Button { app.loadRunners() } label: {
+                    Button { app.refreshRunners() } label: {
                         Image(systemName: "arrow.clockwise").font(.system(size: zoomed(11)))
                     }
                     .buttonStyle(.borderless)
+                    .busy(app.isBusy(BusyKey.refreshRunners))
                     .foregroundStyle(.secondary)
                     .tip("Check the runners again now")
                     Button { aboutShown.toggle() } label: {
@@ -59,13 +60,28 @@ struct RunnersPanel: View {
                     .tip("What this panel shows")
                     .popover(isPresented: $aboutShown, arrowEdge: .bottom) { RunnersAbout() }
                 }
-                ForEach(runners) { runner in
+                // In Mike's order, the phone's and Settings' too, and
+                // dragged into another here (Mike, 8 Nov).
+                let ordered = app.orderedRunners
+                let card = { (runner: RunnerInfo) in
                     RunnerCard(runner: runner, running: RunnersText.running(on: runner, in: running),
-                               open: open.contains(runner.id)) {
+                               open: open.contains(runner.id), movable: app.canOrderRunners) {
                         var next = open
                         if next.contains(runner.id) { next.remove(runner.id) } else { next.insert(runner.id) }
                         openIds = next.sorted().joined(separator: ",")
                     }
+                }
+                if app.canOrderRunners {
+                    ReorderList(ids: ordered.map(\.id), style: .cards(spacing: zoomed(14)), preview: app.runnerPanelDragPreview,
+                                commit: { app.setRunnerOrder(part: $0) }) { id in
+                        if let runner = ordered.first(where: { $0.id == id }) {
+                            card(runner)
+                                .accessibilityAction(named: "Move up") { app.moveRunner(id, by: -1) }
+                                .accessibilityAction(named: "Move down") { app.moveRunner(id, by: 1) }
+                        }
+                    }
+                } else {
+                    ForEach(ordered) { card($0) }
                 }
             }
             .padding(zoomed(16))
@@ -107,6 +123,8 @@ private struct RunnerCard: View {
     let running: [ThreadSummary]
     /// Its details (CPU, memory, disk) are showing.
     let open: Bool
+    /// In a list that drags into Mike's order: a handle on the left, as in Settings.
+    var movable = false
     let toggle: () -> Void
     @State private var hovered = false
     /// Past this many the rest are a count: the panel is a glance, and
@@ -116,6 +134,14 @@ private struct RunnerCard: View {
     var body: some View {
         let state = RunnersText.state(runner)
         HStack(alignment: .top, spacing: zoomed(10)) {
+            if movable {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: zoomed(11)))
+                    .foregroundStyle(.tertiary)
+                    .frame(height: zoomed(17))
+                    .tip("Drag to change the order")
+                    .accessibilityHidden(true)
+            }
             Image(systemName: RunnerIcon.symbol(runner.icon))
                 .font(.system(size: zoomed(15)))
                 .foregroundStyle(state == .offline ? .tertiary : .secondary)

@@ -75,7 +75,8 @@ Archive moved off Convex because of reads and writes, not storage).
 **Self-hosted as an option:** the same functions run on Convex's open source backend on
 your own machine, served over Tailscale. It's a setting in setup, not a fork. The phone
 then needs Tailscale on, and it can't reach a sleeping Mac unless the backend lives on an
-always-on machine.
+always-on machine. Built 7 Nov (docs/self-hosting.md): `setup --self-hosted`, with no
+phone notifications, as the push relay only reaches Convex cloud.
 
 ### 2.2 Setup: one command
 
@@ -118,7 +119,8 @@ changing someone's Threadbear uses the lowest layer that does the job:
 Mike's own runner tags the newest commit it has been running as its last good release
 for at least six hours, as `release/YYYY-MM-DD`, if anything changed since the last tag.
 It also waits until GitHub's checks (the Xcode 26 builds) have passed on that exact
-commit, as the runner staying up says nothing about the apps building. A release held
+commit, as the runner staying up says nothing about the apps building. Nothing else
+pushes main, so the runner pushes a settled main to GitHub first if it isn't there yet. A release held
 back says why in `tb status` and the Updates panel, and goes out on the next hourly look
 once the checks are green. The tag is signed with Mike's SSH signing key and pushed to GitHub. The tag's message
 starts with plain-words notes ("What's new:", a few lines Opus writes from the commits
@@ -202,12 +204,14 @@ everyday things. Tailscale is the default for everything that's machine to machi
   website each one shows as a grey box of the right size, and loads only as you scroll
   to it, several at once (Mike, 28 Oct). When the Mac's asleep the box says "on your
   Mac" instead.
-- **A second runner:** Tinker Desk (plan step 6) writes to the same backend and shows up
-  on the phone and the website straight away. The Mac app talks to it over the tailnet,
-  so its threads can be steered from the laptop.
+- **A second runner:** built and supported (section 4, step 7). It writes to the same
+  backend and shows up on the phone and the website straight away. This proposal had the
+  Mac app reach it over the tailnet; today the first Mac's app reads and steers it through
+  Convex, so it needs no Tailscale, and Tailscale only adds the direct link in
+  Settings > Runners.
 - **A self-hosted backend**, for anyone who picks that option (2.1).
-- **Setup checks Tailscale** is installed and logged in, and says what you lose without
-  it (the heavy bits on the phone, a second runner) rather than refusing.
+- **Setup checks Tailscale** is installed and logged in, and says what it adds rather
+  than refusing.
 
 ## 3. What Mike needs to decide
 
@@ -263,8 +267,13 @@ it public is Mike's call, once he's happy for others to use it.
    thread (docs/bringing-in-updates.md); `tb land` never rebases a merge; setup forks
    and pins the key.
 6. The heavy bits over Tailscale for the phone and the website.
-7. Tinker Desk as a second runner on the same backend.
-8. Self-hosted backend as a setup option.
+7. Done 29 Oct: a second runner on the same backend, on Bruce rather than Tinker Desk.
+   Each one has its own key since 5 Nov (docs/protocol.md, "Runner keys"). Any number of
+   Macs or Linux servers can join: INSTALL.md sets them up.
+8. Done 7 Nov: self-hosted backend as a setup option (`setup --self-hosted`,
+   docs/self-hosting.md). Docker on the same Mac, served with `tailscale serve`,
+   phone notifications off. Convex cloud stays the default and the one we
+   recommend everywhere.
 
 Steps 1 and 2 are useful to Mike straight away. 3 to 5 are what make it installable by
 other people. The landing page already says "Threadbear makes a Convex deployment in

@@ -42,4 +42,19 @@ struct InlinePicturesTests {
         #expect(InlinePictures.unplaced("see [Picture 2]", count: 3) == 2)
         #expect(InlinePictures.pieces("no pictures [picture 1] [Picture 0]") == [.words("no pictures [picture 1] [Picture 0]")])
     }
+
+    /// The runner's "[2 pictures]" line goes once the photos are there to
+    /// show, and only then.
+    @Test func sentPhotosReplaceTheirLine() {
+        let photo = { (seq: Int, n: Int) in MessageImage(seq: seq, src: "picture:\(n)", url: "https://x/\(seq)-\(n)") }
+        let both = ThreadPictures([photo(5, 2), photo(5, 1), photo(4, 1), MessageImage(seq: 5, src: "/a.png", url: "https://x/a")])
+        #expect(both.pasted(seq: 5).map(\.url) == ["https://x/5-1", "https://x/5-2"])
+        #expect(both.words(of: "look\n\n[2 pictures]", seq: 5) == "look")
+        #expect(both.words(of: "[2 pictures]", seq: 5) == "")
+        // One kept on the Mac: the line stays.
+        #expect(ThreadPictures([photo(5, 1)]).words(of: "look\n\n[2 pictures]", seq: 5) == "look\n\n[2 pictures]")
+        // A marker places picture 1, so the line counts only picture 2.
+        #expect(ThreadPictures([photo(5, 2)]).words(of: "this [Picture 1]\n\n[1 picture]", seq: 5) == "this [Picture 1]")
+        #expect(ThreadPictures().words(of: "plain words", seq: 5) == "plain words")
+    }
 }

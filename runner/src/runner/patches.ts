@@ -10,48 +10,76 @@ import { ErrorCode, RpcError } from '../protocol.ts';
 import { Projects } from '../projects.ts';
 import { threadEnv } from '../restart.ts';
 import { paths } from '../config.ts';
+import { isDirectory } from '../fsutil.ts';
 import { commandFiles, isPatchFile, namedPaths, patchHash, scanModule, type ClaudeVerdict, type PatchHash } from '../patch-trust.ts';
 import type { AgentWrite } from '../adapters/types.ts';
 import { CLAUDE_PATCH_ID, claudeCommands, claudeOptions, settingsCommands, settingsNamedPaths, type ClaudeOptions } from '../claude-trust.ts';
-import { canonicalPath, runsAsCodeByName } from '../code-writes.ts';
+import { canonicalPath, runsAsCodeByName, type CodeWrite } from '../code-writes.ts';
 import type { PatchInfo } from '../protocol.ts';
-import { automaticTrust, EMPTY_PATCH_SET, PATCH_EXTENSIONS, patchDirs, hookApplies, loadPatchSet, applyLive, hasLive, projectPanels, renderListPanel, renderPanel, runCommand, type CommandOutcome, type PanelRender, type PatchSet, type ProjectFolder, projectPatchFiles } from '../patches.ts';
+import { actionRunProblem, automaticTrust, isInside, EMPTY_PATCH_SET, PATCH_EXTENSIONS, patchDirs, projectRoots, hookApplies, loadPatchSet, applyLive, hasLive, projectPanels, renderListPanel, renderPanel, runCommand, type CommandOutcome, type PanelRender, type PatchSet, type ProjectFolder, projectPatchFiles } from '../patches.ts';
+import { liveCommandEnv } from '../shell-allowlist.ts';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ThreadState, Turn } from '../runner.ts';
 import type { ThreadRecord } from '../store.ts';
 import { FOLDER_CACHE_MS, HOOK_TELL_CHARS, HOOK_TELL_LIMIT, LIVE_POLL_MS, LIVE_SHARE_MS, PATCHES_TTL_MS } from '../runner.ts';
+import { safeStart } from '../safe-cut.ts';
 
-// What a patch that loads without a hash makes code, for a thread in
-// `cwd` (writeRunsAsCode): every file it reaches, as canonical lower-case
-// paths, or `all` when it can't all be followed. Kept until anything its
-// hash was made from changes, and for a few seconds at most, as what a
-// command reaches from the thread's folder isn't in that hash.
+// What a patch that loads without a hash makes code, its commands run from
+// `from` (writeRunsAsCode): every file it reaches, as canonical lower-case
+// paths, and `all` when something it can run can't all be followed. Kept until
+// anything its hash was made from changes, and for a few seconds at most, as
+// what a command reaches from that folder isn't in that hash.
 type CodeScan = { at: number; h: PatchHash; all: boolean; files: Set<string> };
 const scans = new Map<string, CodeScan>();
+// The files in a Claude login's folder that hold its user settings.
+const LOGIN_SETTINGS = /^(settings(\..*)?\.json|\.claude\.json)$/i;
 const SCAN_TTL_MS = 10_000;
-function codeOfUnhashedPatch(file: string, cwd: string, now: number): CodeScan {
-  const key = `${file}\0${cwd}`;
+// A web address held in a constant (`const PAGE = \`https://x/\${id}\``), so not
+// in the default export where `url` would say so. Run as a command it's one
+// file by that very name, which `files` has: only characters a shell neither
+// splits at nor expands, so no `?`, `[`, `;` or `$`, and no `..` to leave the
+// folder by (Codex's review).
+const PLAIN_WEB_ADDRESS = /^https?:\/\/(?!.*\.\.)[\w.~/%:-]*$/i;
+function codeOfUnhashedPatch(file: string, from: string, now: number): CodeScan {
+  const key = `${file}\0${from}`;
   const hit = scans.get(key);
   if (hit && now - hit.at < SCAN_TTL_MS && hit.h.looked.same()) return hit;
   const h = patchHash(file);
   const files = new Set<string>();
   const add = (f: string) => files.add(canonicalPath(f).toLowerCase());
-  // One it can't follow all of, or that names a script that runs
-  // something it can't follow: any edit might be what it runs.
-  let all = Boolean(h.incomplete || h.blocked);
+  // Code it can't follow: any edit might be what it runs.
+  let all = Boolean(h.incomplete);
   for (const f of [file, h.root, ...h.deps.map((d) => d.path), ...h.unnamed]) add(f);
-  for (const [from, bytes] of all ? [] : h.code) {
+  const worktreeReach = new Set<string>();
+  // The folder holding its `.threadbear/patches`, as a worktree's commands run from there.
+  const patchFolder = path.dirname(path.dirname(path.dirname(file)));
+  for (const [module, bytes] of h.code) {
     const text = bytes.toString('utf8');
-    for (const n of namedPaths(text)) add(path.resolve(cwd, n));
-    // Each string in it as a command run from the thread's folder, as its
-    // hooks are: what that reaches.
-    for (const command of scanModule(text, from).strings) {
+    for (const n of namedPaths(text)) add(path.resolve(from, n));
+    // Each string in it as a command run from where its commands run: what
+    // that reaches, whatever it is. A problem means there may be more it
+    // runs, unless the patch file's own default export has it as something
+    // else (scanModule). A `worktree` setup and check don't count either. Setup
+    // runs what's committed, in a new worktree, and worktree-setup.sh won't
+    // install from an uncommitted package.json in the main checkout; the check
+    // runs when a land is asked for. So neither runs what an agent just wrote
+    // until it has got past a step that's asked about.
+    const scan = scanModule(text, module);
+    // Imported by anything it imports, its default export has a name after all.
+    const rootPath = canonicalPath(h.root);
+    const own = canonicalPath(module) === rootPath && ![...h.edges.values()].some((to) => [...to.values()].some((f) => canonicalPath(f) === rootPath));
+    const data = new Set(own ? scan.data : []);
+    const worktree = new Set(own ? scan.worktree : []);
+    for (const command of scan.strings) {
       if (!/\S/.test(command) || command.length > 2000) continue;
-      const reach = commandFiles(command, cwd);
-      if (reach.problem) all = true;
+      const reach = commandFiles(command, from);
       reach.files.forEach(add);
+      if (worktree.has(command)) {
+        for (const f of commandFiles(command, patchFolder).files) worktreeReach.add(canonicalPath(f).toLowerCase());
+      } else if (PLAIN_WEB_ADDRESS.test(command)) add(path.resolve(from, command));
+      else if (reach.problem && !data.has(command)) all = true;
     }
     // Absolute and `~/` paths, there yet or not.
     for (const word of text.split(/[\s'"`;&|()<>=,[\]{}]+/)) {
@@ -59,6 +87,10 @@ function codeOfUnhashedPatch(file: string, cwd: string, now: number): CodeScan {
       else if (word.startsWith('~/')) add(path.join(os.homedir(), word.slice(2)));
     }
   }
+  // A script it names that runs something it can't follow, other than a
+  // worktree's own (above). A hook or action that runs one is a problem as a
+  // command too; this also catches what's named some other way.
+  if (Object.keys(h.blocked ?? {}).some((s) => !worktreeReach.has(canonicalPath(s).toLowerCase()))) all = true;
   const scan = { at: now, h, all, files };
   scans.set(key, scan);
   if (scans.size > 200) scans.delete(scans.keys().next().value!);
@@ -138,6 +170,12 @@ export const patchesPart = {
     }
     entry.refreshing = false;
     entry.at = this.clock.now();
+    // Asked for again while this read ran (rereadPatches): it may be stale.
+    if (entry.again) {
+      entry.again = false;
+      entry.at = -Infinity;
+      if (rt.patches === entry && !rt.deleted) void this.refreshPatches(st);
+    }
     // The folder moved on meanwhile: the next summary starts over.
     if (rt.patches !== entry || rec.cwd !== cwd || rt.deleted) return;
     // The projects changed meanwhile: read again.
@@ -185,7 +223,8 @@ export const patchesPart = {
     this.claudeChecks.clear();
     this.sharedPatchSets.clear();
     // A turn may have changed what they read (comments resolved, a handback).
-    this.liveRuns.clear();
+    // One still running is kept, so it isn't started again beside itself.
+    this.dropFinishedLiveRuns();
   },
 
   // A live state command (when, badge), shared by every thread that runs
@@ -213,8 +252,11 @@ export const patchesPart = {
 
   // A command a patch's function runs (list panels, live state): in its
   // folder, with the thread's variables, like an action.
+  // Each with liveCommandEnv's git settings, which turn off what a repo's
+  // own .git/config could make git run (shell-allowlist.ts).
   runPatchCommand(this: Runner, threadId: string, command: string, cwd: string) {
-    return runCommand(command, { cwd, env: { ...process.env, ...threadEnv(threadId, this.cfg.home) }, shell: this.actionShell, timeoutMs: this.actionTimeoutMs });
+    const env = { ...process.env, ...threadEnv(threadId, this.cfg.home) };
+    return runCommand(command, { cwd, env: { ...env, ...liveCommandEnv(env) }, shell: this.actionShell, timeoutMs: this.actionTimeoutMs, killGroup: true });
   },
 
   // Reads live state again for the inbox's threads that have any, every
@@ -321,11 +363,13 @@ export const patchesPart = {
   // - Patches that load without a hash (home's, Threadbear's own
   //   checkout's): what one is a link to, imports and names, a missing
   //   one included, absolute or `~/` paths in it, and its `./` paths from
-  //   the thread's folder, where its commands run. One whose code can't
-  //   all be followed asks for every edit (Codex review). What such a
-  //   hook runs by name (`npm test`, a tool on PATH) is the folder's own
-  //   code, run as its owner set it up, and isn't followed.
-  writeRunsAsCode(this: Runner, rec: ThreadRecord, file: string): boolean {
+  //   where its commands run: the thread's folder, or for a patch from a
+  //   project's folder, that folder. One that can run something it can't
+  //   follow asks for every edit (Codex review), and answers 'unsure', so
+  //   the card doesn't say this file runs. What such a hook runs by name
+  //   (`npm test`, a tool on PATH) is the folder's own code, run as its
+  //   owner set it up, and isn't followed.
+  writeRunsAsCode(this: Runner, rec: ThreadRecord, file: string): CodeWrite {
     const cwd = rec.cwd;
     const home = this.panelsRoot ?? os.homedir();
     const real = canonicalPath(file).toLowerCase();
@@ -337,10 +381,16 @@ export const patchesPart = {
       if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return true;
       if (same(path.join(os.homedir(), '.claude.json'))) return true;
       const logins = new Set([path.join(os.homedir(), '.claude'), ...this.accounts.list().filter((a) => a.provider === 'claude' && a.configDir).map((a) => a.configDir!)]);
+      // A settings file straight in a login's folder by its name, there yet
+      // or not: writing a new one adds hooks as surely as changing one
+      // (Daybreak, 7 Nov 2026: a Token Stats login with no settings.json
+      // yet, outside the data dir and not named .claude, lost this when
+      // the list below became the files that exist).
+      if (LOGIN_SETTINGS.test(path.basename(real)) && [...logins].some((dir) => canonicalPath(dir).toLowerCase() === path.dirname(real))) return true;
       const settings: { file: string; dir: string }[] = [];
       for (const dir of logins) {
         if (!fs.existsSync(dir)) continue;
-        for (const f of fs.readdirSync(dir)) if (/^(settings(\..*)?\.json|\.claude\.json)$/i.test(f)) settings.push({ file: path.join(dir, f), dir });
+        for (const f of fs.readdirSync(dir)) if (LOGIN_SETTINGS.test(f)) settings.push({ file: path.join(dir, f), dir });
       }
       for (const rel of ['.claude/settings.json', '.claude/settings.local.json']) settings.push({ file: path.join(cwd, rel), dir: cwd });
       for (const s of settings) {
@@ -360,11 +410,17 @@ export const patchesPart = {
       }
       const found = claudeCommands(cwd, home);
       if (found && [...found.files, ...found.named].some(same)) return true;
-      // Every patch folder the thread reads, its projects' too: the ones
+      // Every patch folder the thread reads, as loadPatchSet does, its
+      // projects' too, as their hooks run at the end of its turns: the ones
       // that load without a hash.
-      const dirs = new Map<string, 'home' | 'project'>();
-      for (const folder of [cwd, ...(this.projects?.foldersFor(rec) ?? []).map((f) => f.folder)]) for (const d of patchDirs(folder, home)) dirs.set(d.dir, d.source);
-      for (const [dir, source] of dirs) {
+      const dirs = new Map<string, { source: 'home' | 'project'; from: string }>();
+      for (const d of patchDirs(cwd, home)) dirs.set(d.dir, { source: d.source, from: cwd });
+      for (const root of projectRoots(cwd, this.projects?.foldersFor(rec) ?? [])) {
+        for (const d of patchDirs(root.folder, home)) if (!dirs.has(d.dir)) dirs.set(d.dir, { source: d.source, from: root.folder });
+      }
+      // Files one is sure of win over another's "can't tell", for the card.
+      let unsure = false;
+      for (const [dir, { source, from }] of dirs) {
         if (source === 'project' && !this.patchTrust.loadsUnhashed(dir)) continue;
         for (const name of fs.readdirSync(dir)) {
           if (!PATCH_EXTENSIONS.includes(path.extname(name)) || name.endsWith('.d.ts') || name.startsWith('.')) continue;
@@ -372,16 +428,17 @@ export const patchesPart = {
           if (same(p)) return true;
           let scan: CodeScan;
           try {
-            scan = codeOfUnhashedPatch(p, cwd, this.clock.now());
+            scan = codeOfUnhashedPatch(p, from, this.clock.now());
           } catch {
             continue; // can't be read, so can't be loaded either
           }
-          if (scan.all || scan.files.has(real)) return true;
+          if (scan.files.has(real)) return true;
+          if (scan.all) unsure = true;
         }
       }
-      return false;
+      return unsure ? 'unsure' : false;
     } catch {
-      return true;
+      return 'unsure';
     }
   },
 
@@ -424,6 +481,22 @@ export const patchesPart = {
 
   // Every thread whose patches have been read reads them again now: a
   // trusted file can matter to threads in other folders (a project's).
+  // Forgets the live commands' finished output (it may be out of date),
+  // keeping any still running for the reads that join them.
+  dropFinishedLiveRuns(this: Runner): void {
+    for (const [key, run] of this.liveRuns) if (run.doneAt !== undefined) this.liveRuns.delete(key);
+  },
+
+  // Reads one thread's patches again now. A read already under way may have
+  // started before whatever asked for this, so it goes again once it ends.
+  rereadPatches(this: Runner, st: ThreadState): void {
+    const entry = st.rt.patches;
+    if (!entry) return;
+    entry.at = -Infinity;
+    if (entry.refreshing) entry.again = true;
+    else void this.refreshPatches(st);
+  },
+
   rereadAllPatches(this: Runner): void {
     this.forgetFolders();
     for (const st of this.threads.values()) {
@@ -526,8 +599,19 @@ export const patchesPart = {
       await this.runHookList(st, hooks);
     } finally {
       st.rt.hooksRunning--;
+      // Before the handover check, which then waits for what this starts.
+      // Not while stopping: the next runner picks it up (cleanupOwed), and
+      // two cleanups shouldn't run side by side.
+      if (!this.stopping) this.archiveWhenGone(st);
       if (this.draining) this.queueHandoverCheck();
+      // A restart waiting for this hook hears through thread.updated.
+      this.markDirty(st);
     }
+  },
+
+  // The threads a turn-end hook is running for, which a restart waits for.
+  threadsWithHooksRunning(this: Runner): string[] {
+    return [...this.threads.values()].filter((st) => st.rt.hooksRunning && !st.rt.deleted).map((st) => st.rec.id);
   },
 
   async runHookList(this: Runner, st: ThreadState, hooks: PatchSet['hooks']): Promise<void> {
@@ -544,14 +628,27 @@ export const patchesPart = {
           continue;
         }
       }
+      const cwd = hook.folder ?? st.rec.cwd;
       const outcome = await runCommand(hook.exec ?? hook.command, {
-        cwd: hook.folder ?? st.rec.cwd,
+        cwd,
         env: { ...process.env, ...threadEnv(st.rec.id, this.cfg.home) },
         shell: this.actionShell,
         timeoutMs: this.actionTimeoutMs,
         background: this.backgroundJobs,
+        // An archive's cleanup and a handover wait for this, so it has to
+        // end: SIGKILL for one that ignores SIGTERM, and nothing it left
+        // running can hold the pipes open.
+        killGroup: true,
       });
       if (st.rt.deleted || this.stopping) return;
+      // An archive waits for its hooks, but a folder can go other ways (by
+      // hand, say). What ran then failed on missing files, not on the code,
+      // so it isn't a result to act on.
+      if (!isDirectory(cwd)) {
+        this.emit(st, { type: 'system.note', text: `The hook "${hook.title}" had its folder ${cwd} removed while it ran, so its result says nothing about the code.` }, st.rt.turn?.turnId);
+        this.markDirty(st);
+        continue;
+      }
       const body: EventBody = {
         type: 'action.run',
         actionId: hook.id,
@@ -569,6 +666,9 @@ export const patchesPart = {
       this.markDirty(st);
       const tell = hook.tell === 'always' || (hook.tell === 'failures' && !outcome.ok);
       if (!tell) continue;
+      // Telling starts a turn, which brings an archived thread back: worth
+      // it for a failure, not for "passed, nothing to do".
+      if (outcome.ok && st.rec.archivedAt) continue;
       const counts = (st.rt.hookTurns ??= new Map());
       const sofar = counts.get(hook.id) ?? 0;
       if (sofar >= HOOK_TELL_LIMIT) {
@@ -576,7 +676,8 @@ export const patchesPart = {
         continue;
       }
       counts.set(hook.id, sofar + 1);
-      const shown = outcome.text.length > HOOK_TELL_CHARS ? outcome.text.slice(-HOOK_TELL_CHARS) : outcome.text;
+      // Its last part, begun where no secret is cut in two (safe-cut.ts): it goes to Convex as a message.
+      const shown = outcome.text.length > HOOK_TELL_CHARS ? outcome.text.slice(safeStart(outcome.text, outcome.text.length - HOOK_TELL_CHARS)) : outcome.text;
       const verdict = outcome.ok ? 'passed' : `failed${outcome.exitCode !== undefined ? ` (exit ${outcome.exitCode})` : ''}`;
       const text =
         `[Threadbear hook] ${hook.title} (patch ${hook.patch}) ran after your turn and ${verdict}:\n\n` +
@@ -596,7 +697,8 @@ export const patchesPart = {
   // time per thread.
   async runAction(this: Runner, threadId: string, actionId: string): Promise<{ turnId?: string; ok?: boolean; exitCode?: number; durationMs?: number; seq?: number }> {
     const st = this.mustGet(threadId);
-    const action = this.actionsOf(st, this.patchSet(st)).find((a) => a.id === actionId);
+    const set = this.patchSet(st);
+    const action = this.actionsOf(st, set).find((a) => a.id === actionId);
     if (!action) throw new RpcError(ErrorCode.badParams, `This thread has no action called ${actionId}`);
     if (action.kind === 'prompt') return this.send(threadId, action.prompt ?? '');
     if (action.kind === 'url') {
@@ -608,8 +710,25 @@ export const patchesPart = {
       await this.openUrl(action.url ?? '');
       return { ok: true, durationMs: Date.now() - started };
     }
+    // A thread whose worktree was removed hasn't moved out of it until its
+    // next message (leaveRemovedWorktree), and the folder may be another
+    // thread's or a borrower's by now, so nothing runs there (Codex, 8 Nov).
+    // An archive's cleanup running now decides whether the folder stays.
+    while (st.rt.cleaning) await st.rt.cleaning;
+    const gone = st.rec.worktree;
+    if (gone?.removedAt && isInside(action.folder ?? st.rec.cwd, gone.path)) {
+      throw new RpcError(ErrorCode.other, `Didn't run ${action.title}: this thread's worktree at ${gone.path} was removed when it was archived, and the folder may be another thread's now. Send the thread a message first, and it carries on in the main checkout.`);
+    }
     const running = (st.rt.runningActions ??= new Set());
     if (running.has(actionId)) throw new RpcError(ErrorCode.busy, `${action.title} is already running.`);
+    // It runs from the folder, so what the patch's hash covered must still
+    // be what's there as it starts, read afresh, however long ago the patch
+    // was last looked at; what changed then asks in Patches.
+    const refused = actionRunProblem(action, set.patches.find((p) => p.id === action.patch), (file, hash) => this.patchTrust.verify(file, hash), (dir) => this.patchTrust.loadsUnhashed(dir));
+    if (refused) {
+      this.rereadAllPatches();
+      throw new RpcError(ErrorCode.other, `Didn't run ${action.title}: ${refused}`);
+    }
     running.add(actionId);
     try {
       const outcome = await runCommand(action.command ?? '', {
@@ -637,9 +756,23 @@ export const patchesPart = {
       const event = this.emit(st, body, st.rt.turn?.turnId);
       st.rec.lastActivityAt = this.isoNow();
       this.markDirty(st);
+      // Land (or any command) may have moved the branch or the files.
+      this.recheckLooseEnds(st);
+      // What a command did is often what its chips' `when` and badges ask
+      // (a Run that starts a server swaps for its Stop): read them now,
+      // rather than at the next poll up to LIVE_POLL_MS later. The live
+      // commands' finished output is from before it ran, so it goes too;
+      // one still running is kept, so a slow command shared by many
+      // threads isn't started again beside itself.
+      if (st.rt.patches) {
+        this.dropFinishedLiveRuns();
+        this.rereadPatches(st);
+      }
       return { ok: outcome.ok, exitCode: outcome.exitCode, durationMs: outcome.durationMs, seq: event.seq };
     } finally {
       running.delete(actionId);
+      // An archive held for it (archiveWhenGone) goes ahead now.
+      if (running.size === 0) this.archiveWhenGone(st);
     }
   },
 };

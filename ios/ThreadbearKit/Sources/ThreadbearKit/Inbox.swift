@@ -293,7 +293,7 @@ public enum RowStatus {
     /// starts, so for a running thread it's the turn's start (the Mac's
     /// ThreadRowLook.workingLabel).
     public static func workingLabel(since start: Date, now: Date) -> String {
-        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        let seconds = max(0, Int(saturating: now.timeIntervalSince(start)))
         if seconds < 60 { return "\(seconds)s" }
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes)m" }
@@ -308,8 +308,8 @@ public enum RelativeTime {
     public static func short(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
         let seconds = now.timeIntervalSince(date)
         if seconds < 60 { return "now" }
-        if seconds < 3600 { return "\(Int(seconds / 60))m" }
-        if seconds < 86_400 { return "\(Int(seconds / 3600))h" }
+        if seconds < 3600 { return "\(Int(saturating: seconds / 60))m" }
+        if seconds < 86_400 { return "\(Int(saturating: seconds / 3600))h" }
         if seconds < 6 * 86_400 {
             return date.formatted(Date.FormatStyle(calendar: calendar).weekday(.abbreviated))
         }
@@ -335,7 +335,10 @@ public enum RelativeTime {
 public enum PreviewText {
     public static func plain(_ text: String) -> String {
         var line = text
-        line = line.replacingOccurrences(of: #"!?\[([^\]]*)\]\([^)]*\)"#, with: "$1", options: .regularExpression)
+        // A `[` with no link after it uses up what it was tried against,
+        // rather than every `[` being tried to the end again, which was
+        // quadratic (cross-lab review, 7 Nov 2026). The same links match.
+        line = line.replacing(/!?\[([^\]]*)(?:\]\([^)]*(\))?)?/) { $0.2 == nil ? String($0.0) : String($0.1) }
         line = line.replacingOccurrences(of: #"(^|\s)(#{1,6}|>)\s+"#, with: "$1", options: .regularExpression)
         for marker in ["**", "__", "~~", "`"] {
             line = line.replacingOccurrences(of: marker, with: "")

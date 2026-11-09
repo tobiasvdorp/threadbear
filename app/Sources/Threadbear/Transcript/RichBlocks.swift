@@ -203,7 +203,7 @@ enum RichDiskCache {
 
 /// The box a rich block is drawn in, as one attachment in the reply's
 /// text: a header with the block's language, a Diagram / Source switch,
-/// Copy and Open beside, and under it the picture or the source.
+/// Copy and Open (a window of its own), and under it the picture or the source.
 /// Everything it shows is fixed when the row renders; a change renders the
 /// row again with a new cell.
 final class RichBlockCell: NSTextAttachmentCell {
@@ -215,7 +215,7 @@ final class RichBlockCell: NSTextAttachmentCell {
             case .drawn: return block.kind == .mermaid ? "Show the diagram" : "Show the page"
             case .source: return "Show the source"
             case .copy: return "Copy the source"
-            case .open: return "Open it beside the thread, full size"
+            case .open: return "Open it full size in its own window"
             }
         }
     }
@@ -246,7 +246,7 @@ final class RichBlockCell: NSTextAttachmentCell {
     static var headerHeight: CGFloat { zoomed(34) }
     static var pad: CGFloat { zoomed(12) }
     static var radius: CGFloat { zoomed(8) }
-    /// The tallest a picture is drawn in the reply; Open beside shows all of it.
+    /// The tallest a picture is drawn in the reply; Open shows all of it.
     static var maxBody: CGFloat { zoomed(560) }
     private static var labelFont: NSFont { .monospacedSystemFont(ofSize: TypeScale.detail, weight: .regular) }
     private static var switchFont: NSFont { .systemFont(ofSize: TypeScale.detail, weight: .medium) }

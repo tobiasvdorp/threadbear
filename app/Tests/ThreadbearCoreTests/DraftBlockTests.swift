@@ -77,12 +77,13 @@ final class DraftBlockTests: XCTestCase {
     }
 
     func testHostileLinesStayQuick() {
-        let start = Date()
-        _ = DraftBlock.slackSpans(String(repeating: "<", count: DraftBlock.maxFormattedLine))
-        _ = DraftBlock.slackSpans(String(repeating: " *a", count: DraftBlock.maxFormattedLine / 3))
-        _ = DraftBlock(kind: .slack, source: String(repeating: "<", count: DraftBlock.maxSource)).plainText
-        _ = DraftBlock(kind: .slack, source: String(repeating: "<", count: DraftBlock.maxSource - 1) + ">").plainText
-        XCTAssertLessThan(Date().timeIntervalSince(start), 2)
+        let seconds = cpuSeconds {
+            _ = DraftBlock.slackSpans(String(repeating: "<", count: DraftBlock.maxFormattedLine))
+            _ = DraftBlock.slackSpans(String(repeating: " *a", count: DraftBlock.maxFormattedLine / 3))
+            _ = DraftBlock(kind: .slack, source: String(repeating: "<", count: DraftBlock.maxSource)).plainText
+            _ = DraftBlock(kind: .slack, source: String(repeating: "<", count: DraftBlock.maxSource - 1) + ">").plainText
+        }
+        XCTAssertLessThan(seconds, 2)
         // A line past the limit is shown as written; a draft past its limit stays code.
         let long = "*" + String(repeating: "a", count: DraftBlock.maxFormattedLine) + "*"
         XCTAssertEqual(DraftBlock.slackSpans(long), [.init(long)])
