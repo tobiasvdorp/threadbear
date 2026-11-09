@@ -65,11 +65,11 @@ test('words found nowhere in the turn find nothing', () => {
   assert.equal(findStep('Run the tests', 99, rows), undefined);
 });
 
-// CPU time, not wall time: the machine running the tests may be busy.
+// This thread's CPU time excludes scheduling delays and V8's background work.
 function cpuMs(work: () => void): number {
-  const start = process.cpuUsage();
+  const start = process.threadCpuUsage();
   work();
-  const used = process.cpuUsage(start);
+  const used = process.threadCpuUsage(start);
   return (used.user + used.system) / 1000;
 }
 
@@ -127,11 +127,13 @@ test('a page full of long rows and links has a bounded cost', () => {
   for (let i = 1; i <= 40; i++) page.push({ seq: i, role: 'tool', text: 'z '.repeat(4000) });
   for (let i = 41; i <= 80; i++) page.push({ seq: i, role: 'assistant', text: '' });
   let found = 0;
-  const ms = cpuMs(() => {
-    for (let m = 41; m <= 80; m++) for (let l = 0; l < 700; l++) if (findStep(`z q${m}-${l}`, m, page) !== undefined) found++;
-  });
+  for (let m = 41; m <= 80; m++) for (let l = 0; l < 700; l++) if (findStep(`z q${m}-${l}`, m, page) !== undefined) found++;
   assert.equal(found, 0);
-  assert.ok(ms < 100, `took ${ms.toFixed(0)} ms`);
+  // The budget belongs to the page, across different quotes and messages.
+  // Once spent, even words present in a step stop searching. A fresh page
+  // finds them, so a missing answer above isn't evidence of bounded work.
+  assert.equal(findStep('z', 80, page), undefined, 'the page stops searching once its budget is spent');
+  assert.equal(findStep('z', 80, [...page]), 40, 'a fresh page can still find the step');
   // Links that do find their step still do, on a fresh page.
   assert.equal(findStep('Run the tests', 9, [...rows]), 5);
 });

@@ -825,16 +825,21 @@ test("R5: a repo's filter drivers don't run: its own are refused, and your own d
   git(repo, 'add', 'a.txt', '.gitattributes');
   git(repo, 'commit', '-qm', 'two');
   fs.rmSync(marker, { force: true });
-  fs.appendFileSync(path.join(repo, 'a.txt'), 'two\n');
+  // A different size lets git skip the filter once the index isn't racy.
+  // Same-size content with an old mtime forces a content check under load too.
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
+  fs.utimesSync(path.join(repo, 'a.txt'), new Date(0), new Date(0));
   const env: Record<string, string | undefined> = { ...process.env, GIT_CONFIG_GLOBAL: global };
   const e = { ...env, ...liveCommandEnv(env) } as NodeJS.ProcessEnv;
   for (const cmd of ['git merge-base --is-ancestor HEAD HEAD', 'git rev-list --count HEAD', "git branch -a --no-merged HEAD --format='%(refname:short)'"]) {
     assert.equal(live(repo, cmd).problem, undefined, cmd);
-    spawnSync('/bin/sh', ['-c', cmd], { cwd: repo, env: e, timeout: 20_000 });
+    const result = spawnSync('/bin/sh', ['-c', cmd], { cwd: repo, env: e, timeout: 20_000 });
+    assert.equal(result.status, 0, `${cmd}: ${result.error ?? result.stderr.toString()}`);
     assert.equal(fs.existsSync(marker), false, cmd);
   }
   // (The same global filter does run for git status, which isn't on the list.)
-  spawnSync('/bin/sh', ['-c', 'git status --porcelain'], { cwd: repo, env: e, timeout: 20_000 });
+  const result = spawnSync('/bin/sh', ['-c', 'git status --porcelain'], { cwd: repo, env: e, timeout: 20_000 });
+  assert.equal(result.status, 0, `git status: ${result.error ?? result.stderr.toString()}`);
   assert.equal(fs.existsSync(marker), true, 'the test plays it right');
 });
 
